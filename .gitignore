@@ -1,8 +1,12 @@
 zfolder/
 configuration.php
-
 .idea
 vendor
 composer.lock
 .env
 .vscode
+*-pb
+pb_data/
+.pb-port
+.app-port
+.antfly-porttazzamphp/

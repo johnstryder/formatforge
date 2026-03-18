@@ -1,0 +1,15 @@
+{
+  "name": "source_links",
+  "type": "base",
+  "listRule": "@request.auth.id != \"\"",
+  "viewRule": "@request.auth.id != \"\"",
+  "createRule": "@request.auth.id != \"\"",
+  "updateRule": "@request.auth.id != \"\"",
+  "deleteRule": "@request.auth.id != \"\"",
+  "fields": [
+    {"name": "url", "type": "text"},
+    {"name": "title", "type": "text"},
+    {"name": "status", "type": "text"},
+    {"name": "metadata", "type": "json"}
+  ]
+}

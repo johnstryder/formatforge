@@ -1,0 +1,24 @@
+{
+  "name": "content_items",
+  "type": "base",
+  "listRule": "@request.auth.id != \"\"",
+  "viewRule": "@request.auth.id != \"\"",
+  "createRule": "@request.auth.id != \"\"",
+  "updateRule": "@request.auth.id != \"\"",
+  "deleteRule": "@request.auth.id != \"\"",
+  "fields": [
+    {"name": "type", "type": "text"},
+    {"name": "title", "type": "text"},
+    {"name": "prompt", "type": "text"},
+    {"name": "source_link_id", "type": "text"},
+    {"name": "garage_key", "type": "text"},
+    {"name": "garage_url", "type": "text"},
+    {"name": "thumbnail_url", "type": "text"},
+    {"name": "status", "type": "text"},
+    {"name": "template_id", "type": "text"},
+    {"name": "metadata", "type": "json"},
+    {"name": "rejected_reason", "type": "text"},
+    {"name": "instagram_account_id", "type": "text"},
+    {"name": "published_at", "type": "date"}
+  ]
+}

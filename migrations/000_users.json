@@ -1,0 +1,17 @@
+{
+  "name": "users",
+  "type": "auth",
+  "listRule": "@request.auth.id != \"\"",
+  "viewRule": "@request.auth.id != \"\"",
+  "createRule": "",
+  "updateRule": "@request.auth.id != \"\"",
+  "deleteRule": "@request.auth.id != \"\"",
+  "fields": [
+    {"name": "name", "type": "text"},
+    {"name": "avatar", "type": "file", "maxSelect": 1, "maxSize": 5242880, "mimeTypes": ["image/jpeg", "image/png", "image/gif", "image/webp"]}
+  ],
+  "passwordAuth": {
+    "enabled": true,
+    "identityFields": ["email"]
+  }
+}

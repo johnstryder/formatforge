@@ -1,0 +1,16 @@
+{
+  "name": "instagram_accounts",
+  "type": "base",
+  "listRule": "@request.auth.id != \"\"",
+  "viewRule": "@request.auth.id != \"\"",
+  "createRule": "@request.auth.id != \"\"",
+  "updateRule": "@request.auth.id != \"\"",
+  "deleteRule": "@request.auth.id != \"\"",
+  "fields": [
+    {"name": "instagram_user_id", "type": "text"},
+    {"name": "username", "type": "text"},
+    {"name": "access_token", "type": "text"},
+    {"name": "token_expires_at", "type": "date"},
+    {"name": "is_active", "type": "bool"}
+  ]
+}

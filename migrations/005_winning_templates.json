@@ -1,0 +1,20 @@
+{
+  "name": "winning_templates",
+  "type": "base",
+  "listRule": "@request.auth.id != \"\"",
+  "viewRule": "@request.auth.id != \"\"",
+  "createRule": "@request.auth.id != \"\"",
+  "updateRule": "@request.auth.id != \"\"",
+  "deleteRule": "@request.auth.id != \"\"",
+  "fields": [
+    {"name": "name", "type": "text"},
+    {"name": "hook_style", "type": "text"},
+    {"name": "visual_layout", "type": "text"},
+    {"name": "pacing_config", "type": "json"},
+    {"name": "view_share_ratio", "type": "number"},
+    {"name": "total_views", "type": "number"},
+    {"name": "total_shares", "type": "number"},
+    {"name": "weight", "type": "number"},
+    {"name": "is_active", "type": "bool"}
+  ]
+}

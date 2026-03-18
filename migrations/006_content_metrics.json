@@ -1,0 +1,19 @@
+{
+  "name": "content_metrics",
+  "type": "base",
+  "listRule": "@request.auth.id != \"\"",
+  "viewRule": "@request.auth.id != \"\"",
+  "createRule": "@request.auth.id != \"\"",
+  "updateRule": "@request.auth.id != \"\"",
+  "deleteRule": "@request.auth.id != \"\"",
+  "fields": [
+    {"name": "content_item_id", "type": "text"},
+    {"name": "instagram_media_id", "type": "text"},
+    {"name": "impressions", "type": "number"},
+    {"name": "likes", "type": "number"},
+    {"name": "views", "type": "number"},
+    {"name": "shares", "type": "number"},
+    {"name": "comments", "type": "number"},
+    {"name": "fetched_at", "type": "date"}
+  ]
+}
