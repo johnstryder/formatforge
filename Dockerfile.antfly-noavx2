@@ -1,0 +1,93 @@
+# Antfly build WITHOUT GOEXPERIMENT=simd — for CPUs without AVX2 (e.g. AVX-only)
+# Uses scalar fallbacks instead of AVX2/AVX-512 SIMD. Slower but runs on older CPUs.
+#
+# Build: docker build -f Dockerfile.antfly-noavx2 -t formatforge-antfly:noavx2 .
+# Use:   docker compose -f docker-compose.antfly.yml up -d  (with build override)
+
+ARG GO_VERSION=1.26-bookworm
+ARG ONNXRUNTIME_VERSION=1.24.3
+ARG GENAI_VERSION=0.12.1
+ARG TOKENIZERS_VERSION=1.26.0
+
+FROM golang:${GO_VERSION} AS builder
+
+ARG ONNXRUNTIME_VERSION
+ARG TOKENIZERS_VERSION
+ARG TARGETARCH
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y build-essential pkg-config curl && rm -rf /var/lib/apt/lists/*
+
+# ONNX Runtime
+RUN mkdir -p /usr/local/onnxruntime && \
+    ARCH=$([ "$TARGETARCH" = "arm64" ] && echo "aarch64" || echo "x64") && \
+    curl -fsSL "https://github.com/microsoft/onnxruntime/releases/download/v${ONNXRUNTIME_VERSION}/onnxruntime-linux-${ARCH}-${ONNXRUNTIME_VERSION}.tgz" \
+    | tar -xzf - --strip-components=1 -C /usr/local/onnxruntime
+
+# libtokenizers
+RUN mkdir -p /usr/local/lib && \
+    ARCH=$([ "$TARGETARCH" = "arm64" ] && echo "arm64" || echo "amd64") && \
+    curl -fsSL "https://github.com/daulet/tokenizers/releases/download/v${TOKENIZERS_VERSION}/libtokenizers.linux-${ARCH}.tar.gz" \
+    | tar -xzf - -C /usr/local/lib && ldconfig
+
+ENV ONNXRUNTIME_ROOT=/usr/local/onnxruntime
+ENV CGO_CFLAGS="-I${ONNXRUNTIME_ROOT}/include"
+ENV CGO_LDFLAGS="-L${ONNXRUNTIME_ROOT}/lib -lonnxruntime"
+ENV LD_LIBRARY_PATH="${ONNXRUNTIME_ROOT}/lib:/usr/local/lib"
+
+COPY antfly-src/go.mod antfly-src/go.sum ./
+COPY antfly-src/termite ./termite
+COPY antfly-src/cmd/antfly ./cmd/antfly
+COPY antfly-src/pkg ./pkg
+
+RUN go mod download
+
+COPY antfly-src/ .
+
+# Build WITHOUT GOEXPERIMENT=simd — uses scalar fallbacks, no AVX2 required
+RUN CGO_ENABLED=1 go build \
+    -tags="onnx,ORT,xla,XLA" \
+    -ldflags="-s -w" \
+    -o /antfly \
+    ./cmd/antfly
+
+FROM debian:bookworm-slim AS runtime
+
+ARG ONNXRUNTIME_VERSION
+ARG GENAI_VERSION
+ARG TARGETARCH
+
+RUN rm -rf /var/lib/apt/lists/* && apt-get clean && \
+    apt-get -o Acquire::Retries=5 update && \
+    apt-get -o Acquire::Retries=5 install -y --no-install-recommends ca-certificates curl && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN mkdir -p /usr/local/onnxruntime && \
+    ARCH=$([ "$TARGETARCH" = "arm64" ] && echo "aarch64" || echo "x64") && \
+    curl -fsSL "https://github.com/microsoft/onnxruntime/releases/download/v${ONNXRUNTIME_VERSION}/onnxruntime-linux-${ARCH}-${ONNXRUNTIME_VERSION}.tgz" \
+    | tar -xzf - --strip-components=1 -C /usr/local/onnxruntime
+
+RUN if [ "$TARGETARCH" = "amd64" ]; then \
+    curl -fsSL "https://github.com/microsoft/onnxruntime-genai/releases/download/v${GENAI_VERSION}/onnxruntime-genai-${GENAI_VERSION}-linux-x64.tar.gz" \
+    | tar -xzf - --strip-components=1 -C /usr/local/onnxruntime; fi
+
+RUN mkdir -p /usr/local/lib/go-xla && \
+    ARCH=$([ "$TARGETARCH" = "arm64" ] && echo "arm64" || echo "amd64") && \
+    curl -fsSL "https://github.com/gomlx/pjrt-cpu-binaries/releases/latest/download/pjrt_cpu_linux_${ARCH}.tar.gz" \
+    | tar -xzf - -C /usr/local/lib/go-xla || true
+
+RUN groupadd -r antfly && useradd -r -g antfly antfly
+
+COPY --from=builder /antfly /antfly
+
+ENV LD_LIBRARY_PATH="/usr/local/onnxruntime/lib:/usr/local/lib/go-xla"
+ENV TERMITE_BACKEND_PRIORITY="onnx,xla,go"
+ENV TERMITE_MODELS_DIR="/models"
+
+RUN mkdir -p /models/embedders /models/chunkers /models/rerankers && chown -R antfly:antfly /models
+
+USER antfly
+EXPOSE 8080
+ENTRYPOINT ["/antfly"]
+CMD ["termite", "--api-url=http://0.0.0.0:8080"]

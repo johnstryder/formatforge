@@ -1,0 +1,18 @@
+# Antfly build without AVX2 — for CPUs that lack AVX2 (AVX-only, older VMs)
+# Run: docker compose -f docker-compose.antfly-noavx2.yml up -d --build
+services:
+  antfly:
+    build:
+      context: .
+      dockerfile: Dockerfile.antfly-noavx2
+    image: formatforge-antfly:noavx2
+    container_name: formatforge-antfly
+    ports:
+      - "${ANTFLY_PORT:-8080}:8080"
+    volumes:
+      - antfly_data:/antflydb
+    command: swarm
+    restart: unless-stopped
+
+volumes:
+  antfly_data: {}

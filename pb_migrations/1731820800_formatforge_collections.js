@@ -92,6 +92,26 @@ migrate((db) => {
 
   createIfMissing({
     type: "base",
+    name: "content_pipelines",
+    listRule: "@request.auth.id != \"\"",
+    viewRule: "@request.auth.id != \"\"",
+    createRule: "@request.auth.id != \"\"",
+    updateRule: "@request.auth.id != \"\"",
+    deleteRule: "@request.auth.id != \"\"",
+    fields: [
+      { name: "name", type: "text" },
+      { name: "prompt_template", type: "text" },
+      { name: "cron_schedule", type: "text" },
+      { name: "binary_path", type: "text" },
+      { name: "rejected_count", type: "number" },
+      { name: "approved_count", type: "number" },
+      { name: "is_active", type: "bool" },
+      { name: "metadata", type: "json" },
+    ],
+  })
+
+  createIfMissing({
+    type: "base",
     name: "content_metrics",
     listRule: "@request.auth.id != \"\"",
     viewRule: "@request.auth.id != \"\"",

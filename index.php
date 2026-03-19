@@ -16,10 +16,16 @@ if (file_exists(__DIR__ . '/.env')) {
     }
 }
 
+$pbUrl = null;
+if (file_exists('/.dockerenv')) {
+    $pbUrl = 'http://pocketbase:8090';
+} elseif (file_exists(__DIR__ . '/.pb-port')) {
+    $pbUrl = 'http://127.0.0.1:' . trim(file_get_contents(__DIR__ . '/.pb-port') ?: '');
+} else {
+    $pbUrl = getenv('POCKETBASE_URL') ?: 'http://127.0.0.1:8090';
+}
 $CONFIG = [
-    'pocketbase_url'   => file_exists(__DIR__ . '/.pb-port')
-        ? 'http://127.0.0.1:' . trim(file_get_contents(__DIR__ . '/.pb-port') ?: '')
-        : (getenv('POCKETBASE_URL') ?: 'http://127.0.0.1:8090'),
+    'pocketbase_url'   => $pbUrl,
     'site_url'         => getenv('APP_URL') ?: ('http://' . ($_SERVER['HTTP_HOST'] ?? 'localhost')),
     'site_name'        => getenv('SITE_NAME') ?: 'FormatForge',
     'users_collection' => 'users',
@@ -29,6 +35,8 @@ $CONFIG = [
     'garage_bucket'    => getenv('GARAGE_BUCKET') ?: 'formatforge',
     'garage_region'    => getenv('GARAGE_REGION') ?: 'garage',
     'replicate_token' => getenv('REPLICATE_API_TOKEN') ?: '',
+    'fal_key'         => getenv('FAL_KEY') ?: '',
+    'video_provider'   => getenv('VIDEO_PROVIDER') ?: '',  // replicate|fal; auto if empty
     'fb_app_id'       => getenv('FB_APP_ID') ?: '',
     'fb_app_secret'    => getenv('FB_APP_SECRET') ?: '',
     'instagram_redirect' => getenv('INSTAGRAM_REDIRECT_URI') ?: '',
@@ -41,9 +49,27 @@ $CONFIG = [
     'antfly_key'       => getenv('ANTFLY_API_KEY') ?: '',
     'winning_threshold' => (float)(getenv('WINNING_TEMPLATE_VIEW_SHARE_RATIO') ?: '0.05'),
     'ffmpeg_path'      => getenv('FFMPEG_PATH') ?: '/usr/bin/ffmpeg',
+    'embed_url'        => getenv('EMBED_URL') ?: '',  // Ollama-compatible: /api/embed or OpenAI
+    'openai_key'       => getenv('OPENAI_API_KEY') ?: '',
+    'pi_trigger_dir'  => getenv('PI_TRIGGER_DIR') ?: (__DIR__ . '/.pi/triggers'),
+    'novel_threshold'  => (float)(getenv('NOVEL_DISTANCE_THRESHOLD') ?: '0.35'),  // cosine distance above = novel
 ];
 if (file_exists(__DIR__ . '/config.php')) {
     $CONFIG = array_merge($CONFIG, require __DIR__ . '/config.php');
+}
+
+function is_internal_network(): bool {
+    if (getenv('ALLOW_SIGNUP') === '1' || getenv('ALLOW_SIGNUP') === 'true') {
+        return true;
+    }
+    $ip = $_SERVER['HTTP_X_FORWARDED_FOR'] ?? $_SERVER['HTTP_X_REAL_IP'] ?? $_SERVER['REMOTE_ADDR'] ?? '';
+    $ip = trim(explode(',', $ip)[0] ?? '');
+    if (!$ip || $ip === '::1') return true;
+    if (filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)) {
+        return str_starts_with($ip, '100.') || str_starts_with($ip, '10.') || str_starts_with($ip, '192.168.')
+            || preg_match('/^172\.(1[6-9]|2\d|3[01])\./', $ip);
+    }
+    return false;
 }
 
 function pb_request(string $method, string $path, $data = null, ?string $token = null): array {
@@ -58,8 +84,10 @@ function pb_request(string $method, string $path, $data = null, ?string $token =
     if ($data !== null) curl_setopt($ch, CURLOPT_POSTFIELDS, is_array($data) ? json_encode($data) : $data);
     $res = curl_exec($ch);
     $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $errNo = curl_errno($ch);
     curl_close($ch);
-    return ['code' => $code, 'body' => json_decode($res ?: '{}', true) ?? []];
+    $body = json_decode($res ?: '{}', true) ?? [];
+    return ['code' => $code, 'body' => $body, 'raw' => $res ?: '', 'curl_errno' => $errNo];
 }
 
 function s3_upload(string $key, string $content, string $contentType = 'video/mp4'): ?string {
@@ -135,6 +163,36 @@ function replicate_run(string $model, array $input, int $waitSec = 60): ?array {
             }
         }
     }
+    return null;
+}
+
+/**
+ * Run a fal.ai model (text-to-video). Uses queue.fal.run.
+ * @param string $model e.g. fal-ai/kling-video/v2.5-turbo/pro/text-to-video
+ * @param array $input e.g. ['prompt' => '...', 'aspect_ratio' => '9:16']
+ * @param int $waitSec max seconds to poll (fal runs synchronously by default)
+ * @return array|null response with video.url, or null on failure
+ */
+function fal_run(string $model, array $input, int $waitSec = 120): ?array {
+    $key = $GLOBALS['CONFIG']['fal_key'];
+    if (!$key) return null;
+    $url = 'https://queue.fal.run/' . ltrim($model, '/');
+    $ch = curl_init($url);
+    curl_setopt_array($ch, [
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_POST => true,
+        CURLOPT_TIMEOUT => min(300, max(60, $waitSec)),
+        CURLOPT_HTTPHEADER => [
+            'Authorization: Key ' . $key,
+            'Content-Type: application/json',
+        ],
+        CURLOPT_POSTFIELDS => json_encode($input),
+    ]);
+    $res = curl_exec($ch);
+    $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    curl_close($ch);
+    $body = json_decode($res ?: '{}', true) ?? [];
+    if ($code >= 200 && $code < 300 && isset($body['video'])) return $body;
     return null;
 }
 
@@ -214,6 +272,196 @@ function antfly_create_table(string $table): bool {
     return $code >= 200 && $code < 300;
 }
 
+function embed_text(string $text): ?array {
+    $cfg = $GLOBALS['CONFIG'];
+    if ($cfg['openai_key']) {
+        $ch = curl_init('https://api.openai.com/v1/embeddings');
+        curl_setopt_array($ch, [
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_POST => true,
+            CURLOPT_HTTPHEADER => [
+                'Authorization: Bearer ' . $cfg['openai_key'],
+                'Content-Type: application/json',
+            ],
+            CURLOPT_POSTFIELDS => json_encode(['model' => 'text-embedding-3-small', 'input' => $text]),
+        ]);
+        $res = curl_exec($ch);
+        $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        curl_close($ch);
+        if ($code === 200) {
+            $body = json_decode($res ?: '{}', true);
+            return $body['data'][0]['embedding'] ?? null;
+        }
+        return null;
+    }
+    if ($cfg['embed_url']) {
+        $url = rtrim($cfg['embed_url'], '/');
+        $body = json_encode(['model' => 'nomic-embed-text', 'input' => [$text]]);
+        $ch = curl_init($url . (str_contains($url, '/embed') ? '' : '/api/embed'));
+        curl_setopt_array($ch, [
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_POST => true,
+            CURLOPT_HTTPHEADER => ['Content-Type: application/json'],
+            CURLOPT_POSTFIELDS => $body,
+        ]);
+        $res = curl_exec($ch);
+        $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        curl_close($ch);
+        if ($code === 200) {
+            $out = json_decode($res ?: '{}', true);
+            $emb = $out['embeddings'][0] ?? $out['data'][0]['embedding'] ?? null;
+            return is_array($emb) ? $emb : null;
+        }
+        return null;
+    }
+    return null;
+}
+
+function cosine_distance(array $a, array $b): float {
+    $n = min(count($a), count($b));
+    if ($n === 0) return 1.0;
+    $dot = $normA = $normB = 0.0;
+    for ($i = 0; $i < $n; $i++) {
+        $dot += $a[$i] * $b[$i];
+        $normA += $a[$i] * $a[$i];
+        $normB += $b[$i] * $b[$i];
+    }
+    $denom = sqrt($normA) * sqrt($normB);
+    if ($denom < 1e-10) return 1.0;
+    $sim = $dot / $denom;
+    return 1.0 - max(-1, min(1, $sim));
+}
+
+function content_is_novel(string $prompt, array $existingPrompts): bool {
+    $cfg = $GLOBALS['CONFIG'];
+    if (empty($cfg['embed_url']) && empty($cfg['openai_key'])) return false;
+    $vec = embed_text($prompt);
+    if (!$vec) return false;
+    foreach ($existingPrompts as $p) {
+        $ev = embed_text($p);
+        if (!$ev) continue;
+        if (cosine_distance($vec, $ev) < $cfg['novel_threshold']) return false;
+    }
+    return true;
+}
+
+function trigger_pi_for_pipeline(string $reason, array $context): void {
+    $cfg = $GLOBALS['CONFIG'];
+    $dir = $cfg['pi_trigger_dir'] ?? '';
+    if (!$dir) return;
+    if (!is_dir($dir) && !@mkdir($dir, 0755, true)) return;
+    if (!is_writable($dir)) return;
+    $file = $dir . '/trigger_' . date('YmdHis') . '_' . bin2hex(random_bytes(4)) . '.json';
+    $payload = [
+        'reason' => $reason,
+        'context' => $context,
+        'created' => date('c'),
+        'template_path' => __DIR__ . '/pipelines/template',
+    ];
+    if (@file_put_contents($file, json_encode($payload, JSON_PRETTY_PRINT))) {
+        setup_pipeline_from_trigger($file);
+    }
+}
+
+function setup_pipeline_from_trigger(string $triggerFile): void {
+    $projectRoot = __DIR__;
+    $cfg = $GLOBALS['CONFIG'];
+    $trigger = json_decode(file_get_contents($triggerFile), true) ?: [];
+    $reason = $trigger['reason'] ?? 'unknown';
+    $context = $trigger['context'] ?? [];
+    $templatePath = $trigger['template_path'] ?? $projectRoot . '/pipelines/template';
+    $created = $trigger['created'] ?? date('c');
+    if (!is_dir($templatePath)) return;
+    $triggerBase = basename($triggerFile, '.json');
+    $pipelineId = str_replace('trigger_', '', $triggerBase);
+    $pipelineDir = $projectRoot . '/pipelines/pipeline-' . $pipelineId;
+    if (!is_dir($pipelineDir)) mkdir($pipelineDir, 0755, true);
+    foreach (glob($templatePath . '/*') ?: [] as $f) {
+        if (is_file($f)) copy($f, $pipelineDir . '/' . basename($f));
+    }
+    if (is_file($templatePath . '/.env.example')) copy($templatePath . '/.env.example', $pipelineDir . '/.env.example');
+    $envVars = ['REPLICATE_API_TOKEN', 'FAL_KEY', 'FAL_VIDEO_MODEL', 'VIDEO_PROVIDER', 'POCKETBASE_URL', 'GARAGE_ENDPOINT', 'GARAGE_ACCESS_KEY', 'GARAGE_SECRET_KEY', 'GARAGE_BUCKET', 'GARAGE_REGION'];
+    $projectEnv = $projectRoot . '/.env';
+    $pipelineEnvLines = [];
+    if (is_file($projectEnv)) {
+        $lines = file($projectEnv, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) ?: [];
+        foreach ($lines as $line) {
+            $line = trim($line);
+            if (strpos($line, '#') === 0) continue;
+            if (preg_match('/^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/', $line, $m) && in_array(trim($m[1]), $envVars)) $pipelineEnvLines[] = $line;
+            if (preg_match('/^(FORMATFORGE_EMAIL|FORMATFORGE_PASSWORD)=(.*)$/', $line, $m)) $pipelineEnvLines[] = $m[1] . '=' . trim($m[2], " \t\"'");
+            if (preg_match('/^(ADMIN_EMAIL|ADMIN_PASSWORD)=(.*)$/', $line, $m)) $pipelineEnvLines[] = ($m[1] === 'ADMIN_EMAIL' ? 'FORMATFORGE_EMAIL' : 'FORMATFORGE_PASSWORD') . '=' . trim($m[2], " \t\"'");
+        }
+    }
+    file_put_contents($pipelineDir . '/.env', implode("\n", array_unique($pipelineEnvLines)) . "\n");
+    $piDir = $projectRoot . '/.pi';
+    if (!is_dir($piDir)) mkdir($piDir, 0755, true);
+    if (!is_dir($piDir . '/prompts')) mkdir($piDir . '/prompts', 0755, true);
+    $piEnvFile = $piDir . '/pipeline-' . $pipelineId . '.env';
+    $piEnvLines = [];
+    if (is_file($projectEnv)) {
+        $piVars = ['OPENROUTER_API_KEY', 'PI_MODEL', 'ANTHROPIC_API_KEY', 'OPENAI_API_KEY'];
+        foreach (file($projectEnv, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) ?: [] as $line) {
+            $line = trim($line);
+            if (strpos($line, '#') === 0) continue;
+            if (preg_match('/^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/', $line, $m) && in_array(trim($m[1]), $piVars)) $piEnvLines[] = 'export ' . $m[1] . '=' . escapeshellarg(trim($m[2], " \t\"'"));
+        }
+    }
+    $hasPiModel = false;
+    foreach ($piEnvLines as $l) { if (strpos($l, 'PI_MODEL') !== false) { $hasPiModel = true; break; } }
+    if (!$hasPiModel) $piEnvLines[] = 'export PI_MODEL="openai/gpt-4o-mini"';
+    file_put_contents($piEnvFile, implode("\n", $piEnvLines) . "\n");
+    $promptFile = $piDir . '/prompts/pipeline-' . $pipelineId . '.md';
+    $contextJson = json_encode($context, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES);
+    $task = $reason === 'content_rejected'
+        ? "Content was rejected. Create or edit a content pipeline to improve output.\n\n1. Pipeline dir: `$pipelineDir`\n2. Edit `$pipelineDir/.env` PROMPT or PROMPT_TEMPLATE based on rejected content and reason\n3. Build: `cd $pipelineDir && go build -o pipeline-generate .`\n4. Crontab: `0 */6 * * * cd $pipelineDir && set -a && . .env && set +a && ./pipeline-generate`"
+        : "Novel content.\n\n1. Pipeline dir: `$pipelineDir`\n2. .env copied. Build: `cd $pipelineDir && go build -o pipeline-generate .`\n3. Crontab: `0 */6 * * * cd $pipelineDir && set -a && . .env && set +a && ./pipeline-generate`";
+    $promptContent = "# FormatForge pipeline setup\n\n**Trigger:** $reason\n**Created:** $created\n\n## Context\n\n```json\n$contextJson\n```\n\n## Task\n\n$task\n\n## Pi env\n\nSource: `$piEnvFile`\n\nRequired: OPENROUTER_API_KEY or ANTHROPIC_API_KEY or OPENAI_API_KEY\nModel: PI_MODEL\n";
+    file_put_contents($promptFile, $promptContent);
+}
+
+// CLI: php index.php setup-pipeline [trigger_file]
+if (PHP_SAPI === 'cli' && ($argv[1] ?? '') === 'setup-pipeline') {
+    $triggerFile = $argv[2] ?? null;
+    $triggerDir = $GLOBALS['CONFIG']['pi_trigger_dir'] ?? __DIR__ . '/.pi/triggers';
+    if (!$triggerFile) {
+        $files = glob($triggerDir . '/trigger_*.json');
+        if (empty($files)) { fwrite(STDERR, "No trigger. Usage: php index.php setup-pipeline [trigger_file]\n"); exit(1); }
+        usort($files, fn($a, $b) => filemtime($b) <=> filemtime($a));
+        $triggerFile = $files[0];
+    }
+    if (!is_file($triggerFile)) { fwrite(STDERR, "Not found: $triggerFile\n"); exit(1); }
+    setup_pipeline_from_trigger($triggerFile);
+    exit(0);
+}
+
+function fetch_recent_content_prompts(?string $authHeader): array {
+    $qs = http_build_query(['filter' => 'status="approved" || status="published"', 'perPage' => 50, 'sort' => '-created']);
+    $r = pb_request('GET', '/api/collections/content_items/records?' . $qs, null, $authHeader);
+    if ($r['code'] !== 200 || empty($r['body']['items'])) return [];
+    $out = [];
+    foreach ($r['body']['items'] as $it) {
+        $p = $it['prompt'] ?? '';
+        if ($p) $out[] = $p;
+    }
+    return $out;
+}
+
+function maybe_trigger_pi(string $action, array $context): void {
+    $cfg = $GLOBALS['CONFIG'];
+    if (empty($cfg['pi_trigger_dir'])) return;
+    if ($action === 'reject') {
+        trigger_pi_for_pipeline('content_rejected', $context);
+        return;
+    }
+    if (($action === 'add_link' || $action === 'approve') && !empty($context['prompt'])) {
+        $existing = $context['existing_prompts'] ?? [];
+        if (content_is_novel($context['prompt'], $existing)) {
+            trigger_pi_for_pipeline('novel_content', $context);
+        }
+    }
+}
+
 // Auth
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'auth_callback') {
     header('Content-Type: application/json');
@@ -245,6 +493,68 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'login
         }
     }
     header('Location: ' . ($_SERVER['REQUEST_URI'] ?: '/') . '?login_error=1');
+    exit;
+}
+
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'register') {
+    if (!is_internal_network()) {
+        header('Location: ' . ($_SERVER['REQUEST_URI'] ?: '/') . '?register_error=not_allowed');
+        exit;
+    }
+    $email = trim($_POST['email'] ?? '');
+    $password = $_POST['password'] ?? '';
+    $passwordConfirm = $_POST['password_confirm'] ?? '';
+    if (!$email || !$password || $password !== $passwordConfirm) {
+        header('Location: ' . ($_SERVER['REQUEST_URI'] ?: '/') . '?register_error=validation');
+        exit;
+    }
+    if (strlen($password) < 8) {
+        header('Location: ' . ($_SERVER['REQUEST_URI'] ?: '/') . '?register_error=password_short');
+        exit;
+    }
+    $create = pb_request('POST', '/api/collections/' . $GLOBALS['CONFIG']['users_collection'] . '/records', [
+        'email' => $email,
+        'password' => $password,
+        'passwordConfirm' => $passwordConfirm,
+    ], null);
+    if ($create['code'] >= 200 && $create['code'] < 300) {
+        $auth = pb_request('POST', '/api/collections/' . $GLOBALS['CONFIG']['users_collection'] . '/auth-with-password', [
+            'identity' => $email,
+            'password' => $password,
+        ], null);
+        if ($auth['code'] === 200 && !empty($auth['body']['token'])) {
+            $_SESSION['pb_token'] = $auth['body']['token'];
+            $_SESSION['pb_user'] = $auth['body']['record'] ?? [];
+            header('Location: ' . ($_SERVER['REQUEST_URI'] ?: '/'));
+            exit;
+        }
+    }
+    $err = $create['body']['message'] ?? $create['body']['msg'] ?? null;
+    if ($err === null && isset($create['body']['data'])) {
+        $d = $create['body']['data'];
+        if (is_array($d)) {
+            $parts = [];
+            foreach ($d as $field => $v) {
+                $msg = is_array($v) ? ($v['message'] ?? $v['code'] ?? json_encode($v)) : (string) $v;
+                $parts[] = $field . ': ' . $msg;
+            }
+            $err = implode('; ', $parts) ?: json_encode($d);
+        } else {
+            $err = (string) $d;
+        }
+    }
+    if (!$err) {
+        $code = $create['code'];
+        $raw = $create['raw'] ?? '';
+        if ($code === 0 || ($create['curl_errno'] ?? 0) !== 0) {
+            $err = 'Cannot reach PocketBase. Check POCKETBASE_URL and that PocketBase is running.';
+        } elseif ($code >= 400) {
+            $err = 'PocketBase returned HTTP ' . $code . (strlen($raw) > 0 && !str_starts_with(trim($raw), '{') ? '. Response was not JSON.' : '.');
+        } else {
+            $err = 'Unexpected response (HTTP ' . $code . ').';
+        }
+    }
+    header('Location: ' . ($_SERVER['REQUEST_URI'] ?: '/') . '?register_error=' . urlencode(is_string($err) ? $err : json_encode($err)));
     exit;
 }
 
@@ -334,6 +644,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && $user && $authHeader) {
             'status' => 'pending',
         ], $authHeader);
         if ($rec['code'] >= 200 && $rec['code'] < 300) {
+            $existing = fetch_recent_content_prompts($authHeader);
+            maybe_trigger_pi('add_link', ['url' => $url, 'prompt' => $url, 'existing_prompts' => $existing]);
             echo json_encode(['ok' => true, 'id' => $rec['body']['id'] ?? null]);
         } else {
             echo json_encode(['ok' => false, 'error' => $rec['body']['message'] ?? 'Failed']);
@@ -356,17 +668,34 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && $user && $authHeader) {
             exit;
         }
         $itemId = $rec['body']['id'] ?? null;
-        $model = 'minimax/video-01:5aa835260ff7f40f4069c41185f72036accf99e29957bb4a3b3a911f3b6c1912';
-        $pred = replicate_run($model, ['prompt' => $prompt], 120);
-        if (!$pred || empty($pred['output'])) {
-            pb_request('PATCH', "/api/collections/content_items/records/{$itemId}", ['status' => 'failed'], $authHeader);
-            echo json_encode(['ok' => false, 'error' => 'Replicate generation failed']);
-            exit;
+        $cfg = $GLOBALS['CONFIG'];
+        $provider = $cfg['video_provider'] ?: ($cfg['replicate_token'] ? 'replicate' : ($cfg['fal_key'] ? 'fal' : 'replicate'));
+        $videoUrl = null;
+        $errMsg = 'Video generation failed';
+
+        if ($provider === 'fal' && $cfg['fal_key']) {
+            $falModel = getenv('FAL_VIDEO_MODEL') ?: 'fal-ai/kling-video/v2.5-turbo/pro/text-to-video';
+            $pred = fal_run($falModel, ['prompt' => $prompt, 'aspect_ratio' => '9:16'], 120);
+            if ($pred && !empty($pred['video']['url'])) {
+                $videoUrl = $pred['video']['url'];
+            } else {
+                $errMsg = 'fal.ai generation failed';
+            }
         }
-        $videoUrl = is_array($pred['output']) ? ($pred['output'][0] ?? $pred['output']['url'] ?? null) : $pred['output'];
+
+        if (!$videoUrl && ($provider !== 'fal' || !$cfg['fal_key']) && $cfg['replicate_token']) {
+            $model = 'minimax/video-01:5aa835260ff7f40f4069c41185f72036accf99e29957bb4a3b3a911f3b6c1912';
+            $pred = replicate_run($model, ['prompt' => $prompt], 120);
+            if ($pred && !empty($pred['output'])) {
+                $videoUrl = is_array($pred['output']) ? ($pred['output'][0] ?? $pred['output']['url'] ?? null) : $pred['output'];
+            } else {
+                $errMsg = 'Replicate generation failed';
+            }
+        }
+
         if (!$videoUrl) {
             pb_request('PATCH', "/api/collections/content_items/records/{$itemId}", ['status' => 'failed'], $authHeader);
-            echo json_encode(['ok' => false, 'error' => 'No video URL']);
+            echo json_encode(['ok' => false, 'error' => $errMsg]);
             exit;
         }
         $videoData = @file_get_contents($videoUrl) ?: '';
@@ -393,10 +722,16 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && $user && $authHeader) {
         $id = $_POST['id'] ?? '';
         $accountId = $_POST['account_id'] ?? '';
         if (!$id || !$accountId) { echo json_encode(['ok' => false, 'error' => 'Missing id or account_id']); exit; }
+        $item = pb_request('GET', "/api/collections/content_items/records/{$id}", null, $authHeader);
         $up = pb_request('PATCH', "/api/collections/content_items/records/{$id}", [
             'status' => 'approved',
             'instagram_account_id' => $accountId,
         ], $authHeader);
+        if ($up['code'] >= 200 && $up['code'] < 300 && $item['code'] === 200) {
+            $prompt = $item['body']['prompt'] ?? '';
+            $existing = fetch_recent_content_prompts($authHeader);
+            maybe_trigger_pi('approve', ['id' => $id, 'prompt' => $prompt, 'existing_prompts' => $existing]);
+        }
         echo json_encode(['ok' => $up['code'] >= 200 && $up['code'] < 300]);
         exit;
     }
@@ -405,10 +740,18 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && $user && $authHeader) {
         $id = $_POST['id'] ?? '';
         $reason = $_POST['reason'] ?? '';
         if (!$id) { echo json_encode(['ok' => false, 'error' => 'Missing id']); exit; }
+        $item = pb_request('GET', "/api/collections/content_items/records/{$id}", null, $authHeader);
         $up = pb_request('PATCH', "/api/collections/content_items/records/{$id}", [
             'status' => 'rejected',
             'rejected_reason' => $reason,
         ], $authHeader);
+        if ($up['code'] >= 200 && $up['code'] < 300 && $item['code'] === 200) {
+            maybe_trigger_pi('reject', [
+                'id' => $id,
+                'prompt' => $item['body']['prompt'] ?? '',
+                'rejected_reason' => $reason,
+            ]);
+        }
         echo json_encode(['ok' => $up['code'] >= 200 && $up['code'] < 300]);
         exit;
     }
@@ -534,21 +877,57 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && $user && $authHeader) {
         <h1><?= htmlspecialchars($CONFIG['site_name']) ?></h1>
         <p style="margin: 1rem 0; color: var(--muted);">Log in to manage your content pipeline.</p>
         <?php if (!empty($_GET['login_error'])): ?><div class="msg error">Invalid email or password.</div><?php endif; ?>
-        <form method="post" action="<?= htmlspecialchars($_SERVER['SCRIPT_NAME']) ?>">
-            <input type="hidden" name="action" value="login">
-            <div class="form-group">
-                <label>Email</label>
-                <input type="email" name="email" required>
+        <?php if (!empty($_GET['register_error'])): ?>
+            <div class="msg error">
+                <?php
+                $re = $_GET['register_error'];
+                echo htmlspecialchars($re === 'not_allowed' ? 'Account creation is only allowed from the internal network.' : ($re === 'validation' ? 'Passwords must match.' : ($re === 'password_short' ? 'Password must be at least 8 characters.' : $re)));
+                ?>
             </div>
-            <div class="form-group">
-                <label>Password</label>
-                <input type="password" name="password" required>
+        <?php endif; ?>
+        <div style="display: flex; gap: 1.5rem; flex-wrap: wrap; align-items: flex-start;">
+            <div>
+                <h3 style="margin-bottom: 0.75rem; font-size: 1rem;">Log in</h3>
+                <form method="post" action="<?= htmlspecialchars($_SERVER['SCRIPT_NAME']) ?>">
+                    <input type="hidden" name="action" value="login">
+                    <div class="form-group">
+                        <label>Email</label>
+                        <input type="email" name="email" required>
+                    </div>
+                    <div class="form-group">
+                        <label>Password</label>
+                        <input type="password" name="password" required>
+                    </div>
+                    <button type="submit" class="btn btn-primary">Log in</button>
+                </form>
             </div>
-            <button type="submit" class="btn btn-primary">Log in</button>
-        </form>
-        <p style="margin-top: 1rem; font-size: 0.875rem; color: var(--muted);">
-            Create an account via PocketBase Admin: <?= htmlspecialchars($CONFIG['pocketbase_url']) ?>
-        </p>
+            <?php if (is_internal_network()): ?>
+            <div style="border-left: 1px solid var(--border); padding-left: 1.5rem;">
+                <h3 style="margin-bottom: 0.75rem; font-size: 1rem;">Create account</h3>
+                <p style="font-size: 0.8rem; color: var(--muted); margin-bottom: 0.75rem;">You're on the internal network. Create a new account.</p>
+                <form method="post" action="<?= htmlspecialchars($_SERVER['SCRIPT_NAME']) ?>">
+                    <input type="hidden" name="action" value="register">
+                    <div class="form-group">
+                        <label>Email</label>
+                        <input type="email" name="email" required>
+                    </div>
+                    <div class="form-group">
+                        <label>Password</label>
+                        <input type="password" name="password" required minlength="8">
+                    </div>
+                    <div class="form-group">
+                        <label>Confirm password</label>
+                        <input type="password" name="password_confirm" required minlength="8">
+                    </div>
+                    <button type="submit" class="btn btn-secondary">Create account</button>
+                </form>
+            </div>
+            <?php else: ?>
+            <p style="font-size: 0.875rem; color: var(--muted);">
+                Create an account via PocketBase Admin: <?= htmlspecialchars($CONFIG['pocketbase_url']) ?>
+            </p>
+            <?php endif; ?>
+        </div>
     </div>
 <?php else: ?>
     <div class="app">
