@@ -9,6 +9,8 @@ Single-file PHP dashboard for AI content generation, curation, and Instagram pub
 ./scripts/start.sh                 # start PocketBase + PHP built-in server
 ```
 
+**Production (formatforgeplus.com):** See [DEPLOYMENT.md](DEPLOYMENT.md) for nginx, SSL, and DNS setup.
+
 **Or with nginx + PHP-FPM + PocketBase (Docker):**
 ```bash
 docker compose -f docker-compose.nginx.yml up -d
@@ -26,6 +28,7 @@ docker compose -f docker-compose.nginx.yml up -d
    - **Docker:** Set `ADMIN_EMAIL` and `ADMIN_PASSWORD` in `.env` before `docker compose up` (auto-creates on first run), or run: `docker compose -f docker-compose.nginx.yml exec pocketbase pocketbase superuser create --dir /pb_data`
 2. **Copy .env:** `cp .env.example .env` and fill in:
    - `ADMIN_EMAIL`, `ADMIN_PASSWORD`, `MIGRATE_SECRET`
+   - `APP_VERSION` (e.g. `v1.0.9`)
    - `GARAGE_*` (S3-compatible storage)
    - `REPLICATE_API_TOKEN` (or `FAL_KEY` for fal.ai)
    - `FB_APP_ID`, `FB_APP_SECRET`, `INSTAGRAM_REDIRECT_URI` (for Instagram OAuth)
@@ -53,6 +56,8 @@ docker compose -f docker-compose.nginx.yml up -d
 - **Instagram Graph API** — OAuth + publish Reels
 - **Antfly** — Self-hosted; index metadata for search (optional)
 - **ffmpeg** — Video compositing (used by generation pipeline)
+- **gallery-dl** — Fetch images from galleries (Instagram, Imgur, DeviantArt, etc.)
+- **yt-dlp** — Fetch video/audio from YouTube and similar sites
 
 ## Autonomous pipeline triggers (pi coding agent)
 
