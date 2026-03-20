@@ -4,32 +4,41 @@
 # Example: ./scripts/diagnose-web-front.sh formatforgeplus.com
 HOST="${1:-formatforgeplus.com}"
 
-echo "=== Processes on 80 / 443 ==="
-sudo sh -c 'command -v ss >/dev/null && ss -tlnp | grep -E ":(80|443)\s" || true; netstat -tlnp 2>/dev/null | grep -E ":(80|443)\s" || true'
+echo "=== Processes on 80 / 443 (one line each; full ss lists every nginx worker) ==="
+sudo ss -tlnp 2>/dev/null | grep -E ':80\s' | head -1 || true
+sudo ss -tlnp 2>/dev/null | grep -E ':443\s' | head -1 || true
 
 echo ""
-echo "=== Any apache left? ==="
-ps aux 2>/dev/null | grep -E '[a]pache|[h]ttpd' || echo "(none)"
+echo "=== Leftovers from Apache (safe to purge apache2* if you use nginx only) ==="
+ps aux 2>/dev/null | grep -E '[h]tcacheclean|[a]pache2|[h]ttpd' || echo "(none obvious)"
 
 echo ""
 echo "=== nginx sites-enabled ==="
 ls -la /etc/nginx/sites-enabled/ 2>/dev/null || echo "(no /etc/nginx/sites-enabled)"
 
-echo ""
-echo "=== Which server block is default for :80? (default_server wins for bare IP / unknown Host) ==="
-if sudo nginx -T 2>/dev/null | grep -E 'listen.*80' | head -20; then
-  :
+if [ -L /etc/nginx/sites-enabled/formatforgeplus ] || [ -f /etc/nginx/sites-enabled/formatforgeplus ]; then
+  echo "OK: formatforgeplus is enabled."
 else
-  echo "(run: sudo nginx -T  … if permission denied)"
+  echo "!!! NO formatforgeplus in sites-enabled — nginx will ONLY serve the stock default site."
+  echo "    Fix: sudo rm -f /etc/nginx/sites-enabled/default"
+  echo "         sudo cp PATH/TO/formatforge/nginx/formatforgeplus.conf /etc/nginx/sites-available/formatforgeplus"
+  echo "         sudo ln -sf /etc/nginx/sites-available/formatforgeplus /etc/nginx/sites-enabled/formatforgeplus"
+  echo "         sudo nginx -t && sudo systemctl reload nginx"
 fi
 
 echo ""
-echo "=== Response body — curl by IP, no Host (often hits nginx default → /var/www/html) ==="
+echo "=== active default_server on :80 (from nginx -T) ==="
+sudo nginx -T 2>/dev/null | grep -E '^\s*listen\s+.*80' | head -15 || echo "(sudo nginx -T failed — run with sudo?)"
+
+echo ""
+echo "=== curl 127.0.0.1/ (no Host) — first lines ==="
 curl -sS --max-time 5 http://127.0.0.1/ 2>/dev/null | head -5 || echo "curl failed"
 
 echo ""
-echo "=== Response body — curl with Host: $HOST (should be FormatForge if vhost is set up) ==="
+echo "=== curl with Host: $HOST — first lines ==="
 curl -sS --max-time 5 -H "Host: $HOST" http://127.0.0.1/ 2>/dev/null | head -5 || echo "curl failed"
 
 echo ""
-echo "=== If first block still says Apache but ps shows no apache: purge CDN/browser cache, or you hit another machine ==="
+echo "=== Title sniff (empty = no <title> or HTML) ==="
+printf 'no Host:    '; curl -sS --max-time 5 http://127.0.0.1/ 2>/dev/null | tr '\n' ' ' | sed 's/.*<title>\([^<]*\).*/\1/' | head -c 80; echo
+printf 'Host %s: ' "$HOST"; curl -sS --max-time 5 -H "Host: $HOST" http://127.0.0.1/ 2>/dev/null | tr '\n' ' ' | sed 's/.*<title>\([^<]*\).*/\1/' | head -c 80; echo
