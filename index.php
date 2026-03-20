@@ -140,7 +140,7 @@ $CONFIG = [
     'pocketbase_public_url' => $pbPublicUrl,
     'site_url'         => $siteUrl,
     'site_name'        => getenv('SITE_NAME') ?: 'FormatForge',
-    'app_version'      => getenv('APP_VERSION') ?: 'v1.0.51',
+    'app_version'      => getenv('APP_VERSION') ?: 'v1.0.52',
     'users_collection' => 'users',
     'garage_endpoint'  => getenv('GARAGE_ENDPOINT') ?: 'http://127.0.0.1:3900',
     'garage_key'       => getenv('GARAGE_ACCESS_KEY') ?: '',
@@ -671,6 +671,40 @@ function ff_fetch_failure_hint(string $url): string {
         return ' Cookies file is set but may be expired — re-export from your browser (instagram.com logged in) and update GALLERY_DL_COOKIES.';
     }
     return ' Instagram (and similar) now block anonymous downloads. Export a Netscape cookies.txt while logged in at instagram.com, place it on the server, and set GALLERY_DL_COOKIES=/absolute/path/to/cookies.txt in .env (optional YT_DLP_COOKIES for yt-dlp).';
+}
+
+/** Strip tracking query (e.g. ?img_index=1) so IG post URLs dedupe and match the public share link. */
+function ff_canonical_fetch_url(string $url): string {
+    $url = trim($url);
+    $p = parse_url($url);
+    if (!is_array($p) || empty($p['scheme']) || empty($p['host'])) {
+        return $url;
+    }
+    $host = strtolower((string) $p['host']);
+    if ($host === 'instagram.com' || $host === 'www.instagram.com') {
+        $path = $p['path'] ?? '/';
+        return 'https://www.instagram.com' . rtrim($path, '/');
+    }
+    return $url;
+}
+
+/** Human-readable title for fetched media (shortcode for Instagram, else basename / “Media”). */
+function ff_short_title_for_fetch_url(string $url, string $fallbackBasename): string {
+    $url = trim($url);
+    if (preg_match('~instagram\.com/(?:p|reel|tv)/([^/?#]+)~i', $url, $m)) {
+        return 'IG ' . $m[1];
+    }
+    if (preg_match('~(?:youtube\.com/watch\?v=|youtu\.be/)([a-zA-Z0-9_-]{6,})~i', $url, $m)) {
+        return 'YouTube ' . $m[1];
+    }
+    if (preg_match('~tiktok\.com/.*/video/(\d+)~i', $url, $m)) {
+        return 'TikTok ' . $m[1];
+    }
+    $fb = trim($fallbackBasename);
+    if ($fb !== '' && $fb !== '.' && $fb !== '..') {
+        return $fb;
+    }
+    return 'Fetched media';
 }
 
 /**
@@ -2382,7 +2416,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && $user && $authHeader) {
     }
 
     if ($action === 'add_link') {
-        $url = trim($_POST['url'] ?? '');
+        $url = ff_canonical_fetch_url(trim($_POST['url'] ?? ''));
         $accountId = trim($_POST['account_id'] ?? '') ?: null;
         if (!$url || !filter_var($url, FILTER_VALIDATE_URL)) {
             echo json_encode(['ok' => false, 'error' => 'Invalid URL']);
@@ -2438,7 +2472,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && $user && $authHeader) {
             echo json_encode(['ok' => false, 'error' => 'Link not found']);
             exit;
         }
-        $url = $link['body']['url'];
+        $url = ff_canonical_fetch_url((string) $link['body']['url']);
         $linkAccountId = $link['body']['metadata']['instagram_account_id'] ?? null;
         [$files, $tmpDir, $viaUsed, $fetchMeta] = fetch_media_from_url_auto($url);
         $created = 0;
@@ -2468,6 +2502,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && $user && $authHeader) {
             if ($baseName === '' || $baseName === '.' || $baseName === '..') {
                 $baseName = 'fetched-media-' . ($fileIndex + 1);
             }
+            $displayTitle = ff_short_title_for_fetch_url($url, $baseName);
+            if ($fileIndex > 0) {
+                $displayTitle .= ' (' . ($fileIndex + 1) . ')';
+            }
             $key = 'content/' . $itemId . '/' . $baseName;
             $garageUrl = s3_upload($key, $content, $mime);
             if (!$garageUrl && $content) $garageUrl = $cfg['garage_endpoint'] . '/' . $cfg['garage_bucket'] . '/' . $key;
@@ -2476,7 +2514,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && $user && $authHeader) {
                 : (str_starts_with($mime, 'image/') ? 'carousel' : 'reel');
             $rec = pb_request('POST', '/api/collections/content_items/records', [
                 'type' => $type,
-                'title' => $baseName,
+                'title' => $displayTitle,
                 'prompt' => $url,
                 'source_link_id' => $linkId,
                 'status' => 'pending',
@@ -2493,10 +2531,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && $user && $authHeader) {
                 $created++;
                 $pbRowId = (string)($rec['body']['id'] ?? '');
                 if ($pbRowId !== '') {
-                    $caption = trim($baseName . "\n" . $url);
-                    $semanticBlob = formatforge_antfly_content_semantic_text($baseName, $url, $caption);
+                    $caption = trim($displayTitle . "\n" . $url);
+                    $semanticBlob = formatforge_antfly_content_semantic_text($displayTitle, $url, $caption);
                     $garage = $garageUrl ?: '';
-                    formatforge_index_content_in_antfly($pbRowId, $semanticBlob, $type, 'pending', $garage !== '' ? $garage : null, $mime, $url, $baseName);
+                    formatforge_index_content_in_antfly($pbRowId, $semanticBlob, $type, 'pending', $garage !== '' ? $garage : null, $mime, $url, $displayTitle);
                     if (fetched_text_is_novel_vs_pipelines($semanticBlob, $activePipelineRows)) {
                         $novelFetchedPrompts[] = $semanticBlob;
                     }
@@ -3152,7 +3190,7 @@ if (!empty($_GET['privacy']) || strpos($reqUri, '/privacy') !== false) {
                 <template x-for="p in pipelines" :key="p.id">
                     <div class="card" style="display: flex; flex-direction: column; gap: 0.5rem;">
                         <div style="display: flex; justify-content: space-between; align-items: flex-start; gap: 0.5rem;">
-                            <h3 style="margin: 0; font-size: 1rem;" x-text="p.name || 'Untitled'"></h3>
+                            <h3 style="margin: 0; font-size: 1rem;" x-text="pipelineLabel(p)"></h3>
                             <span class="badge" :class="p.is_active !== false ? 'badge-approved' : 'badge-pending'" x-text="p.is_active !== false ? 'Active' : 'Inactive'"></span>
                         </div>
                         <p style="font-size: 0.8rem; color: var(--muted); margin: 0; flex: 1;" x-text="(p.description || '').trim() || (p.prompt_template || '').slice(0, 120) + ((p.prompt_template || '').length > 120 ? '…' : '') || 'No description'"></p>
@@ -3232,7 +3270,7 @@ if (!empty($_GET['privacy']) || strpos($reqUri, '/privacy') !== false) {
         <div class="modal-backdrop" x-show="runModal.open" x-cloak x-transition @click.self="runModal.open = false" role="presentation">
             <div class="modal-panel" role="dialog" aria-modal="true" aria-labelledby="run-pipeline-title" @click.stop>
                 <h3 id="run-pipeline-title">Run pipeline</h3>
-                <p style="font-size: 0.9rem; color: var(--accent); margin-bottom: 0.5rem;" x-text="runModal.pipeline ? (runModal.pipeline.name || 'Untitled') : ''"></p>
+                <p style="font-size: 0.9rem; color: var(--accent); margin-bottom: 0.5rem;" x-text="runModal.pipeline ? pipelineLabel(runModal.pipeline) : ''"></p>
                 <p style="font-size: 0.8rem; color: var(--muted); margin-bottom: 0.5rem;">Template (from Pi / admin)</p>
                 <div class="pipeline-preview" x-text="runModal.pipeline && (runModal.pipeline.prompt_template || '').trim() ? runModal.pipeline.prompt_template : '(no template yet — add extra instructions below, or have Cursor agent set it via PocketBase)'"></div>
                 <div class="form-group">
@@ -3294,6 +3332,7 @@ if (!empty($_GET['privacy']) || strpos($reqUri, '/privacy') !== false) {
                     if (!c) return false;
                     if (c.metadata && c.metadata.origin === 'fetch') return true;
                     if (c.metadata && (c.metadata.pipeline_id || c.metadata.origin === 'generate')) return false;
+                    if (c.metadata && c.metadata.source_url && !c.metadata.pipeline_id) return true;
                     return !!(c.source_link_id && !c.metadata?.pipeline_id);
                 },
 
@@ -3314,13 +3353,32 @@ if (!empty($_GET['privacy']) || strpos($reqUri, '/privacy') !== false) {
                     return this.content.filter(c => !this.isFetchedMedia(c) && !this.isPipelineGenerated(c));
                 },
 
+                pipelineLabel(p) {
+                    const n = String(p?.name || '').trim();
+                    if (n) return n;
+                    const tmpl = String(p?.prompt_template || '').trim().replace(/\s+/g, ' ');
+                    if (tmpl) return tmpl.length > 52 ? tmpl.slice(0, 52) + '…' : tmpl;
+                    const id = String(p?.id || '');
+                    return id ? ('Pipeline · ' + id.slice(0, 10)) : 'Pipeline';
+                },
+
                 contentItemTitle(c) {
                     const t = String(c?.title || '').trim();
                     if (t) return t;
-                    const p = String(c?.prompt || '').trim();
-                    if (p) return p.length > 80 ? p.slice(0, 80) + '…' : p;
+                    const pr = String(c?.prompt || '').trim();
+                    if (pr) return pr.length > 80 ? pr.slice(0, 80) + '…' : pr;
+                    const su = String(c?.metadata?.source_url || '').trim();
+                    if (su) {
+                        const ig = su.match(/instagram\.com\/(?:p|reel|tv)\/([^/?#]+)/i);
+                        if (ig) return 'IG ' + ig[1];
+                        return su.length > 72 ? su.slice(0, 72) + '…' : su;
+                    }
+                    const gk = String(c?.garage_key || '');
+                    const leaf = gk.includes('/') ? gk.split('/').pop() : gk;
+                    if (leaf && leaf !== 'content') return leaf;
                     if (this.isFetchedMedia(c)) return 'Fetched media';
-                    return 'Untitled';
+                    const id = String(c?.id || '');
+                    return id ? ('Item · ' + id.slice(0, 8)) : 'Untitled';
                 },
 
                 init() {
