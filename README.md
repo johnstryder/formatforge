@@ -1,6 +1,6 @@
 # FormatForge — Autonomous Content Pipeline
 
-Single-file PHP dashboard for AI content generation, curation, and Instagram publishing. Built on tazzamphp (PocketBase + Alpine.js).
+Single-file PHP dashboard for AI content generation, curation, and Instagram publishing (PHP + PocketBase + Alpine.js).
 
 ## Quick start
 
