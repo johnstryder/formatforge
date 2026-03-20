@@ -47,7 +47,10 @@ else
 fi
 
 echo "=== curl origin (nginx on this machine) ==="
-curl -sS -o /dev/null -w "HTTP %{http_code}\n" --max-time 5 -H "Host: $HOST" http://127.0.0.1/ || echo "curl failed"
+# Site root goes through PHP — 502 here usually means PHP-FPM socket/down/crash.
+curl -sS -o /dev/null -w "GET / (PHP) HTTP %{http_code}\n" --max-time 8 -H "Host: $HOST" http://127.0.0.1/ || echo "curl / failed"
+# /api/ proxies to PocketBase — 502 only here often means PB not listening on 127.0.0.1:8090.
+curl -sS -o /dev/null -w "GET /api/health (PocketBase) HTTP %{http_code}\n" --max-time 5 -H "Host: $HOST" http://127.0.0.1/api/health || echo "curl /api/health failed"
 
 echo "=== last nginx errors (if readable) ==="
 if [ -r /var/log/nginx/error.log ]; then
@@ -55,3 +58,18 @@ if [ -r /var/log/nginx/error.log ]; then
 else
   echo "sudo tail -40 /var/log/nginx/error.log"
 fi
+
+echo "=== php-fpm journal (last errors — pick your unit from above) ==="
+for u in php8.4-fpm php8.3-fpm php8.2-fpm php-fpm; do
+  systemctl is-active "$u" >/dev/null 2>&1 && journalctl -u "$u" -n 15 --no-pager 2>/dev/null && break
+done || true
+
+echo "=== nginx map for PocketBase /api/ and /_/ (missing → 502 if vhost uses pocketbase-proxy-common.conf) ==="
+if [ -f /etc/nginx/conf.d/formatforge_pb_map.conf ]; then
+  echo "OK: /etc/nginx/conf.d/formatforge_pb_map.conf"
+else
+  echo "MISSING: sudo cp $ROOT/nginx/snippets/formatforge_pb_map.conf /etc/nginx/conf.d/ && sudo nginx -t && sudo systemctl reload nginx"
+fi
+
+echo "=== PocketBase direct (502 on /api/ or /_/ only → fix PocketBase, not PHP-FPM) ==="
+curl -sS -o /dev/null -w "127.0.0.1:8090/api/health HTTP %{http_code}\n" --max-time 3 http://127.0.0.1:8090/api/health || echo "curl :8090 failed (nothing listening or refused)"

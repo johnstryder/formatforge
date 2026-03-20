@@ -39,6 +39,15 @@ ln -sfn "$AVAIL" "$ENAB"
 echo "sites-enabled:"
 ls -la /etc/nginx/sites-enabled/
 
+MAP_SRC="$ROOT/nginx/snippets/formatforge_pb_map.conf"
+MAP_DST="/etc/nginx/conf.d/formatforge_pb_map.conf"
+if [ -f "$MAP_SRC" ] && [ ! -f "$MAP_DST" ]; then
+  cp -a "$MAP_SRC" "$MAP_DST"
+  echo "Installed PocketBase Connection map: $MAP_DST (required for /api/ and /_/ — see snippet header)"
+elif [ -f "$MAP_DST" ]; then
+  echo "PocketBase map already exists: $MAP_DST"
+fi
+
 if [ -x "$ROOT/scripts/align-php-fpm-socket.sh" ]; then
   echo "Updating fastcgi socket map..."
   if ! sh "$ROOT/scripts/align-php-fpm-socket.sh"; then

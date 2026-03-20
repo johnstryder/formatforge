@@ -80,12 +80,16 @@ Create the superuser if this is a fresh PocketBase data dir:
 
 ### systemd (PocketBase on `127.0.0.1:8090`)
 
-Copy `scripts/formatforge-pocketbase.service.example` to `/etc/systemd/system/formatforge-pocketbase.service`, edit `User=`, `WorkingDirectory=`, and `ExecStart=` paths, then:
+The PocketBase **binary** in this repo is **`formatforge-pb`** (parent folder name + `-pb`; see `./scripts/download-pocketbase.sh` / `./scripts/start.sh`). It is **not** a separate product called “formatforge-pocketbase” — that was only an old, confusing **systemd unit filename** in older docs.
+
+Copy **`scripts/formatforge-pb.service.example`** to **`/etc/systemd/system/formatforge-pb.service`**, edit `User=`, `WorkingDirectory=`, and `ExecStart=` if your tree isn’t `/var/www/formatforge`, then:
 
 ```bash
 sudo systemctl daemon-reload
-sudo systemctl enable --now formatforge-pocketbase
+sudo systemctl enable --now formatforge-pb
 ```
+
+You may name the unit file however you like; if yours differs, substitute that name in `systemctl` / `journalctl` commands below.
 
 ## 4. Configure `.env` (production)
 
@@ -107,6 +111,12 @@ pip install --user gallery-dl yt-dlp
 
 Instagram cookies: `storage/cookies/instagram_cookies.txt` or `cookies.txt` (see `storage/cookies/README.md`).
 
+**Instagram Insights → `content_metrics`:** After publish, rows have `instagram_media_id`. From the app directory (with `.env` loaded), run **`php index.php sync-instagram-insights`** periodically (e.g. cron daily) so PocketBase gets likes, comments, impressions/views, shares. The long-lived Page/User token on each **`instagram_accounts`** record must include Meta **insights** permissions (e.g. `instagram_manage_insights` — check current Graph API docs). Some insight values appear after ~24–48h.
+
+**Cursor Agent as `www-data`:** default **`HOME=/var/www`** is usually not writable, so **`agent login`** and the CLI fail with token/storage/`mkdir …/.cursor` errors. Create **`CURSOR_AGENT_HOME`** (e.g. `/var/lib/formatforge-cursor`), `chown` to **`www-data`**, run **`agent login`** with **`HOME`** and **`XDG_*`** set to paths under that dir (see **`.env.example`** / **README**), then set **`CURSOR_AGENT_HOME`** in **`.env`**. The **`agent`** file is a launcher; the real CLI lives in the **same directory** as **`index.js`** and **`node_modules`** — copy that **whole tree** (or run [cursor.com/install](https://cursor.com/install) on the server). It also needs **Node** on the host (`apt install nodejs` / NodeSource; symlink **`/usr/local/bin/node`** if needed — see **README**).
+
+**Auto-sync CLI → `/opt/cursor-agent`:** when Cursor updates **`~/.local/share/cursor-agent/versions/`** on the deploy account, run **`./scripts/sync-cursor-agent-to-opt.sh`** (uses **`sudo`** for **`/opt`** unless you are root). **Cron (daily as root — no `sudo` password prompt):** copy **`scripts/cursor-agent-sync.cron.example`** to **`/etc/cron.d/formatforge-cursor-agent-sync`** (**`chmod 644`**). **`/etc/cron.d` job lines must be one physical line** — if an editor soft-wraps, vars like **`CURSOR_AGENT_SYNC_RELOAD_PHP`** and **`>>/var/log/...`** break; use the recommended **wrapper** **`scripts/cursor-agent-sync-root-invoke.sh.example`** → **`/usr/local/sbin/formatforge-cursor-agent-sync`** so the crontab stays short. **systemd** alternative: **`scripts/cursor-agent-sync.service.example`** + **`scripts/cursor-agent-sync.timer.example`**. Dry run: **`./scripts/sync-cursor-agent-to-opt.sh --dry-run`**.
+
 ## 5. nginx
 
 The public site must be served by **this host’s nginx** (PHP-FPM + optional `/pb/` proxy). If DNS points here but something else answers, or PHP-FPM is down / socket mismatched, you’ll see **502** (from Cloudflare or from nginx directly).
@@ -119,7 +129,20 @@ From your clone (e.g. `~/formatforge`):
 sudo ./scripts/install-formatforge-nginx-site.sh
 ```
 
-This symlinks the clone to **`/var/www/formatforge`**, copies **`nginx/formatforgeplus.conf`** into **`sites-available`**, links **`sites-enabled`**, removes **`default`**, runs **`align-php-fpm-socket.sh`** when possible, **`nginx -t`s**, and **starts or reloads nginx**.
+This symlinks the clone to **`/var/www/formatforge`**, copies **`nginx/formatforgeplus.conf`** into **`sites-available`**, links **`sites-enabled`**, removes **`default`**, installs **`/etc/nginx/conf.d/formatforge_pb_map.conf`** (PocketBase **`Connection`** / upgrade map — **required** for `/api/` and `/_/`), runs **`align-php-fpm-socket.sh`** when possible, **`nginx -t`s**, and **starts or reloads nginx**.
+
+### **`/_/` (PocketBase admin) or `/api/` returns 502** but the PHP app works
+
+The old vhost set **`Connection: upgrade`** on every proxied request. PocketBase’s own [production guide](https://pocketbase.io/docs/going-to-production/) expects an **empty** `Connection` for normal traffic; forcing **upgrade** commonly breaks the admin/API and nginx may report **502**.
+
+1. Ensure the **map** exists and nginx was reloaded after **`formatforgeplus.conf`** started including **`pocketbase-proxy-common.conf`**:
+   ```bash
+   sudo cp /var/www/formatforge/nginx/snippets/formatforge_pb_map.conf /etc/nginx/conf.d/
+   sudo nginx -t && sudo systemctl reload nginx
+   ```
+   If **`nginx -t`** errors on **`$formatforge_pb_connection`**, the map file is missing or not in **`http { }`** (Debian/Ubuntu: **`/etc/nginx/conf.d/*.conf`** is fine).
+2. Confirm PocketBase is up: **`curl -sS -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8090/api/health`**
+3. If admin still misbehaves (redirects, assets), PocketBase **recommends a subdomain** instead of a path — see **`nginx/formatforge-pb-subdomain.conf.example`** and set **`POCKETBASE_PUBLIC_URL`** to that host.
 
 **Paste trap:** If you copy `sudo cp /path/to/formatforgeplus.conf` and hit Enter before the destination on the same line, `cp` fails with *missing destination* and nothing is installed — use the script above or keep **source and dest on one line**.
 
@@ -196,6 +219,28 @@ sudo nginx -t && sudo systemctl reload nginx
 
 ### Cloudflare shows **502 Bad Gateway**
 
+Cloudflare reached your origin, but **nginx returned 502** (or an empty/broken response). Most often:
+
+1. **PHP-FPM is stopped** or **restarted with a new socket** while nginx still points at the old `unix:/run/php/...sock` → run `align-php-fpm-socket.sh` and reload nginx.
+2. **`fastcgi_pass` path is wrong** — nginx `include` must point at the same clone as the file `align-php-fpm-socket.sh` just updated (often **`/var/www/formatforge/nginx/fastcgi-pass.conf`**).
+3. **Only `/pb/` (e.g. **`/pb/_/`** admin) returns 502** — nginx’s **`proxy_pass`** to PocketBase failed. The main PHP app can be fine.
+
+   **`curl: (7) Failed to connect to 127.0.0.1 port 8090`** means **nothing is listening** — usually **`formatforge-pb` is not running** or it **exits immediately** (check migrations). Start it:
+
+   ```bash
+   cd /var/www/formatforge   # or your clone
+   ./formatforge-pb serve --http=127.0.0.1:8090 --dir=./pb_data --migrationsDir=./pb_migrations
+   # or: sudo systemctl enable --now formatforge-pb
+   ```
+
+   If serve prints **`Dao is not defined`** or **`failed to apply migration`**, update **`pb_migrations/`** from this repo (FormatForge **v0.23+** PocketBase requires **`migrate((app) =>`**, not `Dao`), then try again. **`journalctl -u formatforge-pb -n 80`** shows the same errors under systemd.
+
+   When PocketBase is healthy:
+
+   ```bash
+   curl -sS -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8090/api/health   # expect 200
+   ```
+
 The origin nginx is up but **PHP-FPM is not connected** (wrong socket), **not running**, or **crashing**. On the server:
 
 ```bash
@@ -215,7 +260,7 @@ sudo nginx -t && sudo systemctl reload nginx
 
 Run **`align-php-fpm-socket.sh` from the same tree** your nginx `include …/nginx/fastcgi-pass.conf` points at. If nginx still references `/var/www/formatforge` but you only keep the app in `~/formatforge`, either **`sudo ln -sfn ~/formatforge /var/www/formatforge`** or edit the site config so `root` and every `include .../nginx/` path use your real directory.
 
-If errors mention **PocketBase** or **8090** on `/pb/` only, run: `sudo systemctl status formatforge-pocketbase`.
+If errors mention **PocketBase** or **8090** on `/api/` or `/_/` only, run: `sudo systemctl status formatforge-pb` (or whatever you named the unit that runs **`formatforge-pb`**).
 
 ## 6. SSL (Let's Encrypt)
 
@@ -231,7 +276,11 @@ Optional HTTP → HTTPS: uncomment `return 301` in the `:80` server block after 
 
 ## 7. PocketBase admin (remote)
 
-PocketBase should listen only on `127.0.0.1:8090`. Access:
+PocketBase should listen only on `127.0.0.1:8090`. **Through nginx** (`nginx/formatforgeplus.conf`), the API is at **`/api/`** and the admin UI at **`/_/`** (stryder.tech pattern).
+
+- **In the browser (same host as the app):** open **`https://formatforgeplus.com/_/`**
+
+**Optional:** SSH tunnel if you prefer localhost or `/api/`/`/_/` is blocked by a proxy:
 
 ```bash
 ssh -L 8090:127.0.0.1:8090 user@formatforgeplus.com

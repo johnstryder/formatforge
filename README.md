@@ -14,7 +14,7 @@ Single-file PHP dashboard for AI content generation, curation, and Instagram pub
 **Optional nginx:** `nginx/formatforge.conf` is a **host** sample (`127.0.0.1:8090` + PHP-FPM socket). For the public domain, prefer `nginx/formatforgeplus.conf`.
 
 - **App:** http://127.0.0.1:8000 (`start.sh`) or your nginx `server_name`
-- **PocketBase Admin:** http://127.0.0.1:8090/_/ (when PocketBase listens on 8090)
+- **PocketBase Admin:** With **`start.sh`**, http://127.0.0.1:8090/_/ (or whatever `.pb-port` says). **With nginx** (`formatforgeplus.conf`), the dashboard is at **`https://<your-domain>/_/`** — API at `/api/`, admin at `/_/` (stryder.tech pattern).
 
 ## Setup
 
@@ -47,7 +47,7 @@ Single-file PHP dashboard for AI content generation, curation, and Instagram pub
 - **Garage S3** — Store generated .mp4 files. Check signed uploads from the **same host as PHP**: `php index.php probe-garage`. Set **`GARAGE_ENDPOINT`** to a URL PHP can reach (often `http://127.0.0.1:3900` if Garage is on the same machine).
 - **Replicate** — Video generation (minimax/video-01)
 - **fal.ai** — Alternative video generation (Kling, LTX, etc.)
-- **Instagram Graph API** — OAuth + publish Reels
+- **Instagram Graph API** — OAuth + publish Reels; **`php index.php sync-instagram-insights`** (or web `action=sync_instagram_insights` while logged in) PATCHes **`content_metrics`** with likes, comments, impressions/views, shares when the token has **insights** scopes. Some metrics lag ~24–48h per Meta.
 - **Antfly** — Self-hosted search + **semantic index**: `content` docs carry **`media_url`** (Garage/public URL) plus text fields; Antfly’s embedding template calls **`remoteMedia`** then concatenates text (see `antfly_create_content_table` / `init-antfly.sh`). **Pipeline novelty** (whether to spawn Cursor to create a pipeline) uses **Antfly semantic query** on table **`pipeline_refs`** (synced from active PocketBase pipelines), not `embed_text()` in PHP.
 - **ffmpeg** — Video compositing (used by generation pipeline)
 - **Fetch (Curate)** — One **Fetch** button, no choosers: tries **direct HTTP** when the URL looks like a file, then **gallery-dl**, then **yt-dlp**.
@@ -67,11 +67,39 @@ After **Fetch**, if Antfly reports the item as **novel** vs synced **`pipeline_r
    - Writes **`.cursor-pipeline/prompts/pipeline-<id>.md`** — task prompt for the agent (same repo; Cursor `--workspace` is the project root)
 3. Spawns **`agent`** in the background ([Cursor CLI](https://cursor.com/cli)) with **`-p`**, **`--trust`**, **`-f`**, **`--model composer-2-fast`** by default ([Composer 2 / Cursor 2.0](https://cursor.com/blog/2-0))
 
-**Setup:**
-1. Install CLI: [cursor.com/install](https://cursor.com/install). Put **`agent`** somewhere **`www-data` can execute** — usually **`/usr/local/bin`** (see below). In **`.env`**, set **`CURSOR_AGENT_BIN=/usr/local/bin/agent`** (or the real path) so PHP does not depend on aLogin user’s `PATH`.
-2. **Auth:** `agent login` is enough (no `CURSOR_API_KEY` required). Run login **as `www-data`**, with an explicit binary path, e.g. `sudo -u www-data /usr/local/bin/agent login`. Optional: **`CURSOR_API_KEY`** in `.env` for non-interactive setups.
+The Markdown **`## Context`** block adds **`operating_context`**: latest **`pipelines`** rows, **`target_posts_per_day`** (from **`TARGET_POSTS_PER_DAY`**) vs **`published_count_last_24h`**, recent published items plus **`content_metrics_by_item_id`** when those columns are populated (run **`sync-instagram-insights`** or the web sync so likes/impressions/etc. are filled after publish), and small samples of fetched vs pipeline-generated **`content_items`**. For **novel** fetches it also adds **`semantic_nearest_pipeline_to_this_fetch`** and a **`semantic_novelty_explainer`**.
 
-**`sudo: agent: command not found`:** `sudo -u www-data` uses a **short `PATH`** and often **cannot see** `agent` in your home directory. As your deploy user, find the binary: `command -v agent` or `ls ~/.local/bin/agent ~/.cursor/**/agent 2>/dev/null`. Then install for everyone, e.g. `sudo cp "$(command -v agent)" /usr/local/bin/agent && sudo chmod 755 /usr/local/bin/agent`, and log in: `sudo -u www-data /usr/local/bin/agent login`. If the binary stays under **`/home/you/`**, either **`chmod o+x /home/you`** so `www-data` can traverse and execute (less ideal) or always **`CURSOR_AGENT_BIN=/absolute/path`** and ensure that path is world-executable.
+**Setup:**
+1. Install the **full** Cursor CLI on the server — not just a single file. Official one-liner: [cursor.com/install](https://cursor.com/install) (`curl … | bash`). In **`.env`**, set **`CURSOR_AGENT_BIN`** to the **`agent` launcher inside that install** (whatever path the installer prints). If you **copy** from another machine, copy the **entire directory** that contains **`index.js`** next to **`agent`** (see **`Cannot find module … index.js`** below). Avoid **`sudo cp …/agent /usr/local/bin`** alone — that leaves **`index.js`** behind.
+2. **Auth:** `agent login` is enough (no `CURSOR_API_KEY` required). Run login **as `www-data`**, with an explicit binary path.
+
+**`/var/www` not writable (`EACCES` on `.cursor`, “Failed to store authentication tokens”):** `www-data` often has **`HOME=/var/www`**, but **`/var/www` is root-owned (755)** — the CLI cannot create **`~/.cursor`** or write tokens. Create a dedicated directory and use it for login **and** in `.env` as **`CURSOR_AGENT_HOME`** (FormatForge exports `HOME` + `XDG_*` for the spawned agent):
+
+```bash
+sudo install -d -o www-data -g www-data /var/lib/formatforge-cursor
+sudo -u www-data env HOME=/var/lib/formatforge-cursor \
+  XDG_CONFIG_HOME=/var/lib/formatforge-cursor/.config \
+  XDG_DATA_HOME=/var/lib/formatforge-cursor/.local/share \
+  XDG_STATE_HOME=/var/lib/formatforge-cursor/.local/state \
+  XDG_CACHE_HOME=/var/lib/formatforge-cursor/.cache \
+  /usr/local/bin/agent login   # or: CURSOR_AGENT_BIN path
+```
+
+Then set **`CURSOR_AGENT_HOME=/var/lib/formatforge-cursor`** in **`.env`**.
+
+**`Cannot find module '/usr/local/bin/index.js'`:** the **`agent`** file is a thin launcher; Node loads **`index.js`** from the **same directory** (plus **`node_modules`**, native `.node` addons, etc.). Copying only **`agent`** to **`/usr/local/bin`** omits the rest. **Fix:** (a) Run the [official installer](https://cursor.com/install) **on the server** and use the **`agent`** path it installs. (b) Or on a machine where **`agent` works**, find the install root (it must contain **`index.js`**):
+
+```bash
+AGENT_DIR=$(dirname "$(readlink -f "$(command -v agent)")")
+echo "$AGENT_DIR"
+ls "$AGENT_DIR"   # expect index.js, node_modules, …
+```
+
+**Rsync/scp that whole directory** to e.g. **`/opt/cursor-agent`** on the server, then **`sudo chmod -R a+rX /opt/cursor-agent`**, set **`CURSOR_AGENT_BIN=/opt/cursor-agent/cursor-agent`** (or the real launcher name in that folder), and run **`agent login`** as **`www-data`** with **`CURSOR_AGENT_HOME`** / **`XDG_*`** as above. To refresh **`/opt/cursor-agent`** whenever Cursor ships a new local version, run **`./scripts/sync-cursor-agent-to-opt.sh`**, or install **cron** (**`scripts/cursor-agent-sync.cron.example`** + **`cursor-agent-sync-root-invoke.sh.example`**) / **systemd** (**`scripts/cursor-agent-sync.*.example`**) — see **`DEPLOYMENT.md`** (cron lines must not wrap).
+
+**`/usr/local/bin/node: No such file or directory`:** the launcher runs **Node**. Install Node on the server (**`sudo apt install -y nodejs`** or [NodeSource](https://github.com/nodesource/distributions) LTS), check **`head -25 "$(command -v agent)"`**, and if it expects **`/usr/local/bin/node`** but **`node`** is **`/usr/bin/node`**, run **`sudo ln -sf "$(command -v node)" /usr/local/bin/node`**.
+
+**`sudo: agent: command not found`:** `sudo -u www-data` uses a **short `PATH`** and often **cannot see** `agent` in your home directory. Use a **full path** in **`CURSOR_AGENT_BIN`**. If **`agent`** lives under **`/home/you/`**, either **`chmod o+x /home/you`** so **`www-data`** can traverse (less ideal) or install under **`/opt/…`** as above. Optional: **`CURSOR_API_KEY`** in **`.env`** for non-interactive setups.
 3. **`CURSOR_PIPELINE_TRIGGER_DIR`** in `.env` if you want a non-default path (default: **`.cursor-pipeline/triggers`**; legacy **`PI_TRIGGER_DIR`** still works)
 4. **`ANTFLY_URL`** + run `./scripts/init-antfly.sh` (tables **`content`** + **`pipeline_refs`**). Antfly needs OpenRouter for the table embedder (`EMBED_MODEL`, API key in Antfly env or embedder JSON). PHP **`OPENROUTER_API_KEY`** is still used for `embed_text()` in **`php index.php test-embed`** only.
 5. Optional: `CURSOR_AGENT_MODEL`, `CURSOR_AGENT_ENABLED=0` to disable auto-spawn

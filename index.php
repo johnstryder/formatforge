@@ -134,7 +134,7 @@ if (!$siteUrl) {
     if (!empty($_SERVER['HTTP_X_FORWARDED_HOST'])) $host = $_SERVER['HTTP_X_FORWARDED_HOST'];
     $siteUrl = $proto . '://' . preg_replace('/:\d+$/', '', $host);
 }
-$pbPublicUrl = getenv('POCKETBASE_PUBLIC_URL') ?: rtrim($siteUrl, '/') . '/pb';
+$pbPublicUrl = getenv('POCKETBASE_PUBLIC_URL') ?: rtrim($siteUrl, '/');
 $galleryCookiesEnv = getenv('GALLERY_DL_COOKIES');
 $galleryCookiesPath = ($galleryCookiesEnv !== false && trim((string)$galleryCookiesEnv) !== '')
     ? trim((string)$galleryCookiesEnv)
@@ -155,9 +155,11 @@ if (!is_string($cursorPipelineTriggerDir) || trim($cursorPipelineTriggerDir) ===
 $CONFIG = [
     'pocketbase_url'   => $pbUrl,
     'pocketbase_public_url' => $pbPublicUrl,
+    /** Admin UI: under nginx, PB is proxied at /_/ so this is usually https://site/_/ */
+    'pocketbase_admin_url' => rtrim($pbPublicUrl, '/') . '/_/',
     'site_url'         => $siteUrl,
     'site_name'        => getenv('SITE_NAME') ?: 'FormatForge',
-    'app_version'      => getenv('APP_VERSION') ?: 'v1.0.59',
+    'app_version'      => getenv('APP_VERSION') ?: 'v1.0.76',
     'users_collection' => 'users',
     'garage_endpoint'  => getenv('GARAGE_ENDPOINT') ?: 'http://127.0.0.1:3900',
     'garage_key'       => getenv('GARAGE_ACCESS_KEY') ?: '',
@@ -189,9 +191,14 @@ $CONFIG = [
     'embed_model'      => getenv('EMBED_MODEL') ?: 'google/gemini-embedding-001',  // OpenRouter embeddings id
     'cursor_pipeline_trigger_dir' => $cursorPipelineTriggerDir,
     'novel_threshold'  => (float)(getenv('NOVEL_DISTANCE_THRESHOLD') ?: '0.35'),  // cosine distance above = novel
+    'target_posts_per_day' => max(0, (int)(getenv('TARGET_POSTS_PER_DAY') ?: '60')),  // Cursor prompt + operating_context (0 = omit cadence hints)
     'pipeline_reject_streak' => max(1, (int)(getenv('PIPELINE_REJECT_STREAK') ?: '3')),  // edit pipeline after N consecutive rejects
     'cursor_agent_bin' => getenv('CURSOR_AGENT_BIN') ?: 'agent',
     'cursor_agent_model' => getenv('CURSOR_AGENT_MODEL') ?: 'composer-2-fast',
+    'cursor_agent_home' => (static function (): string {
+        $h = getenv('CURSOR_AGENT_HOME');
+        return (is_string($h) && trim($h) !== '') ? trim($h) : '';
+    })(),
     'cursor_agent_enabled' => !in_array(strtolower((string)(getenv('CURSOR_AGENT_ENABLED') ?: '1')), ['0', 'false', 'no', 'off'], true),
 ];
 if (file_exists(__DIR__ . '/config.php')) {
@@ -503,6 +510,226 @@ function pb_find_instagram_account_by_user_id(string $igUserId, ?string $authHea
     $resp = pb_request('GET', '/api/collections/instagram_accounts/records?' . $query, null, $authHeader);
     if ($resp['code'] !== 200) return null;
     return $resp['body']['items'][0] ?? null;
+}
+
+/** IG Graph hosts (Instagram Login tokens often work on graph.instagram.com; some setups need graph.facebook.com). */
+function ff_instagram_graph_hosts(): array {
+    return ['https://graph.instagram.com/v18.0', 'https://graph.facebook.com/v18.0'];
+}
+
+/**
+ * @return array|null decoded JSON body or null on failure
+ */
+function ff_ig_graph_get_json(string $pathQuery, string $accessToken): ?array {
+    $pathQuery = ltrim($pathQuery, '/');
+    $sep = str_contains($pathQuery, '?') ? '&' : '?';
+    $tail = $pathQuery . $sep . 'access_token=' . rawurlencode($accessToken);
+    foreach (ff_instagram_graph_hosts() as $base) {
+        $ch = curl_init($base . '/' . $tail);
+        curl_setopt_array($ch, [
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_TIMEOUT => 45,
+        ]);
+        $raw = curl_exec($ch);
+        curl_close($ch);
+        $body = json_decode($raw ?: '{}', true);
+        if (!is_array($body)) {
+            continue;
+        }
+        if (!empty($body['error'])) {
+            continue;
+        }
+        return $body;
+    }
+    return null;
+}
+
+/**
+ * @return array{like_count?:int,comments_count?:int,media_product_type?:string,media_type?:string}|null
+ */
+function ff_instagram_ig_media_node(string $igMediaId, string $accessToken): ?array {
+    $igMediaId = trim($igMediaId);
+    if ($igMediaId === '') {
+        return null;
+    }
+    $q = rawurlencode($igMediaId) . '?fields=like_count,comments_count,media_product_type,media_type';
+    return ff_ig_graph_get_json($q, $accessToken);
+}
+
+/**
+ * Parse /insights response `data` array into metric name => int value.
+ */
+function ff_instagram_parse_insights_body(?array $body): array {
+    if (!is_array($body)) {
+        return [];
+    }
+    $out = [];
+    foreach ($body['data'] ?? [] as $block) {
+        if (!is_array($block)) {
+            continue;
+        }
+        $name = (string) ($block['name'] ?? '');
+        if ($name === '') {
+            continue;
+        }
+        $v = null;
+        if (isset($block['values'][0]['value']) && is_numeric($block['values'][0]['value'])) {
+            $v = (int) $block['values'][0]['value'];
+        } elseif (isset($block['total_value']['value']) && is_numeric($block['total_value']['value'])) {
+            $v = (int) $block['total_value']['value'];
+        }
+        if ($v !== null) {
+            $out[$name] = $v;
+        }
+    }
+    return $out;
+}
+
+/**
+ * Request IG media insights; tries metric bundles (newer API deprecates `impressions` / `plays` for some media).
+ *
+ * @return array<string,int>
+ */
+function ff_instagram_ig_media_insights(string $igMediaId, string $accessToken): array {
+    $igMediaId = trim($igMediaId);
+    if ($igMediaId === '') {
+        return [];
+    }
+    $bundles = [
+        'reach,saved,shares,total_interactions,views,likes,comments',
+        'reach,saved,shares,total_interactions,views',
+        'reach,saved,shares,comments,likes',
+        'impressions,reach,saved,shares',
+    ];
+    foreach ($bundles as $metric) {
+        $path = rawurlencode($igMediaId) . '/insights?metric=' . rawurlencode($metric);
+        $body = ff_ig_graph_get_json($path, $accessToken);
+        if ($body === null) {
+            continue;
+        }
+        if (!empty($body['error'])) {
+            continue;
+        }
+        $parsed = ff_instagram_parse_insights_body($body);
+        if ($parsed !== []) {
+            return $parsed;
+        }
+    }
+    return [];
+}
+
+/**
+ * Pull Instagram Insights for published rows in `content_metrics` and PATCH PocketBase (requires insights permission on the token).
+ *
+ * @return array{ok:bool, updated:int, skipped:int, failed:int, detail: list<array<string,mixed>>}
+ */
+function formatforge_sync_content_metrics_insights(?string $authHeader, int $maxRecords = 80): array {
+    $out = ['ok' => true, 'updated' => 0, 'skipped' => 0, 'failed' => 0, 'detail' => []];
+    if (!$authHeader || trim($authHeader) === '') {
+        $out['ok'] = false;
+        $out['detail'][] = ['error' => 'missing_auth'];
+        return $out;
+    }
+    $maxRecords = max(1, min(250, $maxRecords));
+    $qs = http_build_query(['perPage' => $maxRecords, 'sort' => '-fetched_at']);
+    $list = pb_request('GET', '/api/collections/content_metrics/records?' . $qs, null, $authHeader);
+    if ($list['code'] !== 200) {
+        $out['ok'] = false;
+        $out['detail'][] = ['error' => 'list_content_metrics', 'code' => $list['code']];
+        return $out;
+    }
+    $rows = $list['body']['items'] ?? [];
+    foreach ($rows as $row) {
+        if (!is_array($row)) {
+            continue;
+        }
+        $pbMetricId = (string) ($row['id'] ?? '');
+        $igMid = trim((string) ($row['instagram_media_id'] ?? ''));
+        $cid = trim((string) ($row['content_item_id'] ?? ''));
+        if ($pbMetricId === '' || $igMid === '' || $cid === '') {
+            $out['skipped']++;
+            continue;
+        }
+        $itemResp = pb_request('GET', '/api/collections/content_items/records/' . rawurlencode($cid), null, $authHeader);
+        if ($itemResp['code'] !== 200) {
+            $out['skipped']++;
+            $out['detail'][] = ['content_item_id' => $cid, 'skip' => 'item_not_found'];
+            continue;
+        }
+        $item = $itemResp['body'] ?? [];
+        $accId = trim((string) ($item['instagram_account_id'] ?? ''));
+        if ($accId === '') {
+            $out['skipped']++;
+            $out['detail'][] = ['content_item_id' => $cid, 'skip' => 'no_instagram_account_id'];
+            continue;
+        }
+        $accResp = pb_request('GET', '/api/collections/instagram_accounts/records/' . rawurlencode($accId), null, $authHeader);
+        if ($accResp['code'] !== 200) {
+            $out['failed']++;
+            $out['detail'][] = ['instagram_media_id' => $igMid, 'error' => 'account_not_found'];
+            continue;
+        }
+        $acc = $accResp['body'] ?? [];
+        $token = trim((string) ($acc['access_token'] ?? ''));
+        if ($token === '') {
+            $out['failed']++;
+            $out['detail'][] = ['instagram_media_id' => $igMid, 'error' => 'missing_access_token'];
+            continue;
+        }
+        $node = ff_instagram_ig_media_node($igMid, $token);
+        if ($node === null) {
+            $out['failed']++;
+            $out['detail'][] = ['instagram_media_id' => $igMid, 'error' => 'ig_media_node_failed'];
+            continue;
+        }
+        $insights = ff_instagram_ig_media_insights($igMid, $token);
+        $likes = (int) ($node['like_count'] ?? 0);
+        if (isset($insights['likes'])) {
+            $likes = max($likes, (int) $insights['likes']);
+        }
+        $comments = (int) ($node['comments_count'] ?? 0);
+        if (isset($insights['comments'])) {
+            $comments = max($comments, (int) $insights['comments']);
+        }
+        $impressions = null;
+        if (isset($insights['impressions'])) {
+            $impressions = (int) $insights['impressions'];
+        } elseif (isset($insights['views'])) {
+            $impressions = (int) $insights['views'];
+        } elseif (isset($insights['reach'])) {
+            $impressions = (int) $insights['reach'];
+        }
+        $views = isset($insights['views']) ? (int) $insights['views'] : null;
+        $shares = isset($insights['shares']) ? (int) $insights['shares'] : null;
+        $patch = [
+            'likes' => $likes,
+            'comments' => $comments,
+            'fetched_at' => date('c'),
+        ];
+        if ($impressions !== null) {
+            $patch['impressions'] = $impressions;
+        }
+        if ($views !== null) {
+            $patch['views'] = $views;
+        }
+        if ($shares !== null) {
+            $patch['shares'] = $shares;
+        }
+        $up = pb_request('PATCH', '/api/collections/content_metrics/records/' . rawurlencode($pbMetricId), $patch, $authHeader);
+        if ($up['code'] >= 200 && $up['code'] < 300) {
+            $out['updated']++;
+            $out['detail'][] = [
+                'instagram_media_id' => $igMid,
+                'content_item_id' => $cid,
+                'patched' => array_keys($patch),
+            ];
+        } else {
+            $out['failed']++;
+            $out['detail'][] = ['instagram_media_id' => $igMid, 'error' => $up['body']['message'] ?? 'patch_failed', 'code' => $up['code']];
+        }
+        usleep(200000);
+    }
+    return $out;
 }
 
 function s3_upload(string $key, string $content, string $contentType = 'video/mp4'): ?string {
@@ -1311,6 +1538,189 @@ function fetched_text_is_novel_vs_pipelines(string $semanticTextBlob, int $activ
 }
 
 /**
+ * Best semantic match in Antfly `pipeline_refs` for a copy blob (same index as novelty checks). Returns null if Antfly off or no hits.
+ */
+function antfly_closest_pipeline_ref(string $textBlob): ?array {
+    $textBlob = trim($textBlob);
+    if ($textBlob === '' || !formatforge_antfly_novelty_configured()) {
+        return null;
+    }
+    $res = antfly_api_post_json('/api/v1/tables/pipeline_refs/query', [
+        'table' => 'pipeline_refs',
+        'indexes' => ['semantic_idx'],
+        'semantic_search' => $textBlob,
+        'limit' => 3,
+    ], 90);
+    if ($res['code'] < 200 || $res['code'] >= 300) {
+        return null;
+    }
+    $responses = $res['body']['responses'] ?? [];
+    $first = $responses[0] ?? [];
+    $hits = $first['hits']['hits'] ?? [];
+    if (!is_array($hits) || $hits === []) {
+        return ['note' => 'No hits in pipeline_refs semantic index (templates may not be synced yet).'];
+    }
+    $top = $hits[0];
+    if (!is_array($top)) {
+        return null;
+    }
+    $src = [];
+    if (isset($top['_source']) && is_array($top['_source'])) {
+        $src = $top['_source'];
+    } elseif (isset($top['source']) && is_array($top['source'])) {
+        $src = $top['source'];
+    }
+    $prompt = isset($src['prompt']) ? (string) $src['prompt'] : '';
+    return [
+        'pipeline_pb_id' => $src['id'] ?? $top['_id'] ?? null,
+        'name' => $src['name'] ?? null,
+        'prompt_template_excerpt' => $prompt !== '' ? (strlen($prompt) > 220 ? substr($prompt, 0, 220) . '…' : $prompt) : null,
+        'hit_score' => $top['_score'] ?? $top['score'] ?? null,
+        'sort' => $top['sort'] ?? null,
+    ];
+}
+
+function ff_content_item_is_fetched_for_snapshot(array $it): bool {
+    $m = $it['metadata'] ?? [];
+    if (!is_array($m)) {
+        $m = [];
+    }
+    if (($m['origin'] ?? '') === 'fetch') {
+        return true;
+    }
+    if (($m['pipeline_id'] ?? '') !== '' || ($m['origin'] ?? '') === 'generate') {
+        return false;
+    }
+    if (!empty($m['source_url']) && empty($m['pipeline_id'])) {
+        return true;
+    }
+    $sl = trim((string) ($it['source_link_id'] ?? ''));
+    return $sl !== '' && empty($m['pipeline_id']);
+}
+
+function ff_content_item_is_pipeline_generated_snapshot(array $it): bool {
+    $m = $it['metadata'] ?? [];
+    if (!is_array($m)) {
+        return false;
+    }
+    return ($m['pipeline_id'] ?? '') !== '' || ($m['origin'] ?? '') === 'generate';
+}
+
+/**
+ * PocketBase + Antfly snapshot for Cursor agent prompts (cadence, pipelines, metrics samples).
+ */
+function ff_cursor_agent_operating_context(?string $authHeader): array {
+    if (!$authHeader || trim($authHeader) === '') {
+        return [];
+    }
+    $cfg = $GLOBALS['CONFIG'];
+    $target = (int) ($cfg['target_posts_per_day'] ?? 60);
+    $out = [
+        'novel_distance_threshold' => (float) ($cfg['novel_threshold'] ?? 0.35),
+        'novelty_meaning' => 'Fetched copy is treated as novel vs existing pipelines when it is NOT within novel_distance_threshold (cosine) of any active pipeline template in Antfly pipeline_refs.',
+        'metrics_note' => 'Run `php index.php sync-instagram-insights` (cron) or POST action=sync_instagram_insights after publish. Requires Instagram insights permissions on the connected token; metrics can lag up to ~48h per Meta.',
+    ];
+    if ($target > 0) {
+        $out['target_posts_per_day'] = $target;
+        $out['cadence_note'] = "Product goal: about {$target} publishes per day across the active account set — tune pipeline templates, prompts, and cron so generation + review can sustain that without quality collapse.";
+    }
+    $out['active_pipelines_count'] = fetch_active_pipeline_row_count($authHeader);
+
+    $pr = pb_request('GET', '/api/collections/pipelines/records?perPage=5&sort=-updated', null, $authHeader);
+    $pipelines = [];
+    if ($pr['code'] === 200) {
+        foreach ($pr['body']['items'] ?? [] as $p) {
+            if (!is_array($p)) {
+                continue;
+            }
+            $tmpl = trim((string) ($p['prompt_template'] ?? ''));
+            $pipelines[] = [
+                'id' => $p['id'] ?? '',
+                'name' => $p['name'] ?? '',
+                'updated' => $p['updated'] ?? '',
+                'is_active' => $p['is_active'] ?? null,
+                'prompt_template_excerpt' => $tmpl !== '' ? (strlen($tmpl) > 240 ? substr($tmpl, 0, 240) . '…' : $tmpl) : '',
+            ];
+        }
+    }
+    $out['pipelines_most_recent'] = $pipelines;
+
+    $since = date('c', time() - 86400);
+    $sinceEsc = str_replace(['\\', '"'], ['\\\\', '\\"'], $since);
+    $filter24 = 'published_at > "' . $sinceEsc . '" && status = "published"';
+    $qs24 = http_build_query(['filter' => $filter24, 'perPage' => 500]);
+    $pub = pb_request('GET', '/api/collections/content_items/records?' . $qs24, null, $authHeader);
+    $out['published_count_last_24h'] = ($pub['code'] === 200) ? count($pub['body']['items'] ?? []) : null;
+    if ($target > 0 && $out['published_count_last_24h'] !== null) {
+        $out['gap_to_target_last_24h'] = max(0, $target - (int) $out['published_count_last_24h']);
+    }
+
+    $qsPub = http_build_query(['filter' => 'status = "published"', 'sort' => '-published_at', 'perPage' => 12]);
+    $list = pb_request('GET', '/api/collections/content_items/records?' . $qsPub, null, $authHeader);
+    $items = ($list['code'] === 200) ? ($list['body']['items'] ?? []) : [];
+    $summ = [];
+    $ids = [];
+    foreach (array_slice($items, 0, 10) as $it) {
+        if (!is_array($it)) {
+            continue;
+        }
+        $id = (string) ($it['id'] ?? '');
+        $meta = is_array($it['metadata'] ?? null) ? $it['metadata'] : [];
+        if ($id !== '') {
+            $ids[] = $id;
+        }
+        $summ[] = [
+            'content_item_id' => $id,
+            'title' => $it['title'] ?? '',
+            'type' => $it['type'] ?? '',
+            'published_at' => $it['published_at'] ?? '',
+            'pipeline_id' => $meta['pipeline_id'] ?? null,
+            'origin' => $meta['origin'] ?? null,
+        ];
+    }
+    $out['recent_published'] = $summ;
+
+    $metricsById = [];
+    foreach ($ids as $cid) {
+        $esc = str_replace(['\\', '"'], ['\\\\', '\\"'], $cid);
+        $qf = http_build_query(['filter' => 'content_item_id = "' . $esc . '"', 'perPage' => 1, 'sort' => '-fetched_at']);
+        $mr = pb_request('GET', '/api/collections/content_metrics/records?' . $qf, null, $authHeader);
+        if ($mr['code'] === 200) {
+            $row = $mr['body']['items'][0] ?? null;
+            if (is_array($row)) {
+                $metricsById[$cid] = array_intersect_key($row, array_flip(['impressions', 'likes', 'views', 'shares', 'comments', 'fetched_at', 'instagram_media_id']));
+            }
+        }
+    }
+    $out['content_metrics_by_item_id'] = $metricsById;
+
+    $qAll = http_build_query(['sort' => '-created', 'perPage' => 48]);
+    $all = pb_request('GET', '/api/collections/content_items/records?' . $qAll, null, $authHeader);
+    $fetched = [];
+    $generated = [];
+    if ($all['code'] === 200) {
+        foreach ($all['body']['items'] ?? [] as $it) {
+            if (!is_array($it)) {
+                continue;
+            }
+            $row = ['id' => $it['id'] ?? '', 'title' => $it['title'] ?? '', 'type' => $it['type'] ?? '', 'status' => $it['status'] ?? ''];
+            if (ff_content_item_is_fetched_for_snapshot($it) && count($fetched) < 8) {
+                $fetched[] = $row;
+            } elseif (ff_content_item_is_pipeline_generated_snapshot($it) && count($generated) < 8) {
+                $generated[] = $row;
+            }
+            if (count($fetched) >= 8 && count($generated) >= 8) {
+                break;
+            }
+        }
+    }
+    $out['recent_fetched_items_sample'] = $fetched;
+    $out['recent_pipeline_generated_items_sample'] = $generated;
+
+    return $out;
+}
+
+/**
  * Rejects for this pipeline only, most recently updated first, then count leading rejected.
  */
 function count_consecutive_rejects_for_pipeline(string $pipelineId, ?string $authHeader): int {
@@ -1359,7 +1769,7 @@ function maybe_trigger_cursor_create_pipeline_after_fetch(array $novelIndexPromp
         'intent' => 'create_pipeline',
         'fetched_index_prompts' => $novelIndexPrompts,
         'novel_threshold' => $cfg['novel_threshold'],
-    ]);
+    ], $authHeader);
 }
 
 /**
@@ -1386,13 +1796,13 @@ function maybe_trigger_cursor_edit_pipeline_after_reject(array $itemBody, string
         'rejected_reason' => $reason,
         'consecutive_rejects' => $streak,
         'content_prompt' => $itemBody['prompt'] ?? '',
-    ]);
+    ], $authHeader);
 }
 
 /**
- * PATH/HOME/API key for the shell that starts `php … cursor-agent-run` (php-fpm often has a tiny PATH).
+ * Normalize PATH for Cursor CLI subprocesses (php-fpm often has a tiny PATH).
  */
-function ff_shell_env_prefix_for_cursor_agent(): string {
+function ff_cursor_agent_path_env(): string {
     $path = getenv('PATH');
     if (!is_string($path) || trim($path) === '') {
         $path = '/usr/local/bin:/usr/bin:/bin:/sbin';
@@ -1403,16 +1813,81 @@ function ff_shell_env_prefix_for_cursor_agent(): string {
             }
         }
     }
-    $parts = ['PATH=' . escapeshellarg($path)];
-    $home = getenv('HOME');
-    if (is_string($home) && $home !== '') {
-        $parts[] = 'HOME=' . escapeshellarg($home);
+    return $path;
+}
+
+/**
+ * HOME + XDG dirs for Cursor CLI when php-fpm user cannot write to default HOME (e.g. www-data: /var/www is root-owned).
+ */
+function ff_cursor_agent_home_env_vars(): array {
+    $cfg = $GLOBALS['CONFIG'] ?? [];
+    $agentHome = isset($cfg['cursor_agent_home']) ? trim((string)$cfg['cursor_agent_home']) : '';
+    if ($agentHome === '') {
+        return [];
     }
-    foreach (['USER', 'CURSOR_API_KEY'] as $k) {
+    return [
+        'HOME' => $agentHome,
+        'XDG_CONFIG_HOME' => $agentHome . '/.config',
+        'XDG_DATA_HOME' => $agentHome . '/.local/share',
+        'XDG_STATE_HOME' => $agentHome . '/.local/state',
+        'XDG_CACHE_HOME' => $agentHome . '/.cache',
+    ];
+}
+
+/**
+ * Minimal env for `agent` / `cursor-agent-run`: PATH, HOME/XDG (if CURSOR_AGENT_HOME), USER, optional API key.
+ */
+function ff_cursor_agent_env_minimal(): array {
+    $out = ['PATH' => ff_cursor_agent_path_env()];
+    foreach (ff_cursor_agent_home_env_vars() as $k => $v) {
+        $out[$k] = $v;
+    }
+    if (!isset($out['HOME'])) {
+        $home = getenv('HOME');
+        if (is_string($home) && $home !== '') {
+            $out['HOME'] = $home;
+        }
+    }
+    foreach (['USER', 'LOGNAME', 'LANG', 'LC_ALL'] as $k) {
         $v = getenv($k);
         if (is_string($v) && $v !== '') {
-            $parts[] = $k . '=' . escapeshellarg($v);
+            $out[$k] = $v;
         }
+    }
+    $key = getenv('CURSOR_API_KEY');
+    if (is_string($key) && $key !== '') {
+        $out['CURSOR_API_KEY'] = $key;
+    }
+    return $out;
+}
+
+/**
+ * Full environment for proc_open (merges getenv() snapshot with minimal overrides).
+ */
+function ff_cursor_agent_env_for_proc_open(): array {
+    $full = [];
+    $snap = getenv();
+    if (is_array($snap)) {
+        foreach ($snap as $k => $v) {
+            if (!is_string($k) || $v === false) {
+                continue;
+            }
+            $full[$k] = is_scalar($v) ? (string)$v : '';
+        }
+    }
+    foreach (ff_cursor_agent_env_minimal() as $k => $v) {
+        $full[$k] = $v;
+    }
+    return $full;
+}
+
+/**
+ * PATH/HOME/API key for the shell that starts `php … cursor-agent-run` (php-fpm often has a tiny PATH).
+ */
+function ff_shell_env_prefix_for_cursor_agent(): string {
+    $parts = [];
+    foreach (ff_cursor_agent_env_minimal() as $k => $v) {
+        $parts[] = $k . '=' . escapeshellarg($v);
     }
     return implode(' ', $parts) . ' ';
 }
@@ -1456,8 +1931,30 @@ function spawn_cursor_agent_background(string $promptFile): void {
     ff_debug_log('cursor_agent_spawn', ['prompt' => basename($promptReal), 'log' => $log]);
 }
 
-function trigger_pipeline_cursor_agent(string $reason, array $context): void {
+function trigger_pipeline_cursor_agent(string $reason, array $context, ?string $authHeader = null): void {
     $cfg = $GLOBALS['CONFIG'];
+    if ($authHeader) {
+        $extra = ff_cursor_agent_operating_context($authHeader);
+        if ($extra !== []) {
+            $context['operating_context'] = $extra;
+        }
+        if ($reason === 'novel_fetched_content' || $reason === 'novel_content') {
+            $prompts = $context['fetched_index_prompts'] ?? [];
+            if (is_array($prompts) && isset($prompts[0])) {
+                $blob = trim((string) $prompts[0]);
+                if ($blob !== '') {
+                    $near = antfly_closest_pipeline_ref($blob);
+                    if ($near !== null) {
+                        $context['semantic_nearest_pipeline_to_this_fetch'] = $near;
+                    }
+                }
+            }
+            $context['semantic_novelty_explainer'] = [
+                'novel_distance_threshold' => (float) ($cfg['novel_threshold'] ?? 0.35),
+                'meaning' => 'This task ran because the fetched item’s Antfly embedding was farther than novel_distance_threshold from every active pipeline template (or there are no active templates). Compare semantic_nearest_pipeline_to_this_fetch to see the closest template anyway.',
+            ];
+        }
+    }
     $dir = $cfg['cursor_pipeline_trigger_dir'] ?? '';
     if (!$dir) return;
     if (!is_dir($dir) && !@mkdir($dir, 0755, true)) return;
@@ -1516,6 +2013,7 @@ function setup_pipeline_from_trigger(string $triggerFile, bool $spawnCursorAgent
         $pname = (string)($context['pipeline_name'] ?? '');
         $streak = (int)($context['consecutive_rejects'] ?? 0);
         $task = "**EDIT an existing pipeline** (user rejected output {$streak} times in a row for this pipeline).\n\n"
+            . "**Context:** Use JSON **`operating_context`** for recent pipelines, **`target_posts_per_day` / `published_count_last_24h`**, **`recent_published`** + **`content_metrics_by_item_id`** (when Insights are synced), and samples of fetched vs generated rows.\n\n"
             . "1. PocketBase **`pipelines`** record id: `$pid`" . ($pname !== '' ? " (name: $pname)" : '') . "\n"
             . "2. Update **`prompt_template`** (and related fields) using rejected_reason and content_prompt from context — improve quality for this niche.\n"
             . "3. If a Go dir exists for this pipeline under `pipelines/`, align `.env` / templates there; otherwise rely on PocketBase.\n"
@@ -1525,6 +2023,7 @@ function setup_pipeline_from_trigger(string $triggerFile, bool $spawnCursorAgent
         $task = "Content was rejected (legacy trigger). Create or edit a content pipeline to improve output.\n\n1. Pipeline dir: `$pipelineDir`\n2. Use context JSON for ids and reasons.\n3. Build: `cd $pipelineDir && go build -o pipeline-generate .`\n4. Update PocketBase **`pipelines`** as needed.";
     } elseif ($reason === 'novel_fetched_content' || $reason === 'novel_content') {
         $task = "**CREATE a new pipeline** — fetched item is novel vs **active** pipelines in Antfly (`pipeline_refs` semantic index). Content embeddings use Antfly’s template + **`remoteMedia`** on `media_url` (OpenRouter `EMBED_MODEL` on the Antfly side).\n\n"
+            . "**Context:** Read **`semantic_novelty_explainer`** and **`semantic_nearest_pipeline_to_this_fetch`** (closest template even though this fetch was “novel”). Use **`operating_context`** for **`pipelines_most_recent`**, **`target_posts_per_day`** vs **`published_count_last_24h`**, **`recent_published`** + metrics, and **`recent_fetched_items_sample`** vs **`recent_pipeline_generated_items_sample`** to align style and posting cadence.\n\n"
             . "1. New pipeline dir: `$pipelineDir`\n"
             . "2. .env copied from template. Build: `cd $pipelineDir && go build -o pipeline-generate .`\n"
             . "3. Crontab: `0 */6 * * * cd $pipelineDir && set -a && . .env && set +a && ./pipeline-generate`\n"
@@ -1641,7 +2140,7 @@ if (PHP_SAPI === 'cli' && ($argv[1] ?? '') === 'cursor-agent-run') {
         ],
         $pipes,
         $root,
-        null,
+        ff_cursor_agent_env_for_proc_open(),
         ['bypass_shell' => true]
     );
     if (!is_resource($proc)) {
@@ -1650,6 +2149,19 @@ if (PHP_SAPI === 'cli' && ($argv[1] ?? '') === 'cursor-agent-run') {
     }
     $exit = proc_close($proc);
     exit(($exit === 0) ? 0 : 1);
+}
+
+// CLI: php index.php sync-instagram-insights [max_records]
+if (PHP_SAPI === 'cli' && ($argv[1] ?? '') === 'sync-instagram-insights') {
+    $pbTok = ff_pb_cli_token();
+    if (!$pbTok) {
+        fwrite(STDERR, "Set ADMIN_EMAIL/ADMIN_PASSWORD or FORMATFORGE_EMAIL/FORMATFORGE_PASSWORD in .env\n");
+        exit(1);
+    }
+    $lim = (int) ($argv[2] ?? 80);
+    $r = formatforge_sync_content_metrics_insights($pbTok, $lim);
+    echo json_encode($r, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES) . "\n";
+    exit(!empty($r['ok']) ? 0 : 1);
 }
 
 // CLI: php index.php delete-source-link [record_id]
@@ -2535,7 +3047,19 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && $user && $authHeader) {
             formatforge_sync_pipeline_refs_to_antfly($authHeader);
         }
         $novelFetchedPrompts = [];
-        foreach (array_values($files) as $fileIndex => $path) {
+        $fetchPaths = array_values($files);
+        $fetchAssetCount = 0;
+        foreach ($fetchPaths as $p) {
+            if (is_string($p) && is_readable($p)) {
+                $sz = @filesize($p);
+                if ($sz !== false && $sz > 0) {
+                    $fetchAssetCount++;
+                }
+            }
+        }
+        // If sizes are unavailable, fall back to path count so singleton images still become `image`.
+        $imageKindSlots = $fetchAssetCount > 0 ? $fetchAssetCount : count($fetchPaths);
+        foreach ($fetchPaths as $fileIndex => $path) {
             $ext = strtolower(pathinfo($path, PATHINFO_EXTENSION));
             $mime = match ($ext) {
                 'jpg', 'jpeg' => 'image/jpeg',
@@ -2562,9 +3086,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && $user && $authHeader) {
             $key = 'content/' . $itemId . '/' . $baseName;
             $garageUrl = s3_upload($key, $content, $mime);
             if (!$garageUrl && $content) $garageUrl = $cfg['garage_endpoint'] . '/' . $cfg['garage_bucket'] . '/' . $key;
-            $type = str_starts_with($mime, 'video/')
-                ? 'video'
-                : (str_starts_with($mime, 'image/') ? 'carousel' : 'reel');
+            if (str_starts_with($mime, 'video/')) {
+                $type = 'video';
+            } elseif (str_starts_with($mime, 'image/')) {
+                // Exactly one image asset in this fetch → image; albums / multi-file → carousel.
+                $type = ($imageKindSlots === 1) ? 'image' : 'carousel';
+            } else {
+                $type = 'reel';
+            }
             $rec = pb_request('POST', '/api/collections/content_items/records', [
                 'type' => $type,
                 'title' => $displayTitle,
@@ -2766,6 +3295,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && $user && $authHeader) {
             maybe_trigger_cursor_edit_pipeline_after_reject($item['body'], (string)$id, (string)$reason, $authHeader);
         }
         echo json_encode(['ok' => $up['code'] >= 200 && $up['code'] < 300]);
+        exit;
+    }
+
+    if ($action === 'sync_instagram_insights') {
+        $lim = min(250, max(1, (int) ($_POST['limit'] ?? 80)));
+        echo json_encode(formatforge_sync_content_metrics_insights($authHeader, $lim), JSON_UNESCAPED_SLASHES);
         exit;
     }
 
@@ -3039,7 +3574,9 @@ if (!empty($_GET['privacy']) || strpos($reqUri, '/privacy') !== false) {
             </div>
             <?php else: ?>
             <p style="font-size: 0.875rem; color: var(--muted);">
-                Create an account via PocketBase Admin: <?= htmlspecialchars($CONFIG['pocketbase_url']) ?>
+                Create an account via PocketBase Admin:
+                <a href="<?= htmlspecialchars($CONFIG['pocketbase_admin_url']) ?>" target="_blank" rel="noopener" style="color: var(--accent);">open dashboard</a>
+                <span style="display: block; margin-top: 0.35rem; font-size: 0.8rem;">PocketBase admin at <code style="font-size:0.9em;">/_/</code>, API at <code style="font-size:0.9em;">/api/</code>. PHP talks to PocketBase at <code style="font-size:0.9em;"><?= htmlspecialchars($CONFIG['pocketbase_url']) ?></code>.</span>
             </p>
             <?php endif; ?>
         </div>
@@ -3576,7 +4113,7 @@ if (!empty($_GET['privacy']) || strpos($reqUri, '/privacy') !== false) {
                         });
                         const d = await r.json();
                         this.content = (d.items || []).map(c => ({ ...c, selectedAccount: c.instagram_account_id || '' }));
-                    } catch (e) { this.msg = 'Failed to load content'; this.msgError = true; }
+                    } catch (e) { this.msg = ''; this.msgError = false; }
                     finally { this.contentLoading = false; }
                 },
 
