@@ -32,11 +32,11 @@ go build -o pipeline-generate .
 0 */6 * * * cd /path/to/pipelines/template && ./pipeline-generate
 ```
 
-## Pipeline creation by pi
+## Pipeline creation (Cursor Agent)
 
-When pi coding agent creates a new pipeline from this template, it should:
+When the Cursor **`agent`** (Composer 2, etc.) creates a new pipeline from this template, it should:
 
 1. Copy this directory to a new path (e.g. `pipelines/pipeline-<id>/`)
 2. Write a `.env` or config with the above variables
 3. Add a crontab entry or systemd timer
-4. If content is rejected, pi may edit the prompt template or schedule
+4. If content is rejected, the agent may edit the prompt template or schedule, and upsert PocketBase **`pipelines`** records

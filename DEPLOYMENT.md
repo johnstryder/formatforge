@@ -1,116 +1,169 @@
-# Deploy FormatForge to formatforgeplus.com
+# Deploy FormatForge to formatforgeplus.com (no Docker)
+
+Stack: **nginx**, **PHP-FPM** (8.2+), **PocketBase** binary, optional **certbot**. Your app code and `pb_data/` stay on disk.
+
+## Before you start
+
+Ensure **ports 80 and 8090** (or whatever you map for HTTP and PocketBase) are free on the host. Keep **`pb_data/`**, **`.env`**, and the project tree when redeploying.
 
 ## Prerequisites
 
-- VPS or server with Docker (Ubuntu 22.04+ recommended)
-- Domain formatforgeplus.com pointed to your server (A record)
+- VPS (Ubuntu 22.04+ recommended) with nginx and PHP-FPM installed
+- Domain `formatforgeplus.com` pointed at the server (A record)
 
 ## 1. DNS
 
-Add an A record:
+| Type | Name | Value   | TTL |
+|------|------|---------|-----|
+| A    | @    | YOUR_IP | 300 |
+| A    | www  | YOUR_IP | 300 |
 
-| Type | Name | Value      | TTL |
-|------|------|------------|-----|
-| A    | @    | YOUR_IP    | 300 |
-| A    | www  | YOUR_IP    | 300 |
+**Cloudflare:** Use **DNS only** (grey cloud) while issuing Let's Encrypt certificates; you can proxy again after.
 
-**If using Cloudflare:** Set both records to **DNS only** (grey cloud) before running certbot. Let's Encrypt must reach your server directly. After the cert is issued, you can re-enable the proxy (orange cloud).
-
-## 2. Clone and configure
+## 2. Packages
 
 ```bash
-git clone <your-repo> formatforge
-cd formatforge
-cp .env.example .env
+sudo apt update
+sudo apt install -y nginx php-fpm php-cli php-curl php-mbstring php-xml php-zip certbot
 ```
 
-Edit `.env` for production:
+After packages install, **start** PHP-FPM (version varies by Ubuntu):
+
+```bash
+sudo systemctl enable --now php8.3-fpm   # or php8.2-fpm / php8.4-fpm
+ls /run/php/*.sock
+```
+
+**Match nginx to the real socket** (avoids **502** from Cloudflare):
+
+```bash
+cd /var/www/formatforge
+chmod +x scripts/*.sh
+./scripts/align-php-fpm-socket.sh
+sudo nginx -t && sudo systemctl reload nginx
+```
+
+That rewrites `nginx/fastcgi-pass.conf`, which `formatforgeplus.conf` includes.
+
+## 3. App tree and PocketBase
+
+```bash
+sudo mkdir -p /var/www/formatforge
+# Copy or clone the repo here; owner readable by www-data
+sudo chown -R www-data:www-data /var/www/formatforge
+```
+
+As `www-data` (or deploy user + fix permissions):
+
+```bash
+cd /var/www/formatforge
+cp .env.example .env   # if needed
+./scripts/download-pocketbase.sh
+```
+
+The binary is named like `formatforge-pb` (parent folder name + `-pb`). Migrations in the repo must be visible to PocketBase:
+
+```bash
+mkdir -p pb_data
+ln -sfn "$(pwd)/pb_migrations" pb_data/pb_migrations
+```
+
+Create the superuser if this is a fresh PocketBase data dir:
+
+```bash
+./formatforge-pb superuser upsert your@email.com 'your-secure-password'
+```
+
+(Or use `ADMIN_EMAIL` / `ADMIN_PASSWORD` from your existing `.env` and run `superuser upsert` once.)
+
+### systemd (PocketBase on `127.0.0.1:8090`)
+
+Copy `scripts/formatforge-pocketbase.service.example` to `/etc/systemd/system/formatforge-pocketbase.service`, edit `User=`, `WorkingDirectory=`, and `ExecStart=` paths, then:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now formatforge-pocketbase
+```
+
+## 4. Configure `.env` (production)
 
 ```env
 APP_URL=https://formatforgeplus.com
-POCKETBASE_URL=http://pocketbase:8090
-
-# Required
-ADMIN_EMAIL=your@email.com
-ADMIN_PASSWORD=secure-password
-MIGRATE_SECRET=random-secret-string
-
-# Instagram OAuth
-FB_APP_ID=your-fb-app-id
-FB_APP_SECRET=your-fb-app-secret
-INSTAGRAM_REDIRECT_URI=https://formatforgeplus.com/instagram/callback
-
-# Video generation (one of)
-REPLICATE_API_TOKEN=...
-# or
-FAL_KEY=...
-
-# Garage S3 (or MinIO, etc.)
-GARAGE_ENDPOINT=http://garage:3900
-GARAGE_ACCESS_KEY=...
-GARAGE_SECRET_KEY=...
-GARAGE_BUCKET=formatforge
-GARAGE_REGION=garage
+POCKETBASE_URL=http://127.0.0.1:8090
 ```
 
-Add `formatforgeplus.com` and `www.formatforgeplus.com` to your Facebook app's **Valid OAuth Redirect URIs**.
+Do **not** use `http://pocketbase:8090` — that hostname only existed inside Docker.
 
-## 3. Start with HTTP (for initial SSL)
+Fill secrets as in `.env.example` (`MIGRATE_SECRET`, Garage, Replicate/fal, Instagram, etc.).
+
+**Curate → Fetch:** install tools on the host and point `.env` if they are not on `PATH`:
 
 ```bash
-docker compose -f docker-compose.production.yml up -d
+pip install --user gallery-dl yt-dlp
+# then e.g. GALLERY_DL_PATH=/home/deploy/.local/bin/gallery-dl
 ```
 
-## 4. Get SSL certificate (Let's Encrypt)
+Instagram cookies: `storage/cookies/instagram_cookies.txt` or `cookies.txt` (see `storage/cookies/README.md`).
+
+## 5. nginx
 
 ```bash
-# Install certbot if needed
-sudo apt install certbot
-
-# Get cert (run from project root; -w must be the directory nginx serves)
-sudo certbot certonly --webroot -w "$(pwd)" -d formatforgeplus.com -d www.formatforgeplus.com
+sudo cp /var/www/formatforge/nginx/formatforgeplus.conf /etc/nginx/sites-available/formatforgeplus
+sudo ln -sf /etc/nginx/sites-available/formatforgeplus /etc/nginx/sites-enabled/
+sudo rm -f /etc/nginx/sites-enabled/default
 ```
 
-Certs will be at `/etc/letsencrypt/live/formatforgeplus.com/`.
-
-## 5. Enable HTTPS
-
-1. Edit `nginx/formatforgeplus.conf`: uncomment the HTTPS `server` block.
-2. Edit `docker-compose.production.yml`:
-   - Uncomment `- "443:443"` under nginx ports
-   - Uncomment `- /etc/letsencrypt:/etc/letsencrypt:ro` under nginx volumes
-3. Restart:
+The shipped `root` is `/var/www/formatforge`. If your tree is elsewhere, change every `root` and the `include /var/www/formatforge/nginx/fastcgi-pass.conf` path in the active site config (or symlink `/var/www/formatforge` → your clone).
 
 ```bash
-docker compose -f docker-compose.production.yml up -d --force-recreate
+sudo nginx -t && sudo systemctl reload nginx
 ```
 
-## 6. Optional: HTTP → HTTPS redirect
+### Cloudflare shows **502 Bad Gateway**
 
-Add to the HTTP server block in `nginx/formatforgeplus.conf` (after the acme-challenge location):
+The origin nginx is up but **PHP-FPM is not connected** (wrong socket), **not running**, or **crashing**. On the server:
 
-```nginx
-location / {
-    return 301 https://$host$request_uri;
-}
+```bash
+cd /var/www/formatforge && ./scripts/prod-check.sh
+sudo tail -40 /var/log/nginx/error.log
 ```
 
-(Remove or comment out the existing `try_files` in that block.)
+Look for `connect() to unix:/run/php/php8.x-fpm.sock failed`. Fix with:
+
+```bash
+sudo systemctl start php8.3-fpm   # use the version you installed
+./scripts/align-php-fpm-socket.sh
+sudo nginx -t && sudo systemctl reload nginx
+```
+
+If errors mention **PocketBase** or **8090** on `/pb/` only, run: `sudo systemctl status formatforge-pocketbase`.
+
+## 6. SSL (Let's Encrypt)
+
+HTTP must serve the app first. Then:
+
+```bash
+sudo certbot certonly --webroot -w /var/www/formatforge -d formatforgeplus.com -d www.formatforgeplus.com
+```
+
+Uncomment the **HTTPS** `server` block in `nginx/formatforgeplus.conf`, set `ssl_certificate` paths, add `listen 443 ssl http2;` and the same `location` blocks as HTTP (see comments in that file). Reload nginx.
+
+Optional HTTP → HTTPS: uncomment `return 301` in the `:80` server block after HTTPS works.
 
 ## 7. PocketBase admin (remote)
 
-PocketBase admin is bound to `127.0.0.1:8090` for security. To access remotely:
+PocketBase should listen only on `127.0.0.1:8090`. Access:
 
 ```bash
 ssh -L 8090:127.0.0.1:8090 user@formatforgeplus.com
-# Then open http://localhost:8090/_/
+# Open http://localhost:8090/_/
 ```
 
-## 8. Auto-renew SSL
+## 8. Renew certs
 
 ```bash
-sudo certbot renew --dry-run   # Test
-# Add to crontab: 0 0 1 * * certbot renew --quiet
+sudo certbot renew --dry-run
+# crontab example: 0 0 1 * * certbot renew --quiet
 ```
 
 ---

@@ -1,0 +1,18 @@
+# Copy to /etc/systemd/system/formatforge-pocketbase.service
+# Adjust User, paths, and binary name (folder-pb) to match your server.
+
+[Unit]
+Description=FormatForge PocketBase
+After=network.target
+
+[Service]
+Type=simple
+User=www-data
+Group=www-data
+WorkingDirectory=/var/www/formatforge
+ExecStart=/var/www/formatforge/formatforge-pb serve --http=127.0.0.1:8090
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

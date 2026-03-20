@@ -16,6 +16,99 @@ if (file_exists(__DIR__ . '/.env')) {
     }
 }
 
+/**
+ * Resolve gallery-dl / yt-dlp executable. php-fpm often has a minimal PATH — bare names get 127.
+ * Tries: env (if absolute & valid), then /usr/bin, /usr/local/bin, ~/.local/bin, else bare name for PATH.
+ */
+function ff_resolve_fetch_bin(string $envVar, string $fallbackName): string {
+    $raw = getenv($envVar);
+    $path = ($raw !== false && trim((string)$raw) !== '') ? trim((string)$raw) : $fallbackName;
+    if (str_starts_with($path, '/')) {
+        return (is_file($path) && is_executable($path)) ? $path : ff_resolve_fetch_bin_expand_bare($fallbackName);
+    }
+    return ff_resolve_fetch_bin_expand_bare($path);
+}
+
+function ff_resolve_fetch_bin_expand_bare(string $name): string {
+    $resolved = ff_fetch_executable($name, $name);
+    return $resolved !== '' ? $resolved : $name;
+}
+
+/** PATH= prefix so sh finds /usr/bin even when php-fpm clears PATH (fixes exit 127). */
+function ff_fetch_path_env_prefix(): string {
+    $parts = ['/opt/ff-fetch/bin', '/usr/bin', '/usr/local/bin', '/bin', '/sbin'];
+    $home = getenv('HOME');
+    if (is_string($home) && $home !== '') {
+        array_unshift($parts, rtrim($home, '/') . '/.local/bin');
+    }
+    $existing = getenv('PATH');
+    if (is_string($existing) && $existing !== '') {
+        $parts[] = $existing;
+    }
+    return 'PATH=' . escapeshellarg(implode(':', $parts)) . ' ';
+}
+
+/** PATH + PYTHONPATH for pip --prefix installs (php-fpm clears env; entrypoint exports do not reach workers). */
+function ff_fetch_env_prefix(): string {
+    $out = ff_fetch_path_env_prefix();
+    $sites = @glob('/opt/ff-fetch/lib/python3.*/site-packages', GLOB_ONLYDIR) ?: [];
+    if ($sites !== [] && is_dir($sites[0])) {
+        $out = 'PYTHONPATH=' . escapeshellarg($sites[0]) . ' ' . $out;
+    }
+    return $out;
+}
+
+/**
+ * Executable path for gallery-dl / yt-dlp at run time (open_basedir may hide /usr/bin at CONFIG time).
+ * @param string $configured value from CONFIG / env
+ * @param string $fallbackName e.g. gallery-dl
+ */
+function ff_fetch_executable(string $configured, string $fallbackName): string {
+    $configured = trim($configured);
+    $fallbackName = trim($fallbackName) ?: 'gallery-dl';
+    $base = $fallbackName;
+    if ($configured !== '') {
+        $base = str_starts_with($configured, '/') ? basename($configured) : $configured;
+    }
+    if ($base === '' || $base === '.' || $base === '..') {
+        $base = $fallbackName;
+    }
+    $candidates = [];
+    if ($configured !== '' && str_starts_with($configured, '/')) {
+        $candidates[] = $configured;
+    }
+    $candidates[] = '/opt/ff-fetch/bin/' . $base;
+    $candidates[] = '/usr/bin/' . $base;
+    $candidates[] = '/usr/local/bin/' . $base;
+    $home = getenv('HOME');
+    if (is_string($home) && $home !== '') {
+        $candidates[] = rtrim($home, '/') . '/.local/bin/' . $base;
+    }
+    $seen = [];
+    foreach ($candidates as $c) {
+        if ($c === '' || isset($seen[$c])) {
+            continue;
+        }
+        $seen[$c] = true;
+        if (@is_file($c) && @is_executable($c)) {
+            return $c;
+        }
+    }
+    return $base;
+}
+
+/** First readable cookies file in storage/cookies (uploads often named cookies.txt). */
+function ff_pick_storage_cookie_file(): string {
+    $dir = __DIR__ . '/storage/cookies';
+    foreach (['instagram_cookies.txt', 'cookies.txt'] as $name) {
+        $p = $dir . '/' . $name;
+        if (is_file($p) && is_readable($p) && filesize($p) > 32) {
+            return $p;
+        }
+    }
+    return '';
+}
+
 $pbUrl = null;
 if (file_exists('/.dockerenv')) {
     $pbUrl = 'http://pocketbase:8090';
@@ -34,12 +127,20 @@ if (!$siteUrl) {
     $siteUrl = $proto . '://' . preg_replace('/:\d+$/', '', $host);
 }
 $pbPublicUrl = getenv('POCKETBASE_PUBLIC_URL') ?: rtrim($siteUrl, '/') . '/pb';
+$galleryCookiesEnv = getenv('GALLERY_DL_COOKIES');
+$galleryCookiesPath = ($galleryCookiesEnv !== false && trim((string)$galleryCookiesEnv) !== '')
+    ? trim((string)$galleryCookiesEnv)
+    : ff_pick_storage_cookie_file();
+$ytCookiesEnv = getenv('YT_DLP_COOKIES');
+$ytCookiesPath = ($ytCookiesEnv !== false && trim((string)$ytCookiesEnv) !== '')
+    ? trim((string)$ytCookiesEnv)
+    : $galleryCookiesPath;
 $CONFIG = [
     'pocketbase_url'   => $pbUrl,
     'pocketbase_public_url' => $pbPublicUrl,
     'site_url'         => $siteUrl,
     'site_name'        => getenv('SITE_NAME') ?: 'FormatForge',
-    'app_version'      => getenv('APP_VERSION') ?: 'v1.0.9',
+    'app_version'      => getenv('APP_VERSION') ?: 'v1.0.39',
     'users_collection' => 'users',
     'garage_endpoint'  => getenv('GARAGE_ENDPOINT') ?: 'http://127.0.0.1:3900',
     'garage_key'       => getenv('GARAGE_ACCESS_KEY') ?: '',
@@ -61,14 +162,20 @@ $CONFIG = [
     'antfly_key'       => getenv('ANTFLY_API_KEY') ?: '',
     'winning_threshold' => (float)(getenv('WINNING_TEMPLATE_VIEW_SHARE_RATIO') ?: '0.05'),
     'ffmpeg_path'      => getenv('FFMPEG_PATH') ?: '/usr/bin/ffmpeg',
-    'gallery_dl_path'   => getenv('GALLERY_DL_PATH') ?: 'gallery-dl',
-    'yt_dlp_path'      => getenv('YT_DLP_PATH') ?: 'yt-dlp',
+    'gallery_dl_path'   => ff_fetch_executable(ff_resolve_fetch_bin('GALLERY_DL_PATH', 'gallery-dl'), 'gallery-dl'),
+    'gallery_dl_cookies' => $galleryCookiesPath,
+    'yt_dlp_path'      => ff_fetch_executable(ff_resolve_fetch_bin('YT_DLP_PATH', 'yt-dlp'), 'yt-dlp'),
+    'yt_dlp_cookies'   => $ytCookiesPath,
     'embed_url'        => getenv('EMBED_URL') ?: '',  // Ollama-compatible: /api/embed
     'openai_key'       => getenv('OPENAI_API_KEY') ?: '',
     'openrouter_key'   => getenv('OPENROUTER_API_KEY') ?: '',
-    'embed_model'      => getenv('EMBED_MODEL') ?: 'openai/text-embedding-3-small',  // for OpenRouter
+    'embed_model'      => getenv('EMBED_MODEL') ?: 'google/gemini-embedding-001',  // OpenRouter embeddings id
     'pi_trigger_dir'  => getenv('PI_TRIGGER_DIR') ?: (__DIR__ . '/.pi/triggers'),
     'novel_threshold'  => (float)(getenv('NOVEL_DISTANCE_THRESHOLD') ?: '0.35'),  // cosine distance above = novel
+    'pipeline_reject_streak' => max(1, (int)(getenv('PIPELINE_REJECT_STREAK') ?: '3')),  // edit pipeline after N consecutive rejects
+    'cursor_agent_bin' => getenv('CURSOR_AGENT_BIN') ?: 'agent',
+    'cursor_agent_model' => getenv('CURSOR_AGENT_MODEL') ?: 'composer-2-fast',
+    'cursor_agent_enabled' => !in_array(strtolower((string)(getenv('CURSOR_AGENT_ENABLED') ?: '1')), ['0', 'false', 'no', 'off'], true),
 ];
 if (file_exists(__DIR__ . '/config.php')) {
     $CONFIG = array_merge($CONFIG, require __DIR__ . '/config.php');
@@ -76,6 +183,10 @@ if (file_exists(__DIR__ . '/config.php')) {
 
 function ff_debug_sanitize($value, string $key = '') {
     $k = strtolower($key);
+    // Booleans like "were cookies configured" — not secret contents
+    if (in_array($k, ['cookies_file_used', 'using_cookies_file'], true)) {
+        return $value;
+    }
     foreach (['token', 'secret', 'password', 'authorization', 'cookie'] as $sensitive) {
         if (str_contains($k, $sensitive)) return '[redacted]';
     }
@@ -205,6 +316,76 @@ function repair_instagram_accounts_schema(): array {
     if (isset($collection['indexes'])) $payload['indexes'] = $collection['indexes'];
 
     $collectionId = $collection['id'] ?? 'instagram_accounts';
+    $up = pb_request('PATCH', '/api/collections/' . rawurlencode($collectionId), $payload, $token);
+    if ($up['code'] >= 200 && $up['code'] < 300) {
+        return ['ok' => true, 'changed' => true, 'collection_id' => $collectionId];
+    }
+    return ['ok' => false, 'error' => $up['body']['message'] ?? ('HTTP ' . $up['code']), 'details' => $up['body'] ?? []];
+}
+
+function repair_source_links_schema(): array {
+    $auth = pb_superuser_auth_token();
+    if (!$auth['ok']) {
+        return ['ok' => false, 'error' => $auth['error'] ?? 'Superuser auth failed'];
+    }
+    $token = $auth['token'];
+    $fetched = pb_fetch_collection('source_links', $token);
+    if (!$fetched['ok']) {
+        return ['ok' => false, 'error' => $fetched['error'] ?? 'Collection fetch failed'];
+    }
+    $collection = $fetched['collection'];
+    $fields = is_array($collection['fields'] ?? null) ? $collection['fields'] : [];
+    $required = [
+        ['name' => 'url', 'type' => 'text'],
+        ['name' => 'title', 'type' => 'text'],
+        ['name' => 'status', 'type' => 'text'],
+        ['name' => 'metadata', 'type' => 'json'],
+    ];
+    $changed = false;
+    foreach ($required as $req) {
+        $idx = null;
+        foreach ($fields as $i => $f) {
+            if (($f['name'] ?? '') === $req['name']) {
+                $idx = $i;
+                break;
+            }
+        }
+        if ($idx === null) {
+            $fields[] = [
+                'name' => $req['name'],
+                'type' => $req['type'],
+                'required' => false,
+                'hidden' => false,
+            ];
+            $changed = true;
+            continue;
+        }
+        $field = $fields[$idx];
+        if (($field['type'] ?? '') !== $req['type']) {
+            ff_debug_log('repair_source_links_type_mismatch', ['field' => $req['name'], 'current_type' => $field['type'] ?? null, 'expected_type' => $req['type']]);
+        }
+        if (!empty($field['hidden'])) {
+            $fields[$idx]['hidden'] = false;
+            $changed = true;
+        }
+    }
+    if (!$changed) {
+        return ['ok' => true, 'changed' => false, 'message' => 'Schema already compatible'];
+    }
+    $payload = [
+        'name' => $collection['name'] ?? 'source_links',
+        'type' => $collection['type'] ?? 'base',
+        'listRule' => $collection['listRule'] ?? '@request.auth.id != ""',
+        'viewRule' => $collection['viewRule'] ?? '@request.auth.id != ""',
+        'createRule' => $collection['createRule'] ?? '@request.auth.id != ""',
+        'updateRule' => $collection['updateRule'] ?? '@request.auth.id != ""',
+        'deleteRule' => $collection['deleteRule'] ?? '@request.auth.id != ""',
+        'fields' => $fields,
+    ];
+    if (isset($collection['indexes'])) {
+        $payload['indexes'] = $collection['indexes'];
+    }
+    $collectionId = $collection['id'] ?? 'source_links';
     $up = pb_request('PATCH', '/api/collections/' . rawurlencode($collectionId), $payload, $token);
     if ($up['code'] >= 200 && $up['code'] < 300) {
         return ['ok' => true, 'changed' => true, 'collection_id' => $collectionId];
@@ -405,44 +586,233 @@ function ffmpeg_compose(array $inputs, string $outputPath, array $options = []):
 }
 
 /**
+ * True when URL path looks like a direct file (S3, Garage, CDN) rather than a gallery page.
+ */
+function is_direct_media_url(string $url): bool {
+    $path = (string)(parse_url($url, PHP_URL_PATH) ?? '');
+    $ext = strtolower(pathinfo($path, PATHINFO_EXTENSION));
+    return in_array($ext, ['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'mp4', 'webm', 'm4v', 'mov', 'mkv', 'mp3', 'm4a', 'wav'], true);
+}
+
+/** Instagram / Threads hosts that usually require cookies for extractors. */
+function ff_url_needs_ig_cookies(string $url): bool {
+    $host = strtolower((string)(parse_url($url, PHP_URL_HOST) ?? ''));
+    if ($host === '') return false;
+    return str_ends_with($host, '.instagram.com')
+        || $host === 'instagram.com'
+        || str_ends_with($host, '.threads.net')
+        || $host === 'threads.net'
+        || str_ends_with($host, '.threads.com')
+        || $host === 'threads.com'
+        || $host === 'instagr.am';
+}
+
+function ff_shell_cookie_opt(string $path): string {
+    $path = trim($path);
+    if ($path === '' || !is_file($path) || !is_readable($path)) {
+        return '';
+    }
+    $real = realpath($path);
+    if ($real === false) {
+        return '';
+    }
+    return ' --cookies ' . escapeshellarg($real);
+}
+
+/** Last $maxBytes of a log file (for fetch extractor output). */
+function ff_tail_log_file(string $path, int $maxBytes = 6000): string {
+    if ($maxBytes < 64) {
+        $maxBytes = 64;
+    }
+    if (!is_file($path)) {
+        return '';
+    }
+    $raw = @file_get_contents($path);
+    if ($raw === false || $raw === '') {
+        return '';
+    }
+    if (strlen($raw) <= $maxBytes) {
+        return $raw;
+    }
+    return "…(truncated, showing last {$maxBytes} bytes)\n" . substr($raw, -$maxBytes);
+}
+
+function ff_fetch_failure_hint(string $url): string {
+    if (!ff_url_needs_ig_cookies($url)) {
+        return '';
+    }
+    $cfg = $GLOBALS['CONFIG'];
+    $hasGd = ($cfg['gallery_dl_cookies'] ?? '') !== '' && is_file((string)$cfg['gallery_dl_cookies']);
+    $ytPath = ($cfg['yt_dlp_cookies'] ?? '') !== '' ? (string)$cfg['yt_dlp_cookies'] : (string)($cfg['gallery_dl_cookies'] ?? '');
+    $hasYt = $ytPath !== '' && is_file($ytPath);
+    if ($hasGd || $hasYt) {
+        return ' Cookies file is set but may be expired — re-export from your browser (instagram.com logged in) and update GALLERY_DL_COOKIES.';
+    }
+    return ' Instagram (and similar) now block anonymous downloads. Export a Netscape cookies.txt while logged in at instagram.com, place it on the server, and set GALLERY_DL_COOKIES=/absolute/path/to/cookies.txt in .env (optional YT_DLP_COOKIES for yt-dlp).';
+}
+
+/**
+ * Download a single HTTP(S) URL to a file inside $tmpDir (curl, follows redirects).
+ */
+function fetch_direct_http_file(string $url, string $tmpDir): ?string {
+    $path = (string)(parse_url($url, PHP_URL_PATH) ?? '');
+    $base = basename($path) ?: 'download.bin';
+    $base = preg_replace('/[^a-zA-Z0-9._-]+/', '_', $base) ?: 'download.bin';
+    $dest = $tmpDir . '/' . $base;
+    $fp = @fopen($dest, 'wb');
+    if (!$fp) {
+        return null;
+    }
+    $ch = curl_init($url);
+    curl_setopt_array($ch, [
+        CURLOPT_FILE => $fp,
+        CURLOPT_FOLLOWLOCATION => true,
+        CURLOPT_TIMEOUT => 120,
+        CURLOPT_USERAGENT => 'FormatForge/1.0',
+    ]);
+    $ok = curl_exec($ch);
+    $code = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    curl_close($ch);
+    fclose($fp);
+    if (!$ok || $code < 200 || $code >= 300) {
+        @unlink($dest);
+        return null;
+    }
+    if (!is_file($dest) || filesize($dest) === 0) {
+        @unlink($dest);
+        return null;
+    }
+    return $dest;
+}
+
+/**
  * Download media from URL using gallery-dl (images) or yt-dlp (video/audio).
  * @param string $url Source URL
  * @param string $downloader 'gallery-dl' or 'yt-dlp'
- * @return array{0: array, 1: ?string} [list of file paths, temp dir for cleanup]
+ * @return array{0: array, 1: ?string, 2: array} [file paths, temp dir, diagnostic]
  */
 function fetch_media_from_url(string $url, string $downloader): array {
     $cfg = $GLOBALS['CONFIG'];
+    $diag = [
+        'tool' => $downloader,
+        'direct_url_candidate' => is_direct_media_url($url),
+        'direct_ok' => false,
+        'cookies_file_used' => false,
+        'exit_code' => null,
+        'output_tail' => '',
+    ];
     $tmpDir = sys_get_temp_dir() . '/ff_fetch_' . bin2hex(random_bytes(8));
-    if (!@mkdir($tmpDir, 0755, true)) return [[], null];
+    if (!@mkdir($tmpDir, 0755, true)) {
+        $diag['error'] = 'temp_dir_mkdir_failed';
+        return [[], null, $diag];
+    }
+    if (is_direct_media_url($url)) {
+        $direct = fetch_direct_http_file($url, $tmpDir);
+        if ($direct) {
+            $diag['direct_ok'] = true;
+            return [[$direct], $tmpDir, $diag];
+        }
+    }
     $files = [];
     if ($downloader === 'gallery-dl') {
-        $bin = $cfg['gallery_dl_path'] ?? 'gallery-dl';
-        $cmd = escapeshellcmd($bin) . ' -d ' . escapeshellarg($tmpDir) . ' ' . escapeshellarg($url) . ' 2>/dev/null';
-        exec($cmd, $out, $code);
+        $cookieOpt = ff_shell_cookie_opt((string)($cfg['gallery_dl_cookies'] ?? ''));
+        if ($cookieOpt !== '') {
+            $diag['cookies_file_used'] = true;
+        }
+        $bin = ff_fetch_executable((string)($cfg['gallery_dl_path'] ?? ''), 'gallery-dl');
+        $diag['resolved_bin'] = $bin;
+        $logFile = sys_get_temp_dir() . '/ff_gdl_' . bin2hex(random_bytes(8)) . '.log';
+        $cmd = ff_fetch_env_prefix() . escapeshellcmd($bin) . $cookieOpt . ' -d ' . escapeshellarg($tmpDir) . ' ' . escapeshellarg($url);
+        $cmd .= ' > ' . escapeshellarg($logFile) . ' 2>&1';
+        exec($cmd, $void, $code);
+        $diag['exit_code'] = $code;
+        $diag['output_tail'] = ff_tail_log_file($logFile, 8000);
+        @unlink($logFile);
         if ($code !== 0) {
-            @array_map('unlink', glob($tmpDir . '/*/*') ?: []);
-            @array_map('rmdir', glob($tmpDir . '/*') ?: []);
+            $iter = new RecursiveIteratorIterator(new RecursiveDirectoryIterator($tmpDir, RecursiveDirectoryIterator::SKIP_DOTS), RecursiveIteratorIterator::CHILD_FIRST);
+            foreach ($iter as $f) { $f->isDir() ? @rmdir($f->getPathname()) : @unlink($f->getPathname()); }
             @rmdir($tmpDir);
-            return [[], null];
+            return [[], null, $diag];
         }
         $all = [];
         $it = new RecursiveIteratorIterator(new RecursiveDirectoryIterator($tmpDir, RecursiveDirectoryIterator::SKIP_DOTS));
         foreach ($it as $f) { if ($f->isFile()) $all[] = $f->getPathname(); }
         $files = $all;
-    } elseif ($downloader === 'yt-dlp') {
-        $bin = $cfg['yt_dlp_path'] ?? 'yt-dlp';
-        $outFile = $tmpDir . '/%(id)s.%(ext)s';
-        $cmd = escapeshellcmd($bin) . ' -o ' . escapeshellarg($outFile) . ' ' . escapeshellarg($url) . ' 2>/dev/null';
-        exec($cmd, $out, $code);
-        if ($code !== 0) {
-            @array_map('unlink', glob($tmpDir . '/*') ?: []);
+        if (count($files) === 0) {
+            $iter = new RecursiveIteratorIterator(new RecursiveDirectoryIterator($tmpDir, RecursiveDirectoryIterator::SKIP_DOTS), RecursiveIteratorIterator::CHILD_FIRST);
+            foreach ($iter as $f) { $f->isDir() ? @rmdir($f->getPathname()) : @unlink($f->getPathname()); }
             @rmdir($tmpDir);
-            return [[], null];
+            $diag['note'] = 'extractor_exit_zero_but_no_files';
+            return [[], null, $diag];
+        }
+    } elseif ($downloader === 'yt-dlp') {
+        $cookieOpt = ff_shell_cookie_opt((string)($cfg['yt_dlp_cookies'] ?? ''));
+        if ($cookieOpt === '') {
+            $cookieOpt = ff_shell_cookie_opt((string)($cfg['gallery_dl_cookies'] ?? ''));
+        }
+        if ($cookieOpt !== '') {
+            $diag['cookies_file_used'] = true;
+        }
+        $bin = ff_fetch_executable((string)($cfg['yt_dlp_path'] ?? ''), 'yt-dlp');
+        $diag['resolved_bin'] = $bin;
+        $outFile = $tmpDir . '/%(id)s.%(ext)s';
+        $logFile = sys_get_temp_dir() . '/ff_ytdl_' . bin2hex(random_bytes(8)) . '.log';
+        $cmd = ff_fetch_env_prefix() . escapeshellcmd($bin) . $cookieOpt . ' -o ' . escapeshellarg($outFile) . ' ' . escapeshellarg($url);
+        $cmd .= ' > ' . escapeshellarg($logFile) . ' 2>&1';
+        exec($cmd, $void, $code);
+        $diag['exit_code'] = $code;
+        $diag['output_tail'] = ff_tail_log_file($logFile, 8000);
+        @unlink($logFile);
+        if ($code !== 0) {
+            $iter = new RecursiveIteratorIterator(new RecursiveDirectoryIterator($tmpDir, RecursiveDirectoryIterator::SKIP_DOTS), RecursiveIteratorIterator::CHILD_FIRST);
+            foreach ($iter as $f) { $f->isDir() ? @rmdir($f->getPathname()) : @unlink($f->getPathname()); }
+            @rmdir($tmpDir);
+            return [[], null, $diag];
         }
         $files = glob($tmpDir . '/*') ?: [];
+        $files = array_values(array_filter($files, 'is_file'));
+        if (count($files) === 0) {
+            $iter = new RecursiveIteratorIterator(new RecursiveDirectoryIterator($tmpDir, RecursiveDirectoryIterator::SKIP_DOTS), RecursiveIteratorIterator::CHILD_FIRST);
+            foreach ($iter as $f) { $f->isDir() ? @rmdir($f->getPathname()) : @unlink($f->getPathname()); }
+            @rmdir($tmpDir);
+            $diag['note'] = 'extractor_exit_zero_but_no_files';
+            return [[], null, $diag];
+        }
     }
     $files = array_values(array_filter($files, 'is_file'));
-    return [$files, $tmpDir];
+    return [$files, $tmpDir, $diag];
+}
+
+/**
+ * Try direct HTTP (when URL looks like a file), then gallery-dl, then yt-dlp.
+ *
+ * @return array{0: array, 1: ?string, 2: string, 3: array} paths, tmpDir, via label, meta (attempts)
+ */
+function fetch_media_from_url_auto(string $url): array {
+    [$files, $tmpDir, $dGd] = fetch_media_from_url($url, 'gallery-dl');
+    if (count($files) > 0) {
+        $via = !empty($dGd['direct_ok']) ? 'direct-http' : 'gallery-dl';
+        return [$files, $tmpDir, $via, ['attempts' => [$dGd]]];
+    }
+    [$files, $tmpDir, $dYt] = fetch_media_from_url($url, 'yt-dlp');
+    if (count($files) > 0) {
+        return [$files, $tmpDir, 'yt-dlp', ['attempts' => [$dGd, $dYt]]];
+    }
+    return [[], null, '', ['attempts' => [$dGd, $dYt]]];
+}
+
+/**
+ * Upsert a PocketBase content_items row into Antfly so text is embedded / searchable (best-effort).
+ */
+function formatforge_index_content_in_antfly(string $pbRecordId, string $prompt, string $type, string $status = 'pending'): void {
+    $pbRecordId = trim($pbRecordId);
+    $prompt = trim($prompt);
+    if ($pbRecordId === '' || $prompt === '') {
+        return;
+    }
+    if (!antfly_index('content', ['id' => $pbRecordId, 'prompt' => $prompt, 'type' => $type, 'status' => $status])) {
+        ff_debug_log('antfly_index_failed', ['id' => $pbRecordId, 'type' => $type]);
+    }
 }
 
 function antfly_index(string $table, array $doc): bool {
@@ -472,6 +842,14 @@ function antfly_create_table(string $table): bool {
     if ($table !== 'content') return false;
     $cfg = $GLOBALS['CONFIG'];
     $url = $cfg['antfly_url'] . '/api/v1/tables/content';
+    $embedModel = trim((string)($cfg['embed_model'] ?? '')) ?: 'google/gemini-embedding-001';
+    $embedder = [
+        'provider' => 'openrouter',
+        'model' => $embedModel,
+    ];
+    if (!empty($cfg['openrouter_key'])) {
+        $embedder['api_key'] = $cfg['openrouter_key'];
+    }
     $body = [
         'num_shards' => 1,
         'schema' => [
@@ -491,7 +869,14 @@ function antfly_create_table(string $table): bool {
             ],
             'default_type' => 'content',
         ],
-        'indexes' => ['search_idx' => ['type' => 'full_text']],
+        'indexes' => [
+            'search_idx' => ['type' => 'full_text'],
+            'semantic_idx' => [
+                'type' => 'embeddings',
+                'field' => 'prompt',
+                'embedder' => $embedder,
+            ],
+        ],
     ];
     $headers = ['Content-Type: application/json'];
     if (!empty($cfg['antfly_key'])) $headers[] = 'Authorization: Bearer ' . $cfg['antfly_key'];
@@ -510,7 +895,7 @@ function antfly_create_table(string $table): bool {
 
 function embed_text(string $text): ?array {
     $cfg = $GLOBALS['CONFIG'];
-    // OpenRouter (embeddings + pi) — preferred if key set
+    // OpenRouter embeddings (e.g. google/gemini-embedding-001) — preferred if key set
     if (!empty($cfg['openrouter_key'])) {
         $ch = curl_init('https://openrouter.ai/api/v1/embeddings');
         curl_setopt_array($ch, [
@@ -607,7 +992,165 @@ function content_is_novel(string $prompt, array $existingPrompts): bool {
     return true;
 }
 
-function trigger_pi_for_pipeline(string $reason, array $context): void {
+function formatforge_embeddings_configured(): bool {
+    $cfg = $GLOBALS['CONFIG'];
+    return !empty($cfg['embed_url']) || !empty($cfg['openai_key']) || !empty($cfg['openrouter_key']);
+}
+
+/** Instagram-bound pipelines: active unless `is_active` is explicitly false (missing/null treated as active). */
+function pipeline_record_is_active_for_feed(array $p): bool {
+    return ($p['is_active'] ?? true) !== false;
+}
+
+/**
+ * Active pipelines only: non-empty prompt_templates for embedding novelty, plus count of active rows.
+ * Inactive pipelines are ignored so novelty compares against what actually feeds Instagram.
+ */
+function fetch_pipeline_embedding_reference_state(?string $authHeader): array {
+    $r = pb_request('GET', '/api/collections/pipelines/records?perPage=200&sort=-updated', null, $authHeader);
+    if ($r['code'] !== 200) {
+        return ['templates' => [], 'active_pipeline_row_count' => 0];
+    }
+    $items = $r['body']['items'] ?? [];
+    $out = [];
+    $activeCount = 0;
+    foreach ($items as $p) {
+        if (!pipeline_record_is_active_for_feed($p)) {
+            continue;
+        }
+        $activeCount++;
+        $t = trim((string)($p['prompt_template'] ?? ''));
+        if ($t !== '') {
+            $out[] = $t;
+        }
+    }
+    return ['templates' => $out, 'active_pipeline_row_count' => $activeCount];
+}
+
+/** True when fetched index text should spawn a “create pipeline” Cursor run. */
+function fetched_text_is_novel_vs_pipelines(string $indexPrompt, array $templates, int $activePipelineRowCount): bool {
+    $indexPrompt = trim($indexPrompt);
+    if ($indexPrompt === '' || !formatforge_embeddings_configured()) {
+        return false;
+    }
+    if ($templates !== []) {
+        return content_is_novel($indexPrompt, $templates);
+    }
+    return $activePipelineRowCount === 0;
+}
+
+/**
+ * Rejects for this pipeline only, most recently updated first, then count leading rejected.
+ */
+function count_consecutive_rejects_for_pipeline(string $pipelineId, ?string $authHeader): int {
+    $pipelineId = trim($pipelineId);
+    if ($pipelineId === '' || !$authHeader) return 0;
+    $escaped = str_replace(['\\', '"'], ['\\\\', '\\"'], $pipelineId);
+    $filter = 'metadata.pipeline_id = "' . $escaped . '"';
+    $qs = http_build_query(['filter' => $filter, 'sort' => '-updated', 'perPage' => 60]);
+    $r = pb_request('GET', '/api/collections/content_items/records?' . $qs, null, $authHeader);
+    $items = ($r['code'] === 200) ? ($r['body']['items'] ?? []) : [];
+    if ($items === []) {
+        $qs2 = http_build_query(['sort' => '-updated', 'perPage' => 200]);
+        $r2 = pb_request('GET', '/api/collections/content_items/records?' . $qs2, null, $authHeader);
+        if ($r2['code'] !== 200) return 0;
+        foreach ($r2['body']['items'] ?? [] as $it) {
+            $m = $it['metadata'] ?? [];
+            if (is_array($m) && trim((string)($m['pipeline_id'] ?? '')) === $pipelineId) {
+                $items[] = $it;
+            }
+        }
+        usort($items, function ($a, $b) {
+            return strcmp((string)($b['updated'] ?? ''), (string)($a['updated'] ?? ''));
+        });
+    }
+    $n = 0;
+    foreach ($items as $it) {
+        if (($it['status'] ?? '') === 'rejected') {
+            $n++;
+        } else {
+            break;
+        }
+    }
+    return $n;
+}
+
+/**
+ * After Antfly indexing: if fetched text is novel vs existing pipeline templates (or there are none), spawn Cursor to create a pipeline.
+ */
+function maybe_trigger_cursor_create_pipeline_after_fetch(array $novelIndexPrompts, ?string $authHeader): void {
+    $cfg = $GLOBALS['CONFIG'];
+    if (empty($cfg['pi_trigger_dir']) || $novelIndexPrompts === []) return;
+    if (!formatforge_embeddings_configured()) return;
+    $novelIndexPrompts = array_values(array_unique(array_filter(array_map('trim', $novelIndexPrompts))));
+    if ($novelIndexPrompts === []) return;
+    trigger_pipeline_cursor_agent('novel_fetched_content', [
+        'intent' => 'create_pipeline',
+        'fetched_index_prompts' => $novelIndexPrompts,
+        'novel_threshold' => $cfg['novel_threshold'],
+    ]);
+}
+
+/**
+ * After rejecting pipeline-generated content: spawn Cursor to edit that pipeline only after N consecutive rejects.
+ */
+function maybe_trigger_cursor_edit_pipeline_after_reject(array $itemBody, string $contentItemId, string $reason, ?string $authHeader): void {
+    $cfg = $GLOBALS['CONFIG'];
+    if (empty($cfg['pi_trigger_dir']) || !$authHeader) return;
+    $meta = $itemBody['metadata'] ?? [];
+    if (!is_array($meta)) return;
+    $pipelineId = trim((string)($meta['pipeline_id'] ?? ''));
+    if ($pipelineId === '') return;
+    $need = (int)($cfg['pipeline_reject_streak'] ?? 3);
+    $streak = count_consecutive_rejects_for_pipeline($pipelineId, $authHeader);
+    if ($streak < $need) return;
+    $pRes = pb_request('GET', '/api/collections/pipelines/records/' . rawurlencode($pipelineId), null, $authHeader);
+    $pipeline = ($pRes['code'] === 200) ? ($pRes['body'] ?? []) : [];
+    trigger_pipeline_cursor_agent('pipeline_edit_streak', [
+        'intent' => 'edit_pipeline',
+        'content_item_id' => $contentItemId,
+        'pipeline_id' => $pipelineId,
+        'pipeline_name' => $pipeline['name'] ?? '',
+        'prompt_template' => $pipeline['prompt_template'] ?? '',
+        'rejected_reason' => $reason,
+        'consecutive_rejects' => $streak,
+        'content_prompt' => $itemBody['prompt'] ?? '',
+    ]);
+}
+
+/**
+ * Queue a headless Cursor Agent run (composer-2-fast by default) after pipeline files exist.
+ */
+function spawn_cursor_agent_background(string $promptFile): void {
+    $cfg = $GLOBALS['CONFIG'];
+    if (empty($cfg['cursor_agent_enabled'])) {
+        return;
+    }
+    $root = __DIR__;
+    $promptReal = realpath($promptFile);
+    if (!$promptReal || !is_file($promptReal) || strncmp($promptReal, $root, strlen($root)) !== 0) {
+        return;
+    }
+    $prefix = $root . DIRECTORY_SEPARATOR . '.pi' . DIRECTORY_SEPARATOR . 'prompts' . DIRECTORY_SEPARATOR;
+    if (strncmp($promptReal, $prefix, strlen($prefix)) !== 0) {
+        return;
+    }
+    $logDir = $root . '/.pi';
+    if (!is_dir($logDir) && !@mkdir($logDir, 0755, true)) {
+        $logDir = sys_get_temp_dir();
+    }
+    $log = $logDir . '/cursor-agent.log';
+    $php = PHP_BINARY && is_executable(PHP_BINARY) ? PHP_BINARY : 'php';
+    $self = __FILE__;
+    $cmd = implode(' ', array_map('escapeshellarg', [$php, $self, 'cursor-agent-run', $promptReal]));
+    if (PHP_OS_FAMILY === 'Windows') {
+        exec($cmd . ' >> ' . escapeshellarg($log) . ' 2>&1');
+    } else {
+        exec($cmd . ' >> ' . escapeshellarg($log) . ' 2>&1 &');
+    }
+}
+
+function trigger_pipeline_cursor_agent(string $reason, array $context): void {
     $cfg = $GLOBALS['CONFIG'];
     $dir = $cfg['pi_trigger_dir'] ?? '';
     if (!$dir) return;
@@ -621,11 +1164,11 @@ function trigger_pi_for_pipeline(string $reason, array $context): void {
         'template_path' => __DIR__ . '/pipelines/template',
     ];
     if (@file_put_contents($file, json_encode($payload, JSON_PRETTY_PRINT))) {
-        setup_pipeline_from_trigger($file);
+        setup_pipeline_from_trigger($file, true);
     }
 }
 
-function setup_pipeline_from_trigger(string $triggerFile): void {
+function setup_pipeline_from_trigger(string $triggerFile, bool $spawnCursorAgent = true): void {
     $projectRoot = __DIR__;
     $cfg = $GLOBALS['CONFIG'];
     $trigger = json_decode(file_get_contents($triggerFile), true) ?: [];
@@ -659,27 +1202,35 @@ function setup_pipeline_from_trigger(string $triggerFile): void {
     $piDir = $projectRoot . '/.pi';
     if (!is_dir($piDir)) mkdir($piDir, 0755, true);
     if (!is_dir($piDir . '/prompts')) mkdir($piDir . '/prompts', 0755, true);
-    $piEnvFile = $piDir . '/pipeline-' . $pipelineId . '.env';
-    $piEnvLines = [];
-    if (is_file($projectEnv)) {
-        $piVars = ['OPENROUTER_API_KEY', 'PI_MODEL', 'ANTHROPIC_API_KEY', 'OPENAI_API_KEY'];
-        foreach (file($projectEnv, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) ?: [] as $line) {
-            $line = trim($line);
-            if (strpos($line, '#') === 0) continue;
-            if (preg_match('/^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/', $line, $m) && in_array(trim($m[1]), $piVars)) $piEnvLines[] = 'export ' . $m[1] . '=' . escapeshellarg(trim($m[2], " \t\"'"));
-        }
-    }
-    $hasPiModel = false;
-    foreach ($piEnvLines as $l) { if (strpos($l, 'PI_MODEL') !== false) { $hasPiModel = true; break; } }
-    if (!$hasPiModel) $piEnvLines[] = 'export PI_MODEL="openai/gpt-4o-mini"';
-    file_put_contents($piEnvFile, implode("\n", $piEnvLines) . "\n");
     $promptFile = $piDir . '/prompts/pipeline-' . $pipelineId . '.md';
     $contextJson = json_encode($context, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES);
-    $task = $reason === 'content_rejected'
-        ? "Content was rejected. Create or edit a content pipeline to improve output.\n\n1. Pipeline dir: `$pipelineDir`\n2. Edit `$pipelineDir/.env` PROMPT or PROMPT_TEMPLATE based on rejected content and reason\n3. Build: `cd $pipelineDir && go build -o pipeline-generate .`\n4. Crontab: `0 */6 * * * cd $pipelineDir && set -a && . .env && set +a && ./pipeline-generate`"
-        : "Novel content.\n\n1. Pipeline dir: `$pipelineDir`\n2. .env copied. Build: `cd $pipelineDir && go build -o pipeline-generate .`\n3. Crontab: `0 */6 * * * cd $pipelineDir && set -a && . .env && set +a && ./pipeline-generate`";
-    $promptContent = "# FormatForge pipeline setup\n\n**Trigger:** $reason\n**Created:** $created\n\n## Context\n\n```json\n$contextJson\n```\n\n## Task\n\n$task\n\n## Pi env\n\nSource: `$piEnvFile`\n\nRequired: OPENROUTER_API_KEY or ANTHROPIC_API_KEY or OPENAI_API_KEY\nModel: PI_MODEL\n";
+    if ($reason === 'pipeline_edit_streak') {
+        $pid = (string)($context['pipeline_id'] ?? '');
+        $pname = (string)($context['pipeline_name'] ?? '');
+        $streak = (int)($context['consecutive_rejects'] ?? 0);
+        $task = "**EDIT an existing pipeline** (user rejected output {$streak} times in a row for this pipeline).\n\n"
+            . "1. PocketBase **`pipelines`** record id: `$pid`" . ($pname !== '' ? " (name: $pname)" : '') . "\n"
+            . "2. Update **`prompt_template`** (and related fields) using rejected_reason and content_prompt from context — improve quality for this niche.\n"
+            . "3. If a Go dir exists for this pipeline under `pipelines/`, align `.env` / templates there; otherwise rely on PocketBase.\n"
+            . "4. Build if you touch Go: `cd $pipelineDir && go build -o pipeline-generate .`\n"
+            . "5. Do **not** create a duplicate pipeline row unless the user workflow clearly needs a second one.";
+    } elseif ($reason === 'content_rejected') {
+        $task = "Content was rejected (legacy trigger). Create or edit a content pipeline to improve output.\n\n1. Pipeline dir: `$pipelineDir`\n2. Use context JSON for ids and reasons.\n3. Build: `cd $pipelineDir && go build -o pipeline-generate .`\n4. Update PocketBase **`pipelines`** as needed.";
+    } elseif ($reason === 'novel_fetched_content' || $reason === 'novel_content') {
+        $task = "**CREATE a new pipeline** (fetched media text is novel vs **active** pipelines’ `prompt_template` embeddings, or no active pipelines yet).\n\n"
+            . "1. New pipeline dir: `$pipelineDir`\n"
+            . "2. .env copied from template. Build: `cd $pipelineDir && go build -o pipeline-generate .`\n"
+            . "3. Crontab: `0 */6 * * * cd $pipelineDir && set -a && . .env && set +a && ./pipeline-generate`\n"
+            . "4. Add a **`pipelines`** row (superuser/admin API) with `prompt_template` suited to `fetched_index_prompts` in context.";
+    } else {
+        $task = "Pipeline maintenance.\n\n1. Pipeline dir: `$pipelineDir`\n2. Build: `cd $pipelineDir && go build -o pipeline-generate .`\n3. Update PocketBase **`pipelines`** as needed.";
+    }
+    $agentModel = $cfg['cursor_agent_model'] ?? 'composer-2-fast';
+    $promptContent = "# FormatForge pipeline setup\n\n**Trigger:** $reason\n**Created:** $created\n\n## Context\n\n```json\n$contextJson\n```\n\n## Task\n\n$task\n\n## Cursor Agent (headless)\n\nFormatForge spawns the [Cursor CLI](https://cursor.com/cli) **`agent`** with **`-p`** (print), **`--trust`**, **`-f`** (force), **`--model $agentModel`** ([Composer 2 Fast](https://cursor.com/blog/2-0)), **`--workspace`** = project root.\n\nManual re-run:\n\n```bash\nagent -p --trust -f --model $agentModel --workspace \"$projectRoot\" \"Execute every step in: $promptFile\"\n```\n\nAuth: **`CURSOR_API_KEY`** or `agent login`. Logs: **`.pi/cursor-agent.log`**.\n";
     file_put_contents($promptFile, $promptContent);
+    if ($spawnCursorAgent) {
+        spawn_cursor_agent_background($promptFile);
+    }
 }
 
 // CLI: php index.php check-instagram
@@ -719,6 +1270,30 @@ if (PHP_SAPI === 'cli' && ($argv[1] ?? '') === 'check-instagram') {
     exit(0);
 }
 
+// CLI: php index.php repair-source-links-schema
+if (PHP_SAPI === 'cli' && ($argv[1] ?? '') === 'repair-source-links-schema') {
+    $r = repair_source_links_schema();
+    echo json_encode($r, JSON_PRETTY_PRINT) . "\n";
+    exit(($r['ok'] ?? false) ? 0 : 1);
+}
+
+// CLI: php index.php probe-garage — signed PUT using GARAGE_* from .env (same code path as uploads)
+if (PHP_SAPI === 'cli' && ($argv[1] ?? '') === 'probe-garage') {
+    $cfg = $GLOBALS['CONFIG'];
+    if (empty($cfg['garage_key']) || empty($cfg['garage_secret'])) {
+        fwrite(STDERR, "Missing GARAGE_ACCESS_KEY / GARAGE_SECRET_KEY in environment.\n");
+        exit(1);
+    }
+    $key = '_formatforge_probe_' . gmdate('Ymd\THis\Z') . '.txt';
+    $url = s3_upload($key, "garage probe " . gmdate('c'), 'text/plain');
+    if ($url) {
+        echo "OK signed PUT\nendpoint: {$cfg['garage_endpoint']}\nbucket: {$cfg['garage_bucket']}\nkey: $key\nurl: $url\n";
+        exit(0);
+    }
+    fwrite(STDERR, "FAIL: s3_upload() returned null. PHP cannot complete SigV4 PUT to GARAGE_ENDPOINT from this process (wrong host/port if PHP runs in Docker — use e.g. http://garage:3900).\n");
+    exit(1);
+}
+
 // CLI: php index.php setup-pipeline [trigger_file]
 if (PHP_SAPI === 'cli' && ($argv[1] ?? '') === 'setup-pipeline') {
     $triggerFile = $argv[2] ?? null;
@@ -730,35 +1305,274 @@ if (PHP_SAPI === 'cli' && ($argv[1] ?? '') === 'setup-pipeline') {
         $triggerFile = $files[0];
     }
     if (!is_file($triggerFile)) { fwrite(STDERR, "Not found: $triggerFile\n"); exit(1); }
-    setup_pipeline_from_trigger($triggerFile);
+    setup_pipeline_from_trigger($triggerFile, false);
     exit(0);
 }
 
-function fetch_recent_content_prompts(?string $authHeader): array {
-    $qs = http_build_query(['filter' => 'status="approved" || status="published"', 'perPage' => 50, 'sort' => '-created']);
-    $r = pb_request('GET', '/api/collections/content_items/records?' . $qs, null, $authHeader);
-    if ($r['code'] !== 200 || empty($r['body']['items'])) return [];
-    $out = [];
-    foreach ($r['body']['items'] as $it) {
-        $p = $it['prompt'] ?? '';
-        if ($p) $out[] = $p;
+// CLI: php index.php cursor-agent-run /abs/path/to/.pi/prompts/pipeline-….md
+if (PHP_SAPI === 'cli' && ($argv[1] ?? '') === 'cursor-agent-run') {
+    $pf = $argv[2] ?? '';
+    $root = __DIR__;
+    $real = $pf !== '' ? realpath($pf) : false;
+    $prefix = $root . DIRECTORY_SEPARATOR . '.pi' . DIRECTORY_SEPARATOR . 'prompts' . DIRECTORY_SEPARATOR;
+    if (!$real || !is_file($real) || strncmp($real, $prefix, strlen($prefix)) !== 0) {
+        fwrite(STDERR, "cursor-agent-run: need a file under .pi/prompts/\n");
+        exit(1);
+    }
+    $cfg = $GLOBALS['CONFIG'];
+    $bin = $cfg['cursor_agent_bin'] ?: 'agent';
+    $model = $cfg['cursor_agent_model'] ?: 'composer-2-fast';
+    $task = 'FormatForge: read and execute all instructions in this Markdown file (PocketBase pipelines collection, Go pipeline dir, crontab). File: ' . $real;
+    $cmdline = [$bin, '-p', '--print', '--trust', '-f', '--model', $model, '--workspace', $root, $task];
+    $nullDevice = PHP_OS_FAMILY === 'Windows' ? 'NUL' : '/dev/null';
+    $proc = @proc_open(
+        $cmdline,
+        [
+            0 => ['file', $nullDevice, 'r'],
+            1 => STDOUT,
+            2 => STDERR,
+        ],
+        $pipes,
+        $root,
+        null,
+        ['bypass_shell' => true]
+    );
+    if (!is_resource($proc)) {
+        fwrite(STDERR, "cursor-agent-run: could not start " . $bin . " (install Cursor CLI / set CURSOR_AGENT_BIN)\n");
+        exit(1);
+    }
+    $exit = proc_close($proc);
+    exit(($exit === 0) ? 0 : 1);
+}
+
+// CLI: php index.php delete-source-link [record_id]
+// Without id: deletes the only source_links row when count === 1 (safety check).
+if (PHP_SAPI === 'cli' && ($argv[1] ?? '') === 'delete-source-link') {
+    $email = getenv('ADMIN_EMAIL') ?: getenv('FORMATFORGE_EMAIL');
+    $pass = getenv('ADMIN_PASSWORD') ?: getenv('FORMATFORGE_PASSWORD');
+    if (!$email || !$pass) {
+        fwrite(STDERR, "Set ADMIN_EMAIL/ADMIN_PASSWORD or FORMATFORGE_EMAIL/FORMATFORGE_PASSWORD in .env\n");
+        exit(1);
+    }
+    $auth = pb_request('POST', '/api/collections/' . $GLOBALS['CONFIG']['users_collection'] . '/auth-with-password', [
+        'identity' => $email,
+        'password' => $pass,
+    ]);
+    if ($auth['code'] < 200 || $auth['code'] >= 300) {
+        fwrite(STDERR, 'Auth failed: ' . ($auth['body']['message'] ?? json_encode($auth['body'])) . "\n");
+        exit(1);
+    }
+    $token = $auth['body']['token'] ?? '';
+    if (!$token) {
+        fwrite(STDERR, "No token in auth response\n");
+        exit(1);
+    }
+    $wantId = trim($argv[2] ?? '');
+    $list = pb_request('GET', '/api/collections/source_links/records?perPage=500&sort=-created', null, $token);
+    if ($list['code'] < 200 || $list['code'] >= 300) {
+        fwrite(STDERR, 'List failed: ' . ($list['body']['message'] ?? json_encode($list['body'])) . "\n");
+        exit(1);
+    }
+    $items = $list['body']['items'] ?? [];
+    if ($wantId === '') {
+        if (count($items) !== 1) {
+            fwrite(STDERR, 'Expected exactly 1 source_links record (pass record id as 2nd arg to delete a specific row). Found: ' . count($items) . "\n");
+            foreach ($items as $it) {
+                $id = $it['id'] ?? '';
+                $url = $it['url'] ?? '';
+                fwrite(STDERR, "  - {$id}  {$url}\n");
+            }
+            exit(1);
+        }
+        $wantId = (string)($items[0]['id'] ?? '');
+    }
+    if ($wantId === '') {
+        fwrite(STDERR, "No record id to delete.\n");
+        exit(1);
+    }
+    $del = pb_request('DELETE', '/api/collections/source_links/records/' . rawurlencode($wantId), null, $token);
+    if ($del['code'] < 200 || $del['code'] >= 300) {
+        fwrite(STDERR, 'Delete failed: ' . ($del['body']['message'] ?? json_encode($del['body'])) . "\n");
+        exit(1);
+    }
+    echo "Deleted source_links/{$wantId}\n";
+    exit(0);
+}
+
+/** PocketBase auth token for CLI maintenance (ADMIN_EMAIL / ADMIN_PASSWORD). */
+function ff_pb_cli_token(): ?string {
+    $email = getenv('ADMIN_EMAIL') ?: getenv('FORMATFORGE_EMAIL');
+    $pass = getenv('ADMIN_PASSWORD') ?: getenv('FORMATFORGE_PASSWORD');
+    if (!$email || !$pass) {
+        return null;
+    }
+    $auth = pb_request('POST', '/api/collections/' . $GLOBALS['CONFIG']['users_collection'] . '/auth-with-password', [
+        'identity' => $email,
+        'password' => $pass,
+    ]);
+    if ($auth['code'] < 200 || $auth['code'] >= 300) {
+        return null;
+    }
+    $t = $auth['body']['token'] ?? '';
+    return $t !== '' ? $t : null;
+}
+
+/**
+ * Delete content_items with no title, no prompt, and no media URLs (corrupt / accidental rows).
+ * @return array{ok: bool, dry_run: bool, deleted: string[], error?: string}
+ */
+function cleanup_bad_content_items(string $token, bool $apply): array {
+    $out = ['ok' => true, 'dry_run' => !$apply, 'deleted' => []];
+    $page = 1;
+    $perPage = 100;
+    $authHeader = 'Bearer ' . $token;
+    while (true) {
+        $qs = http_build_query(['perPage' => $perPage, 'page' => $page, 'sort' => '-created']);
+        $r = pb_request('GET', '/api/collections/content_items/records?' . $qs, null, $authHeader);
+        if ($r['code'] !== 200) {
+            $out['ok'] = false;
+            $out['error'] = $r['body']['message'] ?? 'List content_items failed';
+            return $out;
+        }
+        $items = $r['body']['items'] ?? [];
+        foreach ($items as $it) {
+            $id = (string)($it['id'] ?? '');
+            if ($id === '') {
+                continue;
+            }
+            $title = trim((string)($it['title'] ?? ''));
+            $prompt = trim((string)($it['prompt'] ?? ''));
+            $gurl = trim((string)($it['garage_url'] ?? ''));
+            $thumb = trim((string)($it['thumbnail_url'] ?? ''));
+            $gkey = trim((string)($it['garage_key'] ?? ''));
+            if ($title === '' && $prompt === '' && $gurl === '' && $thumb === '' && $gkey === '') {
+                if ($apply) {
+                    $del = pb_request('DELETE', '/api/collections/content_items/records/' . rawurlencode($id), null, $authHeader);
+                    if ($del['code'] < 200 || $del['code'] >= 300) {
+                        $out['ok'] = false;
+                        $out['error'] = $del['body']['message'] ?? "Delete failed for {$id}";
+                        return $out;
+                    }
+                }
+                $out['deleted'][] = $id;
+            }
+        }
+        if (count($items) < $perPage) {
+            break;
+        }
+        $page++;
     }
     return $out;
 }
 
-function maybe_trigger_pi(string $action, array $context): void {
-    $cfg = $GLOBALS['CONFIG'];
-    if (empty($cfg['pi_trigger_dir'])) return;
-    if ($action === 'reject') {
-        trigger_pi_for_pipeline('content_rejected', $context);
-        return;
+// CLI: php index.php cleanup-bad-content-items  [--apply]
+// Removes content_items with empty title, prompt, and no storage URLs (orphan rows).
+if (PHP_SAPI === 'cli' && ($argv[1] ?? '') === 'cleanup-bad-content-items') {
+    $apply = in_array('--apply', $argv, true);
+    $token = ff_pb_cli_token();
+    if (!$token) {
+        fwrite(STDERR, "Auth failed or missing ADMIN_EMAIL/ADMIN_PASSWORD (or FORMATFORGE_*)\n");
+        exit(1);
     }
-    if (($action === 'add_link' || $action === 'approve') && !empty($context['prompt'])) {
-        $existing = $context['existing_prompts'] ?? [];
-        if (content_is_novel($context['prompt'], $existing)) {
-            trigger_pi_for_pipeline('novel_content', $context);
+    $r = cleanup_bad_content_items($token, $apply);
+    echo json_encode($r, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES) . "\n";
+    exit(($r['ok'] ?? false) ? 0 : 1);
+}
+
+/**
+ * Delete all source_links records (queued / fetched URLs on the Curate tab).
+ * @return array{ok: bool, dry_run: bool, deleted: string[], error?: string}
+ */
+function delete_all_source_links(string $token, bool $apply): array {
+    $out = ['ok' => true, 'dry_run' => !$apply, 'deleted' => []];
+    $page = 1;
+    $perPage = 100;
+    $authHeader = 'Bearer ' . $token;
+    while (true) {
+        $qs = http_build_query(['perPage' => $perPage, 'page' => $page, 'sort' => '-created']);
+        $r = pb_request('GET', '/api/collections/source_links/records?' . $qs, null, $authHeader);
+        if ($r['code'] !== 200) {
+            $out['ok'] = false;
+            $out['error'] = $r['body']['message'] ?? 'List source_links failed';
+            return $out;
         }
+        $items = $r['body']['items'] ?? [];
+        foreach ($items as $it) {
+            $id = (string)($it['id'] ?? '');
+            if ($id === '') {
+                continue;
+            }
+            if ($apply) {
+                $del = pb_request('DELETE', '/api/collections/source_links/records/' . rawurlencode($id), null, $authHeader);
+                if ($del['code'] < 200 || $del['code'] >= 300) {
+                    $out['ok'] = false;
+                    $out['error'] = $del['body']['message'] ?? "Delete failed for {$id}";
+                    return $out;
+                }
+            }
+            $out['deleted'][] = $id;
+        }
+        if (count($items) < $perPage) {
+            break;
+        }
+        $page++;
     }
+    return $out;
+}
+
+// CLI: php index.php delete-all-source-links  [--apply]
+if (PHP_SAPI === 'cli' && ($argv[1] ?? '') === 'delete-all-source-links') {
+    $apply = in_array('--apply', $argv, true);
+    $token = ff_pb_cli_token();
+    if (!$token) {
+        fwrite(STDERR, "Auth failed or missing ADMIN_EMAIL/ADMIN_PASSWORD (or FORMATFORGE_*)\n");
+        exit(1);
+    }
+    $r = delete_all_source_links($token, $apply);
+    echo json_encode($r, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES) . "\n";
+    exit(($r['ok'] ?? false) ? 0 : 1);
+}
+
+// CLI: php index.php test-embed  ["optional phrase"]
+if (PHP_SAPI === 'cli' && ($argv[1] ?? '') === 'test-embed') {
+    $cfg = $GLOBALS['CONFIG'];
+    $phrase = isset($argv[2]) ? (string)$argv[2] : 'FormatForge embedding self-test.';
+    $vec = embed_text($phrase);
+    if (!$vec) {
+        fwrite(STDERR, "FAIL: embed_text() returned null — set OPENROUTER_API_KEY, OPENAI_API_KEY, or EMBED_URL\n");
+        exit(1);
+    }
+    $n = count($vec);
+    $d = cosine_distance($vec, $vec);
+    echo "OK: embed_text() — same code path as novelty checks in index.php\n";
+    echo '  phrase: ' . $phrase . "\n";
+    echo "  dimensions: {$n}\n";
+    echo "  cosine_distance(self,self): {$d} (expect 0)\n";
+    $base = rtrim((string)($cfg['antfly_url'] ?? ''), '/');
+    if ($base !== '') {
+        $headers = ['Accept: application/json'];
+        if (!empty($cfg['antfly_key'])) {
+            $headers[] = 'Authorization: Bearer ' . $cfg['antfly_key'];
+        }
+        $ch = curl_init($base . '/api/v1/tables');
+        curl_setopt_array($ch, [
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_HTTPHEADER => $headers,
+            CURLOPT_TIMEOUT => 10,
+        ]);
+        curl_exec($ch);
+        $acode = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        $cerr = curl_error($ch);
+        curl_close($ch);
+        echo "Antfly: GET {$base}/api/v1/tables → HTTP {$acode}";
+        if ($cerr !== '') {
+            echo " (curl: {$cerr})";
+        }
+        echo "\n";
+    } else {
+        echo "Antfly: ANTFLY_URL not set (skipping reachability check)\n";
+    }
+    exit(0);
 }
 
 // Auth
@@ -1201,6 +2015,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && $user && $authHeader) {
         exit;
     }
 
+    if ($action === 'repair_source_links_schema') {
+        $repair = repair_source_links_schema();
+        ff_debug_log('repair_source_links_schema', $repair);
+        echo json_encode($repair);
+        exit;
+    }
+
     if ($action === 'refresh_instagram_username') {
         $accountId = trim($_POST['account_id'] ?? '');
         ff_debug_log('refresh_username_start', ['account_id' => $accountId ?: null]);
@@ -1259,9 +2080,33 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && $user && $authHeader) {
             'metadata' => $accountId ? ['instagram_account_id' => $accountId] : (object)[],
         ], $authHeader);
         if ($rec['code'] >= 200 && $rec['code'] < 300) {
-            $existing = fetch_recent_content_prompts($authHeader);
-            maybe_trigger_pi('add_link', ['url' => $url, 'prompt' => $url, 'existing_prompts' => $existing]);
-            echo json_encode(['ok' => true, 'id' => $rec['body']['id'] ?? null]);
+            $body = $rec['body'];
+            if (empty($body['url'])) {
+                $repair = repair_source_links_schema();
+                if (!($repair['ok'] ?? false)) {
+                    echo json_encode([
+                        'ok' => false,
+                        'error' => 'source_links collection is missing url/status fields (schema never migrated). Configure ADMIN_EMAIL/ADMIN_PASSWORD for PocketBase, then POST action=repair_source_links_schema or run: php index.php repair-source-links-schema',
+                        'repair_error' => $repair['error'] ?? null,
+                    ]);
+                    exit;
+                }
+                $id = $body['id'] ?? '';
+                if ($id !== '') {
+                    $patch = pb_request('PATCH', '/api/collections/source_links/records/' . rawurlencode($id), [
+                        'url' => $url,
+                        'title' => '',
+                        'status' => 'pending',
+                        'metadata' => $accountId ? ['instagram_account_id' => $accountId] : (object)[],
+                    ], $authHeader);
+                    if ($patch['code'] < 200 || $patch['code'] >= 300) {
+                        echo json_encode(['ok' => false, 'error' => $patch['body']['message'] ?? 'Schema repaired but saving the link failed']);
+                        exit;
+                    }
+                    $body = $patch['body'];
+                }
+            }
+            echo json_encode(['ok' => true, 'id' => $body['id'] ?? null]);
         } else {
             echo json_encode(['ok' => false, 'error' => $rec['body']['message'] ?? 'Failed']);
         }
@@ -1270,10 +2115,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && $user && $authHeader) {
 
     if ($action === 'fetch_link') {
         $linkId = trim($_POST['link_id'] ?? '');
-        $downloader = $_POST['downloader'] ?? 'gallery-dl';
-        $contentType = $_POST['content_type'] ?? 'auto';
-        if (!in_array($downloader, ['gallery-dl', 'yt-dlp'])) $downloader = 'gallery-dl';
-        if (!in_array($contentType, ['carousel', 'video', 'image', 'auto'])) $contentType = 'auto';
         if (!$linkId) {
             echo json_encode(['ok' => false, 'error' => 'Missing link_id']);
             exit;
@@ -1285,10 +2126,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && $user && $authHeader) {
         }
         $url = $link['body']['url'];
         $linkAccountId = $link['body']['metadata']['instagram_account_id'] ?? null;
-        [$files, $tmpDir] = fetch_media_from_url($url, $downloader);
+        [$files, $tmpDir, $viaUsed, $fetchMeta] = fetch_media_from_url_auto($url);
         $created = 0;
         $cfg = $GLOBALS['CONFIG'];
-        foreach ($files as $path) {
+        $pipelineRef = fetch_pipeline_embedding_reference_state($authHeader);
+        $novelFetchedPrompts = [];
+        foreach (array_values($files) as $fileIndex => $path) {
             $ext = strtolower(pathinfo($path, PATHINFO_EXTENSION));
             $mime = match ($ext) {
                 'jpg', 'jpeg' => 'image/jpeg',
@@ -1304,44 +2147,130 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && $user && $authHeader) {
             $content = file_get_contents($path);
             if (!$content) continue;
             $itemId = bin2hex(random_bytes(8));
-            $key = 'content/' . $itemId . '/' . basename($path);
+            $baseName = basename($path);
+            if ($baseName === '' || $baseName === '.' || $baseName === '..') {
+                $baseName = 'fetched-media-' . ($fileIndex + 1);
+            }
+            $key = 'content/' . $itemId . '/' . $baseName;
             $garageUrl = s3_upload($key, $content, $mime);
             if (!$garageUrl && $content) $garageUrl = $cfg['garage_endpoint'] . '/' . $cfg['garage_bucket'] . '/' . $key;
-            $type = $contentType !== 'auto'
-                ? ($contentType === 'video' ? 'video' : ($contentType === 'image' ? 'image' : 'carousel'))
-                : (str_starts_with($mime, 'video/') ? 'video' : (str_starts_with($mime, 'image/') ? 'carousel' : 'reel'));
+            $type = str_starts_with($mime, 'video/')
+                ? 'video'
+                : (str_starts_with($mime, 'image/') ? 'carousel' : 'reel');
             $rec = pb_request('POST', '/api/collections/content_items/records', [
                 'type' => $type,
-                'title' => basename($path),
+                'title' => $baseName,
                 'prompt' => $url,
                 'source_link_id' => $linkId,
                 'status' => 'pending',
                 'garage_key' => $key,
                 'garage_url' => $garageUrl ?: '',
                 'instagram_account_id' => $linkAccountId,
+                'metadata' => [
+                    'origin' => 'fetch',
+                    'fetched_via' => $viaUsed,
+                    'source_url' => $url,
+                ],
             ], $authHeader);
-            if ($rec['code'] >= 200 && $rec['code'] < 300) $created++;
+            if ($rec['code'] >= 200 && $rec['code'] < 300) {
+                $created++;
+                $pbRowId = (string)($rec['body']['id'] ?? '');
+                if ($pbRowId !== '') {
+                    $indexPrompt = trim($baseName . "\n" . $url);
+                    formatforge_index_content_in_antfly($pbRowId, $indexPrompt, $type, 'pending');
+                    if (fetched_text_is_novel_vs_pipelines($indexPrompt, $pipelineRef['templates'], (int)$pipelineRef['active_pipeline_row_count'])) {
+                        $novelFetchedPrompts[] = $indexPrompt;
+                    }
+                }
+            }
         }
+        maybe_trigger_cursor_create_pipeline_after_fetch($novelFetchedPrompts, $authHeader);
         foreach ($files as $path) @unlink($path);
         if ($tmpDir && is_dir($tmpDir)) {
             $iter = new RecursiveIteratorIterator(new RecursiveDirectoryIterator($tmpDir, RecursiveDirectoryIterator::SKIP_DOTS), RecursiveIteratorIterator::CHILD_FIRST);
             foreach ($iter as $f) { $f->isDir() ? @rmdir($f->getPathname()) : @unlink($f->getPathname()); }
             @rmdir($tmpDir);
         }
+        if ($created === 0) {
+            $attempts = $fetchMeta['attempts'] ?? [];
+            $all127 = $attempts !== [] && !array_filter($attempts, fn ($a) => (int)($a['exit_code'] ?? 0) !== 127);
+            $report = [
+                'link_id' => $linkId,
+                'url' => $url,
+                'direct_candidate' => is_direct_media_url($url),
+                'attempts' => $attempts,
+                'hint' => ff_fetch_failure_hint($url),
+                'gallery_dl_path' => $GLOBALS['CONFIG']['gallery_dl_path'] ?? '',
+                'yt_dlp_path' => $GLOBALS['CONFIG']['yt_dlp_path'] ?? '',
+            ];
+            if ($all127) {
+                $report['exit_127_note'] = 'Both tools returned 127 (not found). If using Docker: use compose with entrypoint-fetch-tools.sh + ff_fetch_tools volume, then `docker compose up -d --force-recreate php` and check `docker logs formatforge-php` for the first-run pip install.';
+            }
+            ff_debug_log('fetch_link_zero_files', $report);
+            $copyPayload = ff_debug_sanitize($report);
+            $errExtra = $all127 ? ' Fetch tools not found in PHP — redeploy compose (entrypoint installs gallery-dl/yt-dlp on first start) or check `docker logs formatforge-php`.' : '';
+            echo json_encode([
+                'ok' => false,
+                'error' => 'No files were downloaded. The server tries direct HTTP (file-like URLs), then gallery-dl, then yt-dlp.' . ff_fetch_failure_hint($url) . $errExtra,
+                'debug_copy' => json_encode($copyPayload, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_INVALID_UTF8_SUBSTITUTE),
+            ]);
+            exit;
+        }
         pb_request('PATCH', "/api/collections/source_links/records/{$linkId}", ['status' => 'fetched'], $authHeader);
-        echo json_encode(['ok' => true, 'created' => $created, 'downloader' => $downloader]);
+        echo json_encode(['ok' => true, 'created' => $created, 'via' => $viaUsed]);
         exit;
     }
 
     if ($action === 'generate_content') {
-        $prompt = trim($_POST['prompt'] ?? 'A cinematic shot of a person walking through a modern city at sunset');
-        $sourceId = $_POST['source_id'] ?? '';
+        $pipelineId = trim($_POST['pipeline_id'] ?? '');
+        $userPrompt = trim($_POST['prompt'] ?? '');
+        $sourceId = trim($_POST['source_id'] ?? '');
+        $pipelineRecord = null;
+        if ($pipelineId !== '') {
+            $pRes = pb_request('GET', '/api/collections/pipelines/records/' . rawurlencode($pipelineId), null, $authHeader);
+            if ($pRes['code'] !== 200) {
+                echo json_encode(['ok' => false, 'error' => 'Pipeline not found']);
+                exit;
+            }
+            $pipelineRecord = $pRes['body'];
+            if (array_key_exists('is_active', $pipelineRecord) && $pipelineRecord['is_active'] === false) {
+                echo json_encode(['ok' => false, 'error' => 'Pipeline is inactive']);
+                exit;
+            }
+        }
+        $template = $pipelineRecord ? trim((string)($pipelineRecord['prompt_template'] ?? '')) : '';
+        if ($template !== '' && $userPrompt !== '') {
+            $prompt = $template . "\n\n" . $userPrompt;
+        } elseif ($template !== '') {
+            $prompt = $template;
+        } elseif ($userPrompt !== '') {
+            $prompt = $userPrompt;
+        } else {
+            $prompt = 'A cinematic shot of a person walking through a modern city at sunset';
+        }
+        if ($pipelineId !== '' && trim($prompt) === '') {
+            echo json_encode(['ok' => false, 'error' => 'Add a prompt template on the pipeline or extra instructions when running']);
+            exit;
+        }
+        $meta = [];
+        if ($pipelineId !== '') {
+            $meta['pipeline_id'] = $pipelineId;
+            if (!empty($pipelineRecord['name'])) {
+                $meta['pipeline_name'] = $pipelineRecord['name'];
+            }
+            $plOut = trim((string)($pipelineRecord['output_type'] ?? ''));
+            if ($plOut !== '') {
+                $meta['output_type'] = $plOut;
+            }
+        }
+        $meta['origin'] = 'generate';
         $rec = pb_request('POST', '/api/collections/content_items/records', [
             'type' => 'reel',
             'prompt' => $prompt,
             'title' => substr($prompt, 0, 80),
-            'source_link_id' => $sourceId ?: null,
+            'source_link_id' => $sourceId !== '' ? $sourceId : null,
             'status' => 'generating',
+            'metadata' => $meta === [] ? (object)[] : $meta,
         ], $authHeader);
         if ($rec['code'] < 200 || $rec['code'] >= 300) {
             echo json_encode(['ok' => false, 'error' => $rec['body']['message'] ?? 'Failed']);
@@ -1393,7 +2322,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && $user && $authHeader) {
             'garage_key' => $key,
             'garage_url' => $garageUrl ?: $videoUrl,
         ], $authHeader);
-        antfly_index('content', ['id' => $itemId, 'prompt' => $prompt, 'type' => 'reel', 'status' => 'pending']);
+        formatforge_index_content_in_antfly((string)$itemId, $prompt, 'reel', 'pending');
         echo json_encode(['ok' => true, 'id' => $itemId, 'url' => $garageUrl ?: $videoUrl]);
         exit;
     }
@@ -1407,11 +2336,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && $user && $authHeader) {
             'status' => 'approved',
             'instagram_account_id' => $accountId,
         ], $authHeader);
-        if ($up['code'] >= 200 && $up['code'] < 300 && $item['code'] === 200) {
-            $prompt = $item['body']['prompt'] ?? '';
-            $existing = fetch_recent_content_prompts($authHeader);
-            maybe_trigger_pi('approve', ['id' => $id, 'prompt' => $prompt, 'existing_prompts' => $existing]);
-        }
+        // Cursor agent for pipelines is driven by fetch novelty + reject streak (see maybe_trigger_cursor_*).
         echo json_encode(['ok' => $up['code'] >= 200 && $up['code'] < 300]);
         exit;
     }
@@ -1426,11 +2351,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && $user && $authHeader) {
             'rejected_reason' => $reason,
         ], $authHeader);
         if ($up['code'] >= 200 && $up['code'] < 300 && $item['code'] === 200) {
-            maybe_trigger_pi('reject', [
-                'id' => $id,
-                'prompt' => $item['body']['prompt'] ?? '',
-                'rejected_reason' => $reason,
-            ]);
+            maybe_trigger_cursor_edit_pipeline_after_reject($item['body'], (string)$id, (string)$reason, $authHeader);
         }
         echo json_encode(['ok' => $up['code'] >= 200 && $up['code'] < 300]);
         exit;
@@ -1601,6 +2522,7 @@ if (!empty($_GET['privacy']) || strpos($reqUri, '/privacy') !== false) {
     <script src="https://unpkg.com/pocketbase@0.26.8/dist/pocketbase.umd.js"></script>
     <style>
         :root { --bg: #0a0a0f; --surface: #12121a; --surface2: #1a1a24; --border: #2a2a36; --text: #e4e4e7; --muted: #71717a; --accent: #8b5cf6; --success: #22c55e; --danger: #ef4444; --warning: #f59e0b; }
+        [x-cloak] { display: none !important; }
         * { box-sizing: border-box; margin: 0; padding: 0; }
         body { font-family: system-ui, sans-serif; background: var(--bg); color: var(--text); min-height: 100vh; line-height: 1.5; }
         .app { max-width: 1200px; margin: 0 auto; padding: 1.5rem; }
@@ -1643,6 +2565,13 @@ if (!empty($_GET['privacy']) || strpos($reqUri, '/privacy') !== false) {
         .tabs a.active { color: var(--accent); border-bottom-color: var(--accent); }
         .tabs a:hover { color: var(--text); }
         @media (max-width: 768px) { .mobile-only { display: inline !important; } }
+        .modal-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,0.65); z-index: 200; display: flex; align-items: center; justify-content: center; padding: 1rem; }
+        .modal-panel { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; max-width: 560px; width: 100%; max-height: 90vh; overflow-y: auto; padding: 1.25rem; box-shadow: 0 20px 50px rgba(0,0,0,0.4); }
+        .modal-panel h3 { margin-bottom: 0.75rem; font-size: 1.1rem; }
+        .modal-actions { display: flex; gap: 0.5rem; justify-content: flex-end; flex-wrap: wrap; margin-top: 1.25rem; }
+        .form-group textarea { width: 100%; padding: 0.6rem; border-radius: 8px; background: var(--surface2); border: 1px solid var(--border); color: var(--text); font-family: inherit; font-size: 0.9rem; min-height: 120px; resize: vertical; }
+        .form-group select.w-full { width: 100%; padding: 0.6rem; border-radius: 8px; background: var(--surface2); border: 1px solid var(--border); color: var(--text); }
+        .pipeline-preview { font-size: 0.8rem; color: var(--muted); max-height: 6rem; overflow-y: auto; padding: 0.5rem; background: var(--surface2); border-radius: 8px; margin-bottom: 0.75rem; white-space: pre-wrap; word-break: break-word; }
     </style>
 </head>
 <body x-data="pipelineApp()" x-init="init()">
@@ -1723,11 +2652,20 @@ if (!empty($_GET['privacy']) || strpos($reqUri, '/privacy') !== false) {
 
         <div class="tabs">
             <a href="#" :class="{ active: tab === 'curate' }" @click.prevent="tab = 'curate'">Curate</a>
+            <a href="#" :class="{ active: tab === 'pipelines' }" @click.prevent="tab = 'pipelines'; loadPipelines()">Pipelines</a>
             <a href="#" :class="{ active: tab === 'accounts' }" @click.prevent="tab = 'accounts'; loadAccounts()">Accounts</a>
             <a href="#" :class="{ active: tab === 'activity' }" @click.prevent="tab = 'activity'; loadContent()">Activity</a>
         </div>
 
         <div x-show="msg" x-transition class="msg" :class="msgError ? 'error' : 'success'" x-text="msg"></div>
+
+        <div x-show="tab === 'curate' && fetchDebugText" x-transition class="card" style="margin-top: 0.75rem;">
+            <p style="font-size: 0.85rem; color: var(--muted); margin: 0 0 0.5rem 0;">Fetch debug — copy the JSON below if you need to share what the server saw:</p>
+            <div style="display: flex; gap: 0.5rem; flex-wrap: wrap; margin-bottom: 0.5rem;">
+                <button type="button" class="btn btn-secondary" style="font-size: 0.8rem; padding: 0.35rem 0.75rem;" @click="copyFetchDebug()">Copy to clipboard</button>
+            </div>
+            <textarea readonly x-ref="fetchDebugTa" :value="fetchDebugText" @focus="$el.select()" rows="14" style="width: 100%; box-sizing: border-box; font-family: ui-monospace, monospace; font-size: 0.72rem; line-height: 1.35; background: var(--surface2); color: var(--text); border: 1px solid var(--border); border-radius: 8px; padding: 0.5rem; resize: vertical;"></textarea>
+        </div>
 
         <!-- Curate: Link input + Curate feed -->
         <div x-show="tab === 'curate'" x-transition>
@@ -1745,7 +2683,7 @@ if (!empty($_GET['privacy']) || strpos($reqUri, '/privacy') !== false) {
                     <button class="btn btn-primary" @click="addLink()" :disabled="!linkUrl.trim() || addingLink">Add link</button>
                 </div>
                 <div x-show="links.length" style="margin-top: 1rem;">
-                    <p style="font-size: 0.875rem; color: var(--muted);">Queued links — fetch with gallery-dl (images) or yt-dlp (video/audio):</p>
+                    <p style="font-size: 0.875rem; color: var(--muted);">Queued links — <strong style="color: var(--text); font-weight: 600;">Fetch</strong> runs direct HTTP (for file URLs), then gallery-dl, then yt-dlp automatically:</p>
                     <ul style="list-style: none; margin-top: 0.5rem;">
                         <template x-for="l in links" :key="l.id">
                             <li style="padding: 0.5rem 0; font-size: 0.9rem; word-break: break-all; display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap;">
@@ -1754,19 +2692,7 @@ if (!empty($_GET['privacy']) || strpos($reqUri, '/privacy') !== false) {
                                 <span class="badge" :class="l.status === 'fetched' ? 'badge-approved' : 'badge-pending'" x-text="l.status || 'pending'" style="flex-shrink: 0;"></span>
                                 <span x-show="l.fetching" style="font-size: 0.8rem; color: var(--muted);">Fetching...</span>
                                 <template x-if="l.status !== 'fetched' && !l.fetching">
-                                    <span style="display: flex; gap: 0.25rem; flex-wrap: wrap; align-items: center;">
-                                        <select x-model="l.selectedDownloader" style="padding: 0.25rem 0.5rem; font-size: 0.8rem; background: var(--surface2); border: 1px solid var(--border); color: var(--text); border-radius: 6px;">
-                                            <option value="gallery-dl">gallery-dl (images)</option>
-                                            <option value="yt-dlp">yt-dlp (video/audio)</option>
-                                        </select>
-                                        <select x-model="l.selectedContentType" style="padding: 0.25rem 0.5rem; font-size: 0.8rem; background: var(--surface2); border: 1px solid var(--border); color: var(--text); border-radius: 6px;" title="What type of content is this?">
-                                            <option value="auto">Type: auto</option>
-                                            <option value="carousel">Carousel (multiple images)</option>
-                                            <option value="video">Video</option>
-                                            <option value="image">Image (single)</option>
-                                        </select>
-                                        <button class="btn btn-secondary" style="padding: 0.25rem 0.5rem; font-size: 0.8rem;" @click="fetchLink(l)">Fetch</button>
-                                    </span>
+                                    <button class="btn btn-secondary" style="padding: 0.25rem 0.5rem; font-size: 0.8rem;" @click="fetchLink(l)">Fetch</button>
                                 </template>
                             </li>
                         </template>
@@ -1775,17 +2701,13 @@ if (!empty($_GET['privacy']) || strpos($reqUri, '/privacy') !== false) {
             </div>
 
             <div style="margin-top: 1.5rem;">
-                <h3 style="margin-bottom: 0.75rem;">Generated content</h3>
-                <p style="font-size: 0.875rem; color: var(--muted); margin-bottom: 1rem;">Review and approve or reject content before publishing.</p>
-                <div style="margin-bottom: 1rem;">
-                    <input type="text" x-model="generatePrompt" placeholder="Enter prompt for new video..." style="padding: 0.5rem 1rem; width: 280px; margin-right: 0.5rem; border-radius: 8px; background: var(--surface2); border: 1px solid var(--border); color: var(--text);">
-                    <button class="btn btn-primary" @click="generateContent()" :disabled="generating">Generate</button>
-                </div>
+                <h3 style="margin-bottom: 0.75rem;">Media from your links</h3>
+                <p style="font-size: 0.875rem; color: var(--muted); margin-bottom: 1rem;">These items are created when you <strong style="color: var(--text); font-weight: 600;">Fetch</strong> a queued URL (gallery-dl / yt-dlp). They are <em>not</em> pipeline-generated videos.</p>
                 <template x-if="contentLoading">
                     <p class="msg">Loading...</p>
                 </template>
-                <div class="content-grid" x-show="!contentLoading && content.length">
-                    <template x-for="c in content" :key="c.id">
+                <div class="content-grid" x-show="!contentLoading && fetchedFromLinksList.length">
+                    <template x-for="c in fetchedFromLinksList" :key="c.id">
                         <div class="content-card">
                             <template x-if="c.type === 'reel' || c.type === 'video'">
                                 <video :src="c.garage_url || ''" controls muted loop></video>
@@ -1794,11 +2716,12 @@ if (!empty($_GET['privacy']) || strpos($reqUri, '/privacy') !== false) {
                                 <img :src="c.thumbnail_url || c.garage_url || ''" alt="">
                             </template>
                             <div class="body">
-                                <h4 x-text="c.title || c.prompt?.slice(0,50) || 'Untitled'"></h4>
+                                <h4 x-text="contentItemTitle(c)"></h4>
                                 <p x-text="c.prompt?.slice(0,80) || ''"></p>
-                                <div style="display: flex; gap: 0.5rem; flex-wrap: wrap; margin-bottom: 0.25rem;">
+                                <div style="display: flex; gap: 0.5rem; flex-wrap: wrap; margin-bottom: 0.25rem; align-items: center;">
                                     <span class="badge" :class="'badge-' + (c.status || 'pending')" x-text="c.status"></span>
                                     <span style="font-size: 0.75rem; color: var(--muted);" x-text="(c.type === 'video' || c.type === 'reel') ? 'Video' : (c.type === 'carousel' ? 'Carousel' : (c.type === 'image' ? 'Image' : (c.type || '')))"></span>
+                                    <span style="font-size: 0.72rem; color: var(--muted);">Fetched</span>
                                 </div>
                                 <div class="actions" x-show="c.status === 'pending' || c.status === 'approved'">
                                     <select x-model="c.selectedAccount" x-show="accounts.filter(a => a.is_active).length" style="padding: 0.35rem; font-size: 0.8rem; background: var(--surface2); border: 1px solid var(--border); color: var(--text); border-radius: 6px;">
@@ -1809,14 +2732,117 @@ if (!empty($_GET['privacy']) || strpos($reqUri, '/privacy') !== false) {
                                     </select>
                                     <button class="btn btn-success" x-show="c.status === 'pending'" @click="approveContent(c)" :disabled="!c.selectedAccount">Approve</button>
                                     <button class="btn btn-primary" x-show="c.status === 'approved'" @click="publishContent(c)" :disabled="!c.selectedAccount || publishing">Publish</button>
-                                    <button class="btn btn-danger" @click="rejectContent(c)">Reject</button>
+                                    <button class="btn btn-danger" @click="openRejectContent(c)">Reject</button>
                                 </div>
                             </div>
                         </div>
                     </template>
                 </div>
-                <p x-show="!contentLoading && !content.length" class="msg">No content yet. Add a link or generate a video to get started.</p>
+                <p x-show="!contentLoading && !fetchedFromLinksList.length" class="msg">No fetched media yet. Add a link above and click <strong style="color: var(--text);">Fetch</strong>.</p>
             </div>
+
+            <div style="margin-top: 1.5rem;">
+                <h3 style="margin-bottom: 0.75rem;">Generated content</h3>
+                <p style="font-size: 0.875rem; color: var(--muted); margin-bottom: 1rem;">Text-to-video and other output from the <a href="#" @click.prevent="tab = 'pipelines'; loadPipelines()" style="color: var(--accent);">Pipelines</a> tab. If you have no pipelines yet, this list stays empty until you run one.</p>
+                <div class="content-grid" x-show="!contentLoading && pipelineGeneratedList.length">
+                    <template x-for="c in pipelineGeneratedList" :key="c.id">
+                        <div class="content-card">
+                            <template x-if="c.type === 'reel' || c.type === 'video'">
+                                <video :src="c.garage_url || ''" controls muted loop></video>
+                            </template>
+                            <template x-if="c.type === 'carousel' || c.type === 'image'">
+                                <img :src="c.thumbnail_url || c.garage_url || ''" alt="">
+                            </template>
+                            <div class="body">
+                                <h4 x-text="contentItemTitle(c)"></h4>
+                                <p x-text="c.prompt?.slice(0,80) || ''"></p>
+                                <div style="display: flex; gap: 0.5rem; flex-wrap: wrap; margin-bottom: 0.25rem; align-items: center;">
+                                    <span class="badge" :class="'badge-' + (c.status || 'pending')" x-text="c.status"></span>
+                                    <span style="font-size: 0.75rem; color: var(--muted);" x-text="(c.type === 'video' || c.type === 'reel') ? 'Video' : (c.type === 'carousel' ? 'Carousel' : (c.type === 'image' ? 'Image' : (c.type || '')))"></span>
+                                    <span x-show="c.metadata && c.metadata.pipeline_name" style="font-size: 0.72rem; color: var(--accent);" x-text="'Pipeline: ' + c.metadata.pipeline_name"></span>
+                                </div>
+                                <div class="actions" x-show="c.status === 'pending' || c.status === 'approved'">
+                                    <select x-model="c.selectedAccount" x-show="accounts.filter(a => a.is_active).length" style="padding: 0.35rem; font-size: 0.8rem; background: var(--surface2); border: 1px solid var(--border); color: var(--text); border-radius: 6px;">
+                                        <option value="">Select account</option>
+                                        <template x-for="a in accounts.filter(a => a.is_active && hasInstagramIdentity(a))" :key="a.id">
+                                            <option :value="a.id" x-text="accountHandle(a)"></option>
+                                        </template>
+                                    </select>
+                                    <button class="btn btn-success" x-show="c.status === 'pending'" @click="approveContent(c)" :disabled="!c.selectedAccount">Approve</button>
+                                    <button class="btn btn-primary" x-show="c.status === 'approved'" @click="publishContent(c)" :disabled="!c.selectedAccount || publishing">Publish</button>
+                                    <button class="btn btn-danger" @click="openRejectContent(c)">Reject</button>
+                                </div>
+                            </div>
+                        </div>
+                    </template>
+                </div>
+                <p x-show="!contentLoading && !pipelineGeneratedList.length" class="msg">No pipeline-generated content yet. Open <a href="#" @click.prevent="tab = 'pipelines'; loadPipelines()" style="color: var(--accent);">Pipelines</a> and run one when ready.</p>
+            </div>
+
+            <div style="margin-top: 1.5rem;" x-show="!contentLoading && curateOrphanList.length">
+                <h3 style="margin-bottom: 0.75rem;">Other records</h3>
+                <p style="font-size: 0.875rem; color: var(--muted); margin-bottom: 1rem;">These items are not classified as fetched media or pipeline output (often legacy data). You can reject them or clean them up in PocketBase Admin.</p>
+                <div class="content-grid">
+                    <template x-for="c in curateOrphanList" :key="c.id">
+                        <div class="content-card">
+                            <template x-if="c.type === 'reel' || c.type === 'video'">
+                                <video :src="c.garage_url || ''" controls muted loop></video>
+                            </template>
+                            <template x-if="c.type === 'carousel' || c.type === 'image'">
+                                <img :src="c.thumbnail_url || c.garage_url || ''" alt="">
+                            </template>
+                            <div class="body">
+                                <h4 x-text="contentItemTitle(c)"></h4>
+                                <p x-text="c.prompt?.slice(0,80) || ''"></p>
+                                <div style="display: flex; gap: 0.5rem; flex-wrap: wrap; margin-bottom: 0.25rem; align-items: center;">
+                                    <span class="badge" :class="'badge-' + (c.status || 'pending')" x-text="c.status"></span>
+                                </div>
+                                <div class="actions" x-show="c.status === 'pending' || c.status === 'approved'">
+                                    <select x-model="c.selectedAccount" x-show="accounts.filter(a => a.is_active).length" style="padding: 0.35rem; font-size: 0.8rem; background: var(--surface2); border: 1px solid var(--border); color: var(--text); border-radius: 6px;">
+                                        <option value="">Select account</option>
+                                        <template x-for="a in accounts.filter(a => a.is_active && hasInstagramIdentity(a))" :key="a.id">
+                                            <option :value="a.id" x-text="accountHandle(a)"></option>
+                                        </template>
+                                    </select>
+                                    <button class="btn btn-success" x-show="c.status === 'pending'" @click="approveContent(c)" :disabled="!c.selectedAccount">Approve</button>
+                                    <button class="btn btn-primary" x-show="c.status === 'approved'" @click="publishContent(c)" :disabled="!c.selectedAccount || publishing">Publish</button>
+                                    <button class="btn btn-danger" @click="openRejectContent(c)">Reject</button>
+                                </div>
+                            </div>
+                        </div>
+                    </template>
+                </div>
+            </div>
+        </div>
+
+        <!-- Pipelines (records are created by the Pi agent via PocketBase admin API; users only list & run) -->
+        <div x-show="tab === 'pipelines'" x-transition>
+            <div style="display: flex; justify-content: space-between; align-items: flex-start; flex-wrap: wrap; gap: 1rem; margin-bottom: 1rem;">
+                <div>
+                    <h2 style="margin-bottom: 0.35rem;">Pipelines</h2>
+                    <p style="color: var(--muted); font-size: 0.9rem; max-width: 42rem;">Pipelines are defined by the <strong style="color: var(--text);">Pi coding agent</strong> (PocketBase admin). You can run one here: optional extra instructions are merged with the saved template for video generation.</p>
+                </div>
+                <button type="button" class="btn btn-secondary" @click="loadPipelines()">Refresh</button>
+            </div>
+            <template x-if="pipelinesLoading">
+                <p class="msg">Loading pipelines…</p>
+            </template>
+            <div class="content-grid" x-show="!pipelinesLoading && pipelines.length">
+                <template x-for="p in pipelines" :key="p.id">
+                    <div class="card" style="display: flex; flex-direction: column; gap: 0.5rem;">
+                        <div style="display: flex; justify-content: space-between; align-items: flex-start; gap: 0.5rem;">
+                            <h3 style="margin: 0; font-size: 1rem;" x-text="p.name || 'Untitled'"></h3>
+                            <span class="badge" :class="p.is_active !== false ? 'badge-approved' : 'badge-pending'" x-text="p.is_active !== false ? 'Active' : 'Inactive'"></span>
+                        </div>
+                        <p style="font-size: 0.8rem; color: var(--muted); margin: 0; flex: 1;" x-text="(p.description || '').trim() || (p.prompt_template || '').slice(0, 120) + ((p.prompt_template || '').length > 120 ? '…' : '') || 'No description'"></p>
+                        <p style="font-size: 0.75rem; color: var(--muted); margin: 0;">Output: <span x-text="p.output_type || 'reel'"></span></p>
+                        <div style="display: flex; gap: 0.5rem; flex-wrap: wrap; margin-top: 0.25rem;">
+                            <button type="button" class="btn btn-success" style="font-size: 0.8rem; padding: 0.35rem 0.75rem;" @click="openRunPipeline(p)" :disabled="p.is_active === false || generating">Run</button>
+                        </div>
+                    </div>
+                </template>
+            </div>
+            <p x-show="!pipelinesLoading && !pipelines.length" class="msg">No pipelines yet. When the Cursor <code style="font-size:0.85em;">agent</code> run finishes it should create <code style="font-size:0.85em;">pipelines</code> records (PocketBase admin API). You can also add rows in PocketBase Admin as superuser.</p>
         </div>
 
         <!-- Accounts -->
@@ -1878,7 +2904,41 @@ if (!empty($_GET['privacy']) || strpos($reqUri, '/privacy') !== false) {
                     </tbody>
                 </table>
             </div>
-            <p x-show="!contentLoading && !content.length" class="msg" style="margin-top: 1rem;">No generated content yet. Generate a video from the Curate tab.</p>
+            <p x-show="!contentLoading && !content.length" class="msg" style="margin-top: 1rem;">No generated content yet. Run a pipeline or add a link from the Curate tab.</p>
+        </div>
+
+        <!-- Run pipeline -->
+        <div class="modal-backdrop" x-show="runModal.open" x-cloak x-transition @click.self="runModal.open = false" role="presentation">
+            <div class="modal-panel" role="dialog" aria-modal="true" aria-labelledby="run-pipeline-title" @click.stop>
+                <h3 id="run-pipeline-title">Run pipeline</h3>
+                <p style="font-size: 0.9rem; color: var(--accent); margin-bottom: 0.5rem;" x-text="runModal.pipeline ? (runModal.pipeline.name || 'Untitled') : ''"></p>
+                <p style="font-size: 0.8rem; color: var(--muted); margin-bottom: 0.5rem;">Template (from Pi / admin)</p>
+                <div class="pipeline-preview" x-text="runModal.pipeline && (runModal.pipeline.prompt_template || '').trim() ? runModal.pipeline.prompt_template : '(no template yet — add extra instructions below, or have Cursor agent set it via PocketBase)'"></div>
+                <div class="form-group">
+                    <label for="run-extra-prompt">Extra instructions (optional)</label>
+                    <textarea id="run-extra-prompt" x-model="runModal.extraPrompt" placeholder="e.g. slower pacing, golden hour, no text overlay…"></textarea>
+                </div>
+                <div class="modal-actions">
+                    <button type="button" class="btn btn-secondary" @click="runModal.open = false">Cancel</button>
+                    <button type="button" class="btn btn-primary" @click="submitRunPipeline()" :disabled="generating || !canRunPipeline()">Run</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Reject content -->
+        <div class="modal-backdrop" x-show="rejectModal.open" x-cloak x-transition @click.self="rejectModal.open = false" role="presentation">
+            <div class="modal-panel" role="dialog" aria-modal="true" aria-labelledby="reject-title" @click.stop>
+                <h3 id="reject-title">Reject content</h3>
+                <p style="font-size: 0.85rem; color: var(--muted); margin-bottom: 0.75rem;">Optional note (stored with the item).</p>
+                <div class="form-group">
+                    <label for="reject-reason">Reason</label>
+                    <textarea id="reject-reason" x-model="rejectModal.reason" placeholder="Why reject?"></textarea>
+                </div>
+                <div class="modal-actions">
+                    <button type="button" class="btn btn-secondary" @click="rejectModal.open = false">Cancel</button>
+                    <button type="button" class="btn btn-danger" @click="confirmRejectContent()">Reject</button>
+                </div>
+            </div>
         </div>
     </div>
 
@@ -1898,15 +2958,53 @@ if (!empty($_GET['privacy']) || strpos($reqUri, '/privacy') !== false) {
                 content: [],
                 contentLoading: false,
                 accounts: [],
-                generatePrompt: '',
                 generating: false,
                 publishing: false,
                 disconnectingId: '',
                 refreshingId: '',
                 activatingId: '',
+                pipelines: [],
+                pipelinesLoading: false,
+                runModal: { open: false, pipeline: null, extraPrompt: '' },
+                rejectModal: { open: false, target: null, reason: '' },
+                fetchDebugText: '',
+
+                isFetchedMedia(c) {
+                    if (!c) return false;
+                    if (c.metadata && c.metadata.origin === 'fetch') return true;
+                    if (c.metadata && (c.metadata.pipeline_id || c.metadata.origin === 'generate')) return false;
+                    return !!(c.source_link_id && !c.metadata?.pipeline_id);
+                },
+
+                isPipelineGenerated(c) {
+                    if (!c) return false;
+                    return !!(c.metadata && (c.metadata.pipeline_id || c.metadata.origin === 'generate'));
+                },
+
+                get fetchedFromLinksList() {
+                    return this.content.filter(c => this.isFetchedMedia(c));
+                },
+
+                get pipelineGeneratedList() {
+                    return this.content.filter(c => this.isPipelineGenerated(c));
+                },
+
+                get curateOrphanList() {
+                    return this.content.filter(c => !this.isFetchedMedia(c) && !this.isPipelineGenerated(c));
+                },
+
+                contentItemTitle(c) {
+                    const t = String(c?.title || '').trim();
+                    if (t) return t;
+                    const p = String(c?.prompt || '').trim();
+                    if (p) return p.length > 80 ? p.slice(0, 80) + '…' : p;
+                    if (this.isFetchedMedia(c)) return 'Fetched media';
+                    return 'Untitled';
+                },
 
                 init() {
                     if (this.tab === 'curate') { this.loadLinks(); this.loadContent(); this.loadAccounts(); }
+                    if (this.tab === 'pipelines') { this.loadPipelines(); this.loadAccounts(); }
                     if (this.tab === 'accounts') this.loadAccounts();
                     if (this.tab === 'activity') this.loadContent();
                     if (this.msg === 'connected') this.msg = 'Instagram account connected.';
@@ -1966,33 +3064,46 @@ if (!empty($_GET['privacy']) || strpos($reqUri, '/privacy') !== false) {
                             headers: this.pbHeaders()
                         });
                         const d = await r.json();
-                        this.links = (d.items || []).map(l => ({ ...l, selectedDownloader: l.selectedDownloader || 'gallery-dl', selectedContentType: l.selectedContentType || 'auto', fetching: false }));
+                        this.links = (d.items || []).map(l => ({ ...l, fetching: false }));
                     } catch (e) { this.links = []; }
+                },
+
+                copyFetchDebug() {
+                    const t = this.fetchDebugText || '';
+                    if (!t) return;
+                    if (navigator.clipboard && navigator.clipboard.writeText) {
+                        navigator.clipboard.writeText(t).then(() => {
+                            this.msg = 'Fetch debug copied to clipboard.';
+                            this.msgError = false;
+                        }).catch(() => {});
+                    }
                 },
 
                 async fetchLink(l) {
                     if (l.fetching) return;
                     l.fetching = true;
                     this.msg = '';
+                    this.fetchDebugText = '';
                     const fd = new FormData();
                     fd.append('action', 'fetch_link');
                     fd.append('link_id', l.id);
-                    fd.append('downloader', l.selectedDownloader || 'gallery-dl');
-                    fd.append('content_type', l.selectedContentType || 'auto');
                     try {
                         const r = await fetch(location.href, { method: 'POST', body: fd });
                         const d = await r.json();
                         if (d.ok) {
-                            this.msg = `Fetched ${d.created} file(s) with ${d.downloader}.`;
+                            this.msg = `Fetched ${d.created} file(s)${d.via ? ' via ' + d.via : ''}.`;
+                            this.fetchDebugText = '';
                             this.loadLinks();
                             this.loadContent();
                         } else {
                             this.msg = d.error || 'Fetch failed';
                             this.msgError = true;
+                            this.fetchDebugText = (typeof d.debug_copy === 'string') ? d.debug_copy : '';
                         }
                     } catch (e) {
                         this.msg = 'Request failed';
                         this.msgError = true;
+                        this.fetchDebugText = '';
                     } finally {
                         l.fetching = false;
                     }
@@ -2192,16 +3303,37 @@ if (!empty($_GET['privacy']) || strpos($reqUri, '/privacy') !== false) {
                     else { this.msg = d.error || 'Failed'; this.msgError = true; }
                 },
 
-                async rejectContent(c) {
-                    const reason = prompt('Rejection reason (optional):') || '';
+                openRejectContent(c) {
+                    this.rejectModal.target = c;
+                    this.rejectModal.reason = '';
+                    this.rejectModal.open = true;
+                },
+
+                async confirmRejectContent() {
+                    const c = this.rejectModal.target;
+                    if (!c) return;
+                    const reason = (this.rejectModal.reason || '').trim();
                     const fd = new FormData();
                     fd.append('action', 'reject_content');
                     fd.append('id', c.id);
                     fd.append('reason', reason);
-                    const r = await fetch(location.href, { method: 'POST', body: fd });
-                    const d = await r.json();
-                    if (d.ok) { c.status = 'rejected'; this.msg = 'Rejected.'; this.loadContent(); }
-                    else { this.msg = d.error || 'Failed'; this.msgError = true; }
+                    try {
+                        const r = await fetch(location.href, { method: 'POST', body: fd });
+                        const d = await r.json();
+                        if (d.ok) {
+                            c.status = 'rejected';
+                            this.msg = 'Rejected.';
+                            this.rejectModal.open = false;
+                            this.rejectModal.target = null;
+                            this.loadContent();
+                        } else {
+                            this.msg = d.error || 'Failed';
+                            this.msgError = true;
+                        }
+                    } catch (e) {
+                        this.msg = 'Request failed';
+                        this.msgError = true;
+                    }
                 },
 
                 async publishContent(c) {
@@ -2219,32 +3351,80 @@ if (!empty($_GET['privacy']) || strpos($reqUri, '/privacy') !== false) {
                     } finally { this.publishing = false; }
                 },
 
-                async generateContent() {
-                    if (!this.generatePrompt.trim()) return;
+                async loadPipelines() {
+                    this.pipelinesLoading = true;
+                    try {
+                        const r = await fetch(this.PB_URL + '/api/collections/pipelines/records?sort=name', {
+                            headers: this.pbHeaders()
+                        });
+                        const d = await r.json();
+                        this.pipelines = (d.items || []).map(p => ({
+                            ...p,
+                            is_active: p.is_active !== false,
+                            output_type: p.output_type || 'reel',
+                        }));
+                    } catch (e) {
+                        this.pipelines = [];
+                        this.msg = 'Could not load pipelines. Apply PocketBase migrations and reload.';
+                        this.msgError = true;
+                    } finally {
+                        this.pipelinesLoading = false;
+                    }
+                },
+
+                openRunPipeline(p) {
+                    this.runModal.pipeline = p;
+                    this.runModal.extraPrompt = '';
+                    this.runModal.open = true;
+                },
+
+                canRunPipeline() {
+                    const p = this.runModal.pipeline;
+                    if (!p) return false;
+                    const t = (p.prompt_template || '').trim();
+                    const e = (this.runModal.extraPrompt || '').trim();
+                    return !!(t || e);
+                },
+
+                async submitRunPipeline() {
+                    const p = this.runModal.pipeline;
+                    if (!p || !this.canRunPipeline()) return;
+                    const ok = await this.runVideoGeneration(p.id, (this.runModal.extraPrompt || '').trim());
+                    if (ok) {
+                        this.runModal.open = false;
+                        this.runModal.extraPrompt = '';
+                    }
+                },
+
+                async runVideoGeneration(pipelineId, userPrompt) {
                     this.generating = true;
                     this.msg = '';
+                    this.msgError = false;
                     const fd = new FormData();
                     fd.append('action', 'generate_content');
-                    fd.append('prompt', this.generatePrompt.trim());
+                    fd.append('pipeline_id', pipelineId || '');
+                    fd.append('prompt', userPrompt || '');
                     fd.append('type', 'reel');
                     try {
                         const r = await fetch(location.href, { method: 'POST', body: fd });
                         const d = await r.json();
                         if (d.ok) {
-                            this.msg = 'Generation started. Refresh to see the new content.';
-                            this.generatePrompt = '';
+                            this.msg = 'Generation started. Open Curate to review the new item.';
                             setTimeout(() => this.loadContent(), 3000);
-                        } else {
-                            this.msg = d.error || 'Generation failed';
-                            this.msgError = true;
+                            return true;
                         }
+                        this.msg = d.error || 'Generation failed';
+                        this.msgError = true;
+                        return false;
                     } catch (e) {
                         this.msg = 'Request failed';
                         this.msgError = true;
+                        return false;
                     } finally {
                         this.generating = false;
                     }
                 },
+
             }));
         });
     </script>

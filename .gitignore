@@ -4,6 +4,7 @@ configuration.php
 vendor
 composer.lock
 .env
+.env.antfly
 .vscode
 *-pb
 pb_data/
