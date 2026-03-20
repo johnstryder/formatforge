@@ -111,6 +111,20 @@ Instagram cookies: `storage/cookies/instagram_cookies.txt` or `cookies.txt` (see
 
 The public site must be served by **this host’s nginx** (PHP-FPM + optional `/pb/` proxy). If DNS points here but something else answers, or PHP-FPM is down / socket mismatched, you’ll see **502** (from Cloudflare or from nginx directly).
 
+### One-shot: enable `formatforgeplus` (recommended)
+
+From your clone (e.g. `~/formatforge`):
+
+```bash
+sudo ./scripts/install-formatforge-nginx-site.sh
+```
+
+This symlinks the clone to **`/var/www/formatforge`**, copies **`nginx/formatforgeplus.conf`** into **`sites-available`**, links **`sites-enabled`**, removes **`default`**, runs **`align-php-fpm-socket.sh`** when possible, **`nginx -t`s**, and **starts or reloads nginx**.
+
+**Paste trap:** If you copy `sudo cp /path/to/formatforgeplus.conf` and hit Enter before the destination on the same line, `cp` fails with *missing destination* and nothing is installed — use the script above or keep **source and dest on one line**.
+
+If **`curl` to `127.0.0.1:80` fails** / `ss` shows no `:80` listener, nginx is stopped or crashed: `sudo systemctl status nginx` and `sudo journalctl -u nginx -n 40 --no-pager`.
+
 ### You see Apache’s “It works!” default page instead of FormatForge
 
 That page is **`/var/www/html/index.html`** served by **Apache**, not nginx. Only one service should own **80** (and **443**). If Apache is installed, it often binds port 80 first.

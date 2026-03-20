@@ -44,12 +44,8 @@ if [ -L /etc/nginx/sites-enabled/formatforgeplus ] || [ -f /etc/nginx/sites-enab
 else
   echo "!!! NO formatforgeplus in sites-enabled — nginx will only use whatever is linked (often default)."
   echo "    Run (adjust paths if your clone is not $ROOT):"
-  echo "    sudo mkdir -p /var/www && sudo ln -sfn $ROOT /var/www/formatforge"
-  echo "    sudo rm -f /etc/nginx/sites-enabled/default"
-  echo "    sudo cp $ROOT/nginx/formatforgeplus.conf /etc/nginx/sites-available/formatforgeplus"
-  echo "    sudo ln -sf /etc/nginx/sites-available/formatforgeplus /etc/nginx/sites-enabled/formatforgeplus"
-  echo "    (cd $ROOT && ./scripts/align-php-fpm-socket.sh)"
-  echo "    sudo nginx -t && sudo systemctl reload nginx"
+  echo "    sudo \"$ROOT/scripts/install-formatforge-nginx-site.sh\""
+  echo "    (one line each if you do it by hand — never break 'cp SRC DEST' across lines)"
 fi
 
 echo ""
