@@ -20,16 +20,38 @@ else
 fi
 
 if [ -n "$key" ]; then
-  curl -sf -H "Authorization: Bearer $key" "$URL/api/v1/tables/content" >/dev/null && { echo "Table 'content' already exists."; exit 0; }
+  curl -sf -H "Authorization: Bearer $key" "$URL/api/v1/tables/content" >/dev/null && CONTENT_EXISTS=1 || CONTENT_EXISTS=0
 else
-  curl -sf "$URL/api/v1/tables/content" >/dev/null && { echo "Table 'content' already exists."; exit 0; }
+  curl -sf "$URL/api/v1/tables/content" >/dev/null && CONTENT_EXISTS=1 || CONTENT_EXISTS=0
+fi
+if [ -n "$key" ]; then
+  curl -sf -H "Authorization: Bearer $key" "$URL/api/v1/tables/pipeline_refs" >/dev/null && REFS_EXISTS=1 || REFS_EXISTS=0
+else
+  curl -sf "$URL/api/v1/tables/pipeline_refs" >/dev/null && REFS_EXISTS=1 || REFS_EXISTS=0
+fi
+if [ "$CONTENT_EXISTS" = 1 ] && [ "$REFS_EXISTS" = 1 ]; then
+  echo "Tables 'content' and 'pipeline_refs' already exist."
+  exit 0
 fi
 
-echo "Creating table 'content' (full-text + OpenRouter embeddings on field prompt)..."
-BODY=$(python3 "$(dirname "$0")/build_antfly_content_table_body.py")
-if [ -n "$key" ]; then
-  curl -sf -X POST "$URL/api/v1/tables/content" -H "Authorization: Bearer $key" -H "Content-Type: application/json" -d "$BODY" >/dev/null
-else
-  curl -sf -X POST "$URL/api/v1/tables/content" -H "Content-Type: application/json" -d "$BODY" >/dev/null
+PY="$(dirname "$0")/build_antfly_content_table_body.py"
+if [ "$CONTENT_EXISTS" != 1 ]; then
+  echo "Creating table 'content' (full-text + semantic template with remoteMedia + OpenRouter)..."
+  BODY=$(python3 "$PY" content)
+  if [ -n "$key" ]; then
+    curl -sf -X POST "$URL/api/v1/tables/content" -H "Authorization: Bearer $key" -H "Content-Type: application/json" -d "$BODY" >/dev/null
+  else
+    curl -sf -X POST "$URL/api/v1/tables/content" -H "Content-Type: application/json" -d "$BODY" >/dev/null
+  fi
+  echo "Table 'content' created."
 fi
-echo "Table 'content' created."
+if [ "$REFS_EXISTS" != 1 ]; then
+  echo "Creating table 'pipeline_refs' (active pipeline templates for semantic novelty)..."
+  BODY=$(python3 "$PY" pipeline_refs)
+  if [ -n "$key" ]; then
+    curl -sf -X POST "$URL/api/v1/tables/pipeline_refs" -H "Authorization: Bearer $key" -H "Content-Type: application/json" -d "$BODY" >/dev/null
+  else
+    curl -sf -X POST "$URL/api/v1/tables/pipeline_refs" -H "Content-Type: application/json" -d "$BODY" >/dev/null
+  fi
+  echo "Table 'pipeline_refs' created."
+fi

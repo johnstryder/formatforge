@@ -140,7 +140,7 @@ $CONFIG = [
     'pocketbase_public_url' => $pbPublicUrl,
     'site_url'         => $siteUrl,
     'site_name'        => getenv('SITE_NAME') ?: 'FormatForge',
-    'app_version'      => getenv('APP_VERSION') ?: 'v1.0.39',
+    'app_version'      => getenv('APP_VERSION') ?: 'v1.0.43',
     'users_collection' => 'users',
     'garage_endpoint'  => getenv('GARAGE_ENDPOINT') ?: 'http://127.0.0.1:3900',
     'garage_key'       => getenv('GARAGE_ACCESS_KEY') ?: '',
@@ -223,6 +223,11 @@ function ff_debug_logs_get(): array {
 
 function ff_debug_logs_clear(): void {
     $_SESSION['ff_debug_logs'] = [];
+}
+
+/** One-shot debug payload for the Instagram Accounts tab after OAuth redirect (no secrets). */
+function ff_instagram_connect_audit_flash(array $payload): void {
+    $_SESSION['ff_instagram_connect_audit'] = array_merge(['at' => date('c')], $payload);
 }
 
 function pb_superuser_auth_token(): array {
@@ -423,6 +428,28 @@ function pb_request(string $method, string $path, $data = null, ?string $token =
     curl_close($ch);
     $body = json_decode($res ?: '{}', true) ?? [];
     return ['code' => $code, 'body' => $body, 'raw' => $res ?: '', 'curl_errno' => $errNo];
+}
+
+/** PocketBase API: map field name -> validation message from `data` (no secrets). */
+function pb_record_validation_messages(?array $body): array {
+    if (!is_array($body)) {
+        return [];
+    }
+    $data = $body['data'] ?? null;
+    if (!is_array($data)) {
+        return [];
+    }
+    $out = [];
+    foreach ($data as $field => $info) {
+        if (is_array($info)) {
+            $msg = isset($info['message']) ? (string) $info['message'] : '';
+            $code = isset($info['code']) ? (string) $info['code'] : '';
+            $out[$field] = trim($msg . ($code !== '' && $code !== $msg ? ' (' . $code . ')' : ''));
+        } else {
+            $out[$field] = (string) $info;
+        }
+    }
+    return array_filter($out, static fn (string $v): bool => $v !== '');
 }
 
 function normalize_instagram_username(?string $username): ?string {
@@ -801,47 +828,9 @@ function fetch_media_from_url_auto(string $url): array {
     return [[], null, '', ['attempts' => [$dGd, $dYt]]];
 }
 
-/**
- * Upsert a PocketBase content_items row into Antfly so text is embedded / searchable (best-effort).
- */
-function formatforge_index_content_in_antfly(string $pbRecordId, string $prompt, string $type, string $status = 'pending'): void {
-    $pbRecordId = trim($pbRecordId);
-    $prompt = trim($prompt);
-    if ($pbRecordId === '' || $prompt === '') {
-        return;
-    }
-    if (!antfly_index('content', ['id' => $pbRecordId, 'prompt' => $prompt, 'type' => $type, 'status' => $status])) {
-        ff_debug_log('antfly_index_failed', ['id' => $pbRecordId, 'type' => $type]);
-    }
-}
-
-function antfly_index(string $table, array $doc): bool {
+/** OpenRouter embedder JSON shared by Antfly tables (API key is optional if Antfly has env). */
+function antfly_openrouter_embedder_config(): array {
     $cfg = $GLOBALS['CONFIG'];
-    $url = $cfg['antfly_url'] . '/api/v1/tables/' . urlencode($table) . '/batch';
-    $key = !empty($doc['id']) ? ('content:' . $doc['id']) : ('doc:' . bin2hex(random_bytes(8)));
-    $inserts = [$key => $doc];
-    $headers = ['Content-Type: application/json'];
-    if (!empty($cfg['antfly_key'])) $headers[] = 'Authorization: Bearer ' . $cfg['antfly_key'];
-    $ch = curl_init($url);
-    curl_setopt_array($ch, [
-        CURLOPT_RETURNTRANSFER => true,
-        CURLOPT_POST => true,
-        CURLOPT_HTTPHEADER => $headers,
-        CURLOPT_POSTFIELDS => json_encode(['inserts' => $inserts]),
-    ]);
-    $res = curl_exec($ch);
-    $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-    curl_close($ch);
-    if ($code === 404 && antfly_create_table($table)) {
-        return antfly_index($table, $doc);
-    }
-    return $code >= 200 && $code < 300;
-}
-
-function antfly_create_table(string $table): bool {
-    if ($table !== 'content') return false;
-    $cfg = $GLOBALS['CONFIG'];
-    $url = $cfg['antfly_url'] . '/api/v1/tables/content';
     $embedModel = trim((string)($cfg['embed_model'] ?? '')) ?: 'google/gemini-embedding-001';
     $embedder = [
         'provider' => 'openrouter',
@@ -850,6 +839,124 @@ function antfly_create_table(string $table): bool {
     if (!empty($cfg['openrouter_key'])) {
         $embedder['api_key'] = $cfg['openrouter_key'];
     }
+    return $embedder;
+}
+
+/**
+ * Multimodal-friendly index string: Antfly renders `remoteMedia` from `media_url` when set, then text fields.
+ * Same textual block is used for pipeline novelty queries (semantic_search) so it stays comparable to templates.
+ */
+function formatforge_antfly_content_semantic_text(string $title, string $sourceUrl, string $caption): string {
+    $title = trim($title);
+    $sourceUrl = trim($sourceUrl);
+    $caption = trim($caption);
+    $lines = [];
+    if ($title !== '') {
+        $lines[] = 'Title: ' . $title;
+    }
+    if ($sourceUrl !== '') {
+        $lines[] = 'Source: ' . $sourceUrl;
+    }
+    if ($caption !== '') {
+        $lines[] = $caption;
+    }
+    return trim(implode("\n", $lines));
+}
+
+/**
+ * Upsert a PocketBase content_items row into Antfly. Embeddings run inside Antfly (template + remoteMedia when `media_url` is set).
+ */
+function formatforge_index_content_in_antfly(
+    string $pbRecordId,
+    string $prompt,
+    string $type,
+    string $status = 'pending',
+    ?string $mediaUrl = null,
+    ?string $mime = null,
+    ?string $sourceUrl = null,
+    ?string $title = null
+): void {
+    $pbRecordId = trim($pbRecordId);
+    $prompt = trim($prompt);
+    if ($pbRecordId === '' || $prompt === '') {
+        return;
+    }
+    $mediaUrl = $mediaUrl !== null ? trim($mediaUrl) : '';
+    $mime = $mime !== null ? trim($mime) : '';
+    $sourceUrl = $sourceUrl !== null ? trim($sourceUrl) : '';
+    $title = $title !== null ? trim($title) : '';
+    $doc = [
+        'id' => $pbRecordId,
+        'prompt' => $prompt,
+        'type' => $type,
+        'status' => $status,
+        'title' => $title,
+        'source_url' => $sourceUrl,
+        'mime' => $mime,
+        'media_url' => $mediaUrl,
+    ];
+    if (!antfly_index('content', $doc)) {
+        ff_debug_log('antfly_index_failed', ['id' => $pbRecordId, 'type' => $type]);
+    }
+}
+
+function antfly_index(string $table, array $doc): bool {
+    $cfg = $GLOBALS['CONFIG'];
+    $base = rtrim((string)($cfg['antfly_url'] ?? ''), '/');
+    if ($base === '') {
+        return false;
+    }
+    $id = trim((string)($doc['id'] ?? ''));
+    if ($id === '') {
+        return false;
+    }
+    $url = $base . '/api/v1/tables/' . urlencode($table) . '/batch';
+    $key = $table . ':' . $id;
+    $inserts = [$key => $doc];
+    $headers = ['Content-Type: application/json'];
+    if (!empty($cfg['antfly_key'])) {
+        $headers[] = 'Authorization: Bearer ' . $cfg['antfly_key'];
+    }
+    $ch = curl_init($url);
+    curl_setopt_array($ch, [
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_POST => true,
+        CURLOPT_HTTPHEADER => $headers,
+        CURLOPT_POSTFIELDS => json_encode(['inserts' => $inserts]),
+        CURLOPT_TIMEOUT => 120,
+    ]);
+    $res = curl_exec($ch);
+    $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    curl_close($ch);
+    if ($code === 404 && antfly_ensure_table($table)) {
+        return antfly_index($table, $doc);
+    }
+    return $code >= 200 && $code < 300;
+}
+
+function antfly_ensure_table(string $table): bool {
+    if ($table === 'content') {
+        return antfly_create_content_table();
+    }
+    if ($table === 'pipeline_refs') {
+        return antfly_create_pipeline_refs_table();
+    }
+    return false;
+}
+
+/** Handlebars template: Antfly fetches `media_url` for vision/video/audio when the URL is reachable from Antfly. */
+function antfly_content_semantic_template(): string {
+    return "{{#if media_url}}{{remoteMedia url=media_url}}{{/if}}\n{{prompt}}\n{{title}}\n{{source_url}}\n{{mime}}";
+}
+
+function antfly_create_content_table(): bool {
+    $cfg = $GLOBALS['CONFIG'];
+    $base = rtrim((string)($cfg['antfly_url'] ?? ''), '/');
+    if ($base === '') {
+        return false;
+    }
+    $url = $base . '/api/v1/tables/content';
+    $embedder = antfly_openrouter_embedder_config();
     $body = [
         'num_shards' => 1,
         'schema' => [
@@ -862,12 +969,69 @@ function antfly_create_table(string $table): bool {
                             'prompt' => ['type' => 'string', 'x-antfly-types' => ['text']],
                             'type' => ['type' => 'string', 'x-antfly-types' => ['keyword']],
                             'status' => ['type' => 'string', 'x-antfly-types' => ['keyword']],
+                            'title' => ['type' => 'string', 'x-antfly-types' => ['text']],
+                            'source_url' => ['type' => 'string', 'x-antfly-types' => ['text']],
+                            'mime' => ['type' => 'string', 'x-antfly-types' => ['keyword']],
+                            'media_url' => ['type' => 'string', 'x-antfly-types' => ['text']],
+                        ],
+                        'x-antfly-include-in-all' => ['prompt', 'title', 'source_url'],
+                    ],
+                ],
+            ],
+            'default_type' => 'content',
+        ],
+        'indexes' => [
+            'search_idx' => ['type' => 'full_text'],
+            'semantic_idx' => [
+                'type' => 'embeddings',
+                'template' => antfly_content_semantic_template(),
+                'embedder' => $embedder,
+            ],
+        ],
+    ];
+    $headers = ['Content-Type: application/json'];
+    if (!empty($cfg['antfly_key'])) {
+        $headers[] = 'Authorization: Bearer ' . $cfg['antfly_key'];
+    }
+    $ch = curl_init($url);
+    curl_setopt_array($ch, [
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_POST => true,
+        CURLOPT_HTTPHEADER => $headers,
+        CURLOPT_POSTFIELDS => json_encode($body),
+        CURLOPT_TIMEOUT => 60,
+    ]);
+    curl_exec($ch);
+    $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    curl_close($ch);
+    return $code >= 200 && $code < 300;
+}
+
+function antfly_create_pipeline_refs_table(): bool {
+    $cfg = $GLOBALS['CONFIG'];
+    $base = rtrim((string)($cfg['antfly_url'] ?? ''), '/');
+    if ($base === '') {
+        return false;
+    }
+    $url = $base . '/api/v1/tables/pipeline_refs';
+    $embedder = antfly_openrouter_embedder_config();
+    $body = [
+        'num_shards' => 1,
+        'schema' => [
+            'document_schemas' => [
+                'pipeline_ref' => [
+                    'schema' => [
+                        'type' => 'object',
+                        'properties' => [
+                            'id' => ['type' => 'string', 'x-antfly-types' => ['keyword']],
+                            'prompt' => ['type' => 'string', 'x-antfly-types' => ['text']],
+                            'name' => ['type' => 'string', 'x-antfly-types' => ['text']],
                         ],
                         'x-antfly-include-in-all' => ['prompt'],
                     ],
                 ],
             ],
-            'default_type' => 'content',
+            'default_type' => 'pipeline_ref',
         ],
         'indexes' => [
             'search_idx' => ['type' => 'full_text'],
@@ -879,18 +1043,96 @@ function antfly_create_table(string $table): bool {
         ],
     ];
     $headers = ['Content-Type: application/json'];
-    if (!empty($cfg['antfly_key'])) $headers[] = 'Authorization: Bearer ' . $cfg['antfly_key'];
+    if (!empty($cfg['antfly_key'])) {
+        $headers[] = 'Authorization: Bearer ' . $cfg['antfly_key'];
+    }
     $ch = curl_init($url);
     curl_setopt_array($ch, [
         CURLOPT_RETURNTRANSFER => true,
         CURLOPT_POST => true,
         CURLOPT_HTTPHEADER => $headers,
         CURLOPT_POSTFIELDS => json_encode($body),
+        CURLOPT_TIMEOUT => 60,
     ]);
-    $res = curl_exec($ch);
+    curl_exec($ch);
     $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
     curl_close($ch);
     return $code >= 200 && $code < 300;
+}
+
+function antfly_api_post_json(string $path, array $body, int $timeoutSec = 60): array {
+    $cfg = $GLOBALS['CONFIG'];
+    $base = rtrim((string)($cfg['antfly_url'] ?? ''), '/');
+    $ch = curl_init($base . $path);
+    $headers = ['Content-Type: application/json'];
+    if (!empty($cfg['antfly_key'])) {
+        $headers[] = 'Authorization: Bearer ' . $cfg['antfly_key'];
+    }
+    curl_setopt_array($ch, [
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_POST => true,
+        CURLOPT_HTTPHEADER => $headers,
+        CURLOPT_POSTFIELDS => json_encode($body),
+        CURLOPT_TIMEOUT => $timeoutSec,
+    ]);
+    $raw = curl_exec($ch);
+    $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    curl_close($ch);
+    return ['code' => $code, 'body' => json_decode($raw ?: '{}', true) ?? [], 'raw' => $raw ?: ''];
+}
+
+/**
+ * True if any active pipeline template is within semantic distance (Antfly embeds query + pipeline rows; no PHP embed_text).
+ */
+function antfly_any_pipeline_within_semantic_distance(string $textBlob, float $maxDistance): bool {
+    $textBlob = trim($textBlob);
+    if ($textBlob === '') {
+        return false;
+    }
+    $res = antfly_api_post_json('/api/v1/tables/pipeline_refs/query', [
+        'table' => 'pipeline_refs',
+        'indexes' => ['semantic_idx'],
+        'semantic_search' => $textBlob,
+        'distance_under' => $maxDistance,
+        'limit' => 1,
+    ], 90);
+    if ($res['code'] < 200 || $res['code'] >= 300) {
+        ff_debug_log('antfly_pipeline_query_failed', ['code' => $res['code']]);
+        return false;
+    }
+    $responses = $res['body']['responses'] ?? [];
+    $first = $responses[0] ?? [];
+    $hits = $first['hits']['hits'] ?? [];
+    return is_array($hits) && count($hits) > 0;
+}
+
+/** Sync active PocketBase pipelines (non-empty prompt_template) into Antfly `pipeline_refs` for semantic novelty. */
+function formatforge_sync_pipeline_refs_to_antfly(?string $authHeader): void {
+    if (!formatforge_antfly_novelty_configured() || !$authHeader) {
+        return;
+    }
+    $r = pb_request('GET', '/api/collections/pipelines/records?perPage=200&sort=-updated', null, $authHeader);
+    if ($r['code'] !== 200) {
+        return;
+    }
+    foreach ($r['body']['items'] ?? [] as $p) {
+        if (!pipeline_record_is_active_for_feed($p)) {
+            continue;
+        }
+        $t = trim((string)($p['prompt_template'] ?? ''));
+        if ($t === '') {
+            continue;
+        }
+        $id = trim((string)($p['id'] ?? ''));
+        if ($id === '') {
+            continue;
+        }
+        antfly_index('pipeline_refs', [
+            'id' => $id,
+            'prompt' => $t,
+            'name' => trim((string)($p['name'] ?? '')),
+        ]);
+    }
 }
 
 function embed_text(string $text): ?array {
@@ -979,22 +1221,9 @@ function cosine_distance(array $a, array $b): float {
     return 1.0 - max(-1, min(1, $sim));
 }
 
-function content_is_novel(string $prompt, array $existingPrompts): bool {
-    $cfg = $GLOBALS['CONFIG'];
-    if (empty($cfg['embed_url']) && empty($cfg['openai_key']) && empty($cfg['openrouter_key'])) return false;
-    $vec = embed_text($prompt);
-    if (!$vec) return false;
-    foreach ($existingPrompts as $p) {
-        $ev = embed_text($p);
-        if (!$ev) continue;
-        if (cosine_distance($vec, $ev) < $cfg['novel_threshold']) return false;
-    }
-    return true;
-}
-
-function formatforge_embeddings_configured(): bool {
-    $cfg = $GLOBALS['CONFIG'];
-    return !empty($cfg['embed_url']) || !empty($cfg['openai_key']) || !empty($cfg['openrouter_key']);
+/** Cursor “create pipeline” novelty uses Antfly semantic search only (requires ANTFLY_URL). */
+function formatforge_antfly_novelty_configured(): bool {
+    return trim((string)($GLOBALS['CONFIG']['antfly_url'] ?? '')) !== '';
 }
 
 /** Instagram-bound pipelines: active unless `is_active` is explicitly false (missing/null treated as active). */
@@ -1003,40 +1232,36 @@ function pipeline_record_is_active_for_feed(array $p): bool {
 }
 
 /**
- * Active pipelines only: non-empty prompt_templates for embedding novelty, plus count of active rows.
- * Inactive pipelines are ignored so novelty compares against what actually feeds Instagram.
+ * Count active pipeline rows (Instagram-bound). Novelty vs templates is done in Antfly after syncing `pipeline_refs`.
  */
-function fetch_pipeline_embedding_reference_state(?string $authHeader): array {
+function fetch_active_pipeline_row_count(?string $authHeader): int {
     $r = pb_request('GET', '/api/collections/pipelines/records?perPage=200&sort=-updated', null, $authHeader);
     if ($r['code'] !== 200) {
-        return ['templates' => [], 'active_pipeline_row_count' => 0];
+        return 0;
     }
-    $items = $r['body']['items'] ?? [];
-    $out = [];
-    $activeCount = 0;
-    foreach ($items as $p) {
-        if (!pipeline_record_is_active_for_feed($p)) {
-            continue;
-        }
-        $activeCount++;
-        $t = trim((string)($p['prompt_template'] ?? ''));
-        if ($t !== '') {
-            $out[] = $t;
+    $n = 0;
+    foreach ($r['body']['items'] ?? [] as $p) {
+        if (pipeline_record_is_active_for_feed($p)) {
+            $n++;
         }
     }
-    return ['templates' => $out, 'active_pipeline_row_count' => $activeCount];
+    return $n;
 }
 
-/** True when fetched index text should spawn a “create pipeline” Cursor run. */
-function fetched_text_is_novel_vs_pipelines(string $indexPrompt, array $templates, int $activePipelineRowCount): bool {
-    $indexPrompt = trim($indexPrompt);
-    if ($indexPrompt === '' || !formatforge_embeddings_configured()) {
+/**
+ * True when fetched content’s **textual** semantic blob is far from all synced pipeline templates (Antfly query).
+ * Media bytes are embedded in Antfly on index via `remoteMedia`; pipeline comparison uses the same text lines as `prompt`.
+ */
+function fetched_text_is_novel_vs_pipelines(string $semanticTextBlob, int $activePipelineRowCount): bool {
+    $semanticTextBlob = trim($semanticTextBlob);
+    if ($semanticTextBlob === '' || !formatforge_antfly_novelty_configured()) {
         return false;
     }
-    if ($templates !== []) {
-        return content_is_novel($indexPrompt, $templates);
+    if ($activePipelineRowCount === 0) {
+        return true;
     }
-    return $activePipelineRowCount === 0;
+    $maxD = (float)($GLOBALS['CONFIG']['novel_threshold'] ?? 0.35);
+    return !antfly_any_pipeline_within_semantic_distance($semanticTextBlob, $maxD);
 }
 
 /**
@@ -1081,7 +1306,7 @@ function count_consecutive_rejects_for_pipeline(string $pipelineId, ?string $aut
 function maybe_trigger_cursor_create_pipeline_after_fetch(array $novelIndexPrompts, ?string $authHeader): void {
     $cfg = $GLOBALS['CONFIG'];
     if (empty($cfg['pi_trigger_dir']) || $novelIndexPrompts === []) return;
-    if (!formatforge_embeddings_configured()) return;
+    if (!formatforge_antfly_novelty_configured()) return;
     $novelIndexPrompts = array_values(array_unique(array_filter(array_map('trim', $novelIndexPrompts))));
     if ($novelIndexPrompts === []) return;
     trigger_pipeline_cursor_agent('novel_fetched_content', [
@@ -1217,7 +1442,7 @@ function setup_pipeline_from_trigger(string $triggerFile, bool $spawnCursorAgent
     } elseif ($reason === 'content_rejected') {
         $task = "Content was rejected (legacy trigger). Create or edit a content pipeline to improve output.\n\n1. Pipeline dir: `$pipelineDir`\n2. Use context JSON for ids and reasons.\n3. Build: `cd $pipelineDir && go build -o pipeline-generate .`\n4. Update PocketBase **`pipelines`** as needed.";
     } elseif ($reason === 'novel_fetched_content' || $reason === 'novel_content') {
-        $task = "**CREATE a new pipeline** (fetched media text is novel vs **active** pipelines’ `prompt_template` embeddings, or no active pipelines yet).\n\n"
+        $task = "**CREATE a new pipeline** — fetched item is novel vs **active** pipelines in Antfly (`pipeline_refs` semantic index). Content embeddings use Antfly’s template + **`remoteMedia`** on `media_url` (OpenRouter `EMBED_MODEL` on the Antfly side).\n\n"
             . "1. New pipeline dir: `$pipelineDir`\n"
             . "2. .env copied from template. Build: `cd $pipelineDir && go build -o pipeline-generate .`\n"
             . "3. Crontab: `0 */6 * * * cd $pipelineDir && set -a && . .env && set +a && ./pipeline-generate`\n"
@@ -1544,7 +1769,7 @@ if (PHP_SAPI === 'cli' && ($argv[1] ?? '') === 'test-embed') {
     }
     $n = count($vec);
     $d = cosine_distance($vec, $vec);
-    echo "OK: embed_text() — same code path as novelty checks in index.php\n";
+    echo "OK: embed_text() — direct OpenRouter/OpenAI/Ollama sanity check (novelty uses Antfly semantic query, not this path)\n";
     echo '  phrase: ' . $phrase . "\n";
     echo "  dimensions: {$n}\n";
     echo "  cosine_distance(self,self): {$d} (expect 0)\n";
@@ -1688,6 +1913,12 @@ $user = $_SESSION['pb_user'] ?? null;
 $token = $_SESSION['pb_token'] ?? null;
 $authHeader = $token ?: null;
 
+$instagramConnectAuditForView = null;
+if ($user && (($_GET['tab'] ?? '') === 'accounts') && isset($_SESSION['ff_instagram_connect_audit']) && is_array($_SESSION['ff_instagram_connect_audit'])) {
+    $instagramConnectAuditForView = $_SESSION['ff_instagram_connect_audit'];
+    unset($_SESSION['ff_instagram_connect_audit']);
+}
+
 // Meta/Facebook webhook verification (must respond to GET with hub.challenge)
 $hubMode = $_GET['hub_mode'] ?? $_GET['hub.mode'] ?? '';
 $hubVerify = $_GET['hub_verify_token'] ?? $_GET['hub.verify_token'] ?? '';
@@ -1740,6 +1971,11 @@ if ($isInstagramCallback && $user && !empty($_GET['error'])) {
         'error_reason' => $_GET['error_reason'] ?? null,
         'error_description' => $_GET['error_description'] ?? null,
     ]);
+    ff_instagram_connect_audit_flash([
+        'stage' => 'oauth_cancelled',
+        'error' => $_GET['error'] ?? null,
+        'error_description' => $_GET['error_description'] ?? null,
+    ]);
     header('Location: ' . $baseUrl . '?tab=accounts&msg=' . rawurlencode('Instagram connection was cancelled.') . '&msgError=1');
     exit;
 }
@@ -1767,6 +2003,7 @@ if ($isInstagramCallback && isset($_GET['code']) && $user) {
             'expected_user_id' => $expectedState['user_id'] ?? null,
             'expected_nonce_present' => !empty($expectedState['nonce']),
         ]);
+        ff_instagram_connect_audit_flash(['stage' => 'oauth_state_invalid']);
         header('Location: ' . $baseUrl . '?tab=accounts&msg=' . rawurlencode('Instagram connection failed: invalid OAuth state. Please try again.') . '&msgError=1');
         exit;
     }
@@ -1792,6 +2029,10 @@ if ($isInstagramCallback && isset($_GET['code']) && $user) {
         ff_debug_log('facebook_token_exchange_failed', [
             'error' => $data['error'] ?? $data,
         ]);
+        ff_instagram_connect_audit_flash([
+            'stage' => 'facebook_token_exchange_failed',
+            'message' => $err,
+        ]);
         header('Location: ' . $baseUrl . '?tab=accounts&msg=' . rawurlencode('Instagram connection failed: ' . $err) . '&msgError=1');
         exit;
     }
@@ -1808,6 +2049,11 @@ if ($isInstagramCallback && isset($_GET['code']) && $user) {
             'error' => $accounts['error'] ?? null,
             'response_preview' => substr($r2 ?: '', 0, 300),
         ]);
+        $pgErr = $accounts['error']['message'] ?? json_encode($accounts['error'] ?? []);
+        ff_instagram_connect_audit_flash([
+            'stage' => 'facebook_pages_lookup_failed',
+            'message' => $pgErr,
+        ]);
         header('Location: ' . $baseUrl . '?tab=accounts&msg=' . rawurlencode('Facebook Pages lookup failed: ' . $accounts['error']['message']) . '&msgError=1');
         exit;
     }
@@ -1816,12 +2062,21 @@ if ($isInstagramCallback && isset($_GET['code']) && $user) {
     $saved = 0;
     $schemaIssue = null;
     $seenIgUsers = [];
+    $pagesAudit = [];
     foreach ($pages as $page) {
         $pageId = $page['id'] ?? '';
         $pageName = $page['name'] ?? '';
         $pageToken = trim((string) ($page['access_token'] ?? ''));
         if ($pageToken === '') $pageToken = $fbToken;
-        if (!$pageId) continue;
+        if (!$pageId) {
+            $pagesAudit[] = [
+                'page_id' => null,
+                'page_name' => $pageName ?: '(unknown)',
+                'instagram_business_linked' => false,
+                'note' => 'skipped_missing_page_id',
+            ];
+            continue;
+        }
         ff_debug_log('facebook_page_scan_start', [
             'page_id' => $pageId,
             'page_name' => $pageName,
@@ -1848,12 +2103,37 @@ if ($isInstagramCallback && isset($_GET['code']) && $user) {
                 'page_id' => $pageId,
                 'page_name' => $pageName,
             ]);
+            $pagesAudit[] = [
+                'page_id' => $pageId,
+                'page_name' => $pageName,
+                'instagram_business_linked' => false,
+                'ig_resolved_via' => $igSource,
+            ];
             continue;
         }
 
         $igUserId = trim((string) ($igBiz['id'] ?? ''));
-        if ($igUserId === '') continue;
-        if (isset($seenIgUsers[$igUserId])) continue;
+        if ($igUserId === '') {
+            $pagesAudit[] = [
+                'page_id' => $pageId,
+                'page_name' => $pageName,
+                'instagram_business_linked' => true,
+                'ig_resolved_via' => $igSource,
+                'note' => 'empty_ig_user_id_after_link',
+            ];
+            continue;
+        }
+        if (isset($seenIgUsers[$igUserId])) {
+            $pagesAudit[] = [
+                'page_id' => $pageId,
+                'page_name' => $pageName,
+                'instagram_business_linked' => true,
+                'ig_user_id' => $igUserId,
+                'ig_resolved_via' => $igSource,
+                'note' => 'duplicate_ig_already_saved_this_callback',
+            ];
+            continue;
+        }
         $seenIgUsers[$igUserId] = true;
 
         $username = normalize_instagram_username($igBiz['username'] ?? null);
@@ -1871,12 +2151,36 @@ if ($isInstagramCallback && isset($_GET['code']) && $user) {
             'is_active' => true,
         ];
         $existing = pb_find_instagram_account_by_user_id($igUserId, $authHeader);
-        if ($existing && !empty($existing['id'])) {
-            $rec = pb_request('PATCH', "/api/collections/instagram_accounts/records/{$existing['id']}", $payload, $authHeader);
-            $upsertMode = 'update';
-        } else {
-            $rec = pb_request('POST', '/api/collections/instagram_accounts/records', $payload, $authHeader);
-            $upsertMode = 'create';
+        $upsertMode = ($existing && !empty($existing['id'])) ? 'update' : 'create';
+        $rec = null;
+        $pbFieldErrors = [];
+        for ($upsertAttempt = 0; $upsertAttempt < 2; $upsertAttempt++) {
+            if ($upsertMode === 'update') {
+                $rec = pb_request('PATCH', "/api/collections/instagram_accounts/records/{$existing['id']}", $payload, $authHeader);
+            } else {
+                $rec = pb_request('POST', '/api/collections/instagram_accounts/records', $payload, $authHeader);
+            }
+            $code = (int) ($rec['code'] ?? 0);
+            if ($code >= 200 && $code < 300) {
+                break;
+            }
+            $pbFieldErrors = pb_record_validation_messages($rec['body'] ?? null);
+            ff_debug_log('instagram_account_upsert_failed', [
+                'attempt' => $upsertAttempt + 1,
+                'upsert_mode' => $upsertMode,
+                'pb_code' => $code,
+                'pb_message' => $rec['body']['message'] ?? null,
+                'pb_field_errors' => $pbFieldErrors,
+                'access_token_length' => strlen((string) $pageToken),
+            ]);
+            if ($upsertAttempt === 0 && $code >= 400 && $code < 500) {
+                $repairUpsert = repair_instagram_accounts_schema();
+                ff_debug_log('instagram_upsert_repair_before_retry', ['repair' => $repairUpsert]);
+                if ($repairUpsert['ok'] ?? false) {
+                    continue;
+                }
+            }
+            break;
         }
         $recordBody = is_array($rec['body'] ?? null) ? $rec['body'] : [];
         $visibleFieldSuspect = (
@@ -1920,9 +2224,55 @@ if ($isInstagramCallback && isset($_GET['code']) && $user) {
             'pb_message' => $rec['body']['message'] ?? null,
             'pb_record_id' => $rec['body']['id'] ?? ($existing['id'] ?? null),
         ]);
-        if ($rec['code'] >= 200 && $rec['code'] < 300) $saved++;
+        $pbOk = ($rec['code'] ?? 0) >= 200 && ($rec['code'] ?? 0) < 300;
+        $pagesAudit[] = [
+            'page_id' => $pageId,
+            'page_name' => $pageName,
+            'instagram_business_linked' => true,
+            'ig_user_id' => $igUserId,
+            'ig_username_resolved' => $username,
+            'ig_resolved_via' => $igSource,
+            'upsert_mode' => $upsertMode,
+            'pocketbase_saved' => $pbOk,
+            'pb_http_code' => $rec['code'] ?? null,
+            'pb_message' => $rec['body']['message'] ?? null,
+            'pb_field_errors' => $pbOk ? (object)[] : $pbFieldErrors,
+            'access_token_length' => $pbOk ? null : strlen((string) $pageToken),
+            'pb_record_id' => $rec['body']['id'] ?? ($existing['id'] ?? null),
+        ];
+        if ($pbOk) {
+            $saved++;
+        }
     }
+    $graphIgRowCount = count(array_filter(
+        $pagesAudit,
+        static fn (array $r): bool => !empty($r['instagram_business_linked'])
+    ));
+    ff_debug_log('instagram_callback_pages_audit', [
+        'saved' => $saved,
+        'pages_count' => count($pages),
+        'graph_ig_row_count' => $graphIgRowCount,
+        'pages_rows' => $pagesAudit,
+    ]);
     ff_debug_log('instagram_callback_complete', ['saved' => $saved, 'pages_count' => count($pages)]);
+
+    $outcome = 'no_pages';
+    if ($schemaIssue) {
+        $outcome = 'schema_issue';
+    } elseif ($saved > 0) {
+        $outcome = 'success';
+    } elseif (!empty($pages)) {
+        $outcome = 'pages_but_no_usable_ig';
+    }
+    ff_instagram_connect_audit_flash([
+        'stage' => 'pages_scan_complete',
+        'outcome' => $outcome,
+        'saved_to_pocketbase' => $saved,
+        'facebook_pages_total' => count($pages),
+        'graph_rows_reporting_ig_linked' => $graphIgRowCount,
+        'per_page' => $pagesAudit,
+        'schema_issue' => $schemaIssue,
+    ]);
 
     if ($schemaIssue) {
         header('Location: ' . $baseUrl . '?tab=accounts&msg=' . rawurlencode($schemaIssue) . '&msgError=1');
@@ -2129,7 +2479,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && $user && $authHeader) {
         [$files, $tmpDir, $viaUsed, $fetchMeta] = fetch_media_from_url_auto($url);
         $created = 0;
         $cfg = $GLOBALS['CONFIG'];
-        $pipelineRef = fetch_pipeline_embedding_reference_state($authHeader);
+        $activePipelineRows = fetch_active_pipeline_row_count($authHeader);
+        if (formatforge_antfly_novelty_configured() && $activePipelineRows > 0) {
+            formatforge_sync_pipeline_refs_to_antfly($authHeader);
+        }
         $novelFetchedPrompts = [];
         foreach (array_values($files) as $fileIndex => $path) {
             $ext = strtolower(pathinfo($path, PATHINFO_EXTENSION));
@@ -2176,10 +2529,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && $user && $authHeader) {
                 $created++;
                 $pbRowId = (string)($rec['body']['id'] ?? '');
                 if ($pbRowId !== '') {
-                    $indexPrompt = trim($baseName . "\n" . $url);
-                    formatforge_index_content_in_antfly($pbRowId, $indexPrompt, $type, 'pending');
-                    if (fetched_text_is_novel_vs_pipelines($indexPrompt, $pipelineRef['templates'], (int)$pipelineRef['active_pipeline_row_count'])) {
-                        $novelFetchedPrompts[] = $indexPrompt;
+                    $caption = trim($baseName . "\n" . $url);
+                    $semanticBlob = formatforge_antfly_content_semantic_text($baseName, $url, $caption);
+                    $garage = $garageUrl ?: '';
+                    formatforge_index_content_in_antfly($pbRowId, $semanticBlob, $type, 'pending', $garage !== '' ? $garage : null, $mime, $url, $baseName);
+                    if (fetched_text_is_novel_vs_pipelines($semanticBlob, $activePipelineRows)) {
+                        $novelFetchedPrompts[] = $semanticBlob;
                     }
                 }
             }
@@ -2322,7 +2677,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && $user && $authHeader) {
             'garage_key' => $key,
             'garage_url' => $garageUrl ?: $videoUrl,
         ], $authHeader);
-        formatforge_index_content_in_antfly((string)$itemId, $prompt, 'reel', 'pending');
+        $gUrl = $garageUrl ?: $videoUrl;
+        $semanticBlob = formatforge_antfly_content_semantic_text('(pipeline)', '', trim($prompt));
+        formatforge_index_content_in_antfly((string)$itemId, $semanticBlob, 'reel', 'pending', $gUrl ?: null, 'video/mp4', '', '(pipeline)');
         echo json_encode(['ok' => true, 'id' => $itemId, 'url' => $garageUrl ?: $videoUrl]);
         exit;
     }
@@ -2849,6 +3206,13 @@ if (!empty($_GET['privacy']) || strpos($reqUri, '/privacy') !== false) {
         <div x-show="tab === 'accounts'" x-transition>
             <h2>Instagram Accounts</h2>
             <p style="margin-bottom: 1rem; color: var(--muted);">Connect multiple Instagram Business/Creator accounts to publish content.</p>
+            <?php if (!empty($instagramConnectAuditForView)): ?>
+            <details class="card" style="margin-bottom: 1.25rem;" open>
+                <summary style="cursor: pointer; font-weight: 600; color: var(--muted);">Last Instagram connect — API debug</summary>
+                <p style="font-size: 0.8rem; color: var(--muted); margin: 0.75rem 0 0.5rem;">What Meta returned for your Facebook login (page IDs, whether <code style="font-size:0.85em;">instagram_business_account</code> was present). No access tokens.</p>
+                <pre style="margin: 0; padding: 0.75rem; background: var(--surface2); border-radius: 8px; font-size: 0.72rem; overflow-x: auto; white-space: pre-wrap; word-break: break-word; border: 1px solid var(--border);"><?= htmlspecialchars(json_encode($instagramConnectAuditForView, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES), ENT_QUOTES, 'UTF-8') ?></pre>
+            </details>
+            <?php endif; ?>
             <a :href="'?instagram_oauth=1'" class="btn btn-primary" style="margin-bottom: 1.5rem; display: inline-block;" x-text="accounts.length ? 'Connect another account' : 'Connect Instagram Account'"></a>
             <div class="content-grid" x-show="accounts.length">
                 <template x-for="a in accounts" :key="a.id">

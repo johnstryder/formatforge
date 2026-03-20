@@ -6,6 +6,8 @@ Stack: **nginx**, **PHP-FPM** (8.2+), **PocketBase** binary, optional **certbot*
 
 Ensure **ports 80 and 8090** (or whatever you map for HTTP and PocketBase) are free on the host. Keep **`pb_data/`**, **`.env`**, and the project tree when redeploying.
 
+**nginx without PHP-FPM** still yields **502** on every PHP request — the stack needs both. See **§2. Packages** (`php-fpm` and extensions).
+
 ## Prerequisites
 
 - VPS (Ubuntu 22.04+ recommended) with nginx and PHP-FPM installed
@@ -92,7 +94,7 @@ APP_URL=https://formatforgeplus.com
 POCKETBASE_URL=http://127.0.0.1:8090
 ```
 
-Do **not** use `http://pocketbase:8090` — that hostname only existed inside Docker.
+Use **`http://127.0.0.1:8090`** (or the host/port where PocketBase actually listens). Do not point PHP at a hostname that only resolves inside a container network.
 
 Fill secrets as in `.env.example` (`MIGRATE_SECRET`, Garage, Replicate/fal, Instagram, etc.).
 
@@ -106,6 +108,8 @@ pip install --user gallery-dl yt-dlp
 Instagram cookies: `storage/cookies/instagram_cookies.txt` or `cookies.txt` (see `storage/cookies/README.md`).
 
 ## 5. nginx
+
+The public site must be served by **this host’s nginx** (PHP-FPM + optional `/pb/` proxy). If DNS points here but something else answers, or PHP-FPM is down / socket mismatched, you’ll see **502** (from Cloudflare or from nginx directly).
 
 ```bash
 sudo cp /var/www/formatforge/nginx/formatforgeplus.conf /etc/nginx/sites-available/formatforgeplus
@@ -124,17 +128,21 @@ sudo nginx -t && sudo systemctl reload nginx
 The origin nginx is up but **PHP-FPM is not connected** (wrong socket), **not running**, or **crashing**. On the server:
 
 ```bash
-cd /var/www/formatforge && ./scripts/prod-check.sh
+cd /path/to/your/formatforge/clone   # e.g. ~/formatforge or /var/www/formatforge
+./scripts/diagnose-502.sh
 sudo tail -40 /var/log/nginx/error.log
 ```
 
 Look for `connect() to unix:/run/php/php8.x-fpm.sock failed`. Fix with:
 
 ```bash
-sudo systemctl start php8.3-fpm   # use the version you installed
+sudo systemctl start php8.3-fpm   # use the version you installed — must match nginx/fastcgi-pass.conf
+cd /path/to/your/formatforge/clone
 ./scripts/align-php-fpm-socket.sh
 sudo nginx -t && sudo systemctl reload nginx
 ```
+
+Run **`align-php-fpm-socket.sh` from the same tree** your nginx `include …/nginx/fastcgi-pass.conf` points at. If nginx still references `/var/www/formatforge` but you only keep the app in `~/formatforge`, either **`sudo ln -sfn ~/formatforge /var/www/formatforge`** or edit the site config so `root` and every `include .../nginx/` path use your real directory.
 
 If errors mention **PocketBase** or **8090** on `/pb/` only, run: `sudo systemctl status formatforge-pocketbase`.
 
