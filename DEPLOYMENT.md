@@ -125,6 +125,8 @@ This symlinks the clone to **`/var/www/formatforge`**, copies **`nginx/formatfor
 
 If **`curl` to `127.0.0.1:80` fails** / `ss` shows no `:80` listener, nginx is stopped or crashed: `sudo systemctl status nginx` and `sudo journalctl -u nginx -n 40 --no-pager`.
 
+**`curl: (2) no URL specified`:** the URL was split onto the next line. Keep the whole command on **one** line, e.g. `curl -sS -w '%{http_code}\n' -H 'Host: formatforgeplus.com' http://127.0.0.1/` — or rely on **`install-formatforge-nginx-site.sh`**, which runs a verification `curl` at the end.
+
 ### You see Apache’s “It works!” default page instead of FormatForge
 
 That page is **`/var/www/html/index.html`** served by **Apache**, not nginx. Only one service should own **80** (and **443**). If Apache is installed, it often binds port 80 first.

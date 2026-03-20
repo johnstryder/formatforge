@@ -49,4 +49,14 @@ else
   systemctl reload nginx || systemctl restart nginx
 fi
 
-echo "Done. Check: ss -tlnp | grep :80  &&  curl -sS -H 'Host: formatforgeplus.com' http://127.0.0.1/ | head"
+HOST="${FORMATFORGE_SERVER_NAME:-formatforgeplus.com}"
+echo "--- verify (URL must stay on same line as curl) ---"
+set +e
+code="$(curl -sS --max-time 15 -o /tmp/ff-install-verify.$$ -w '%{http_code}' -H "Host: $HOST" http://127.0.0.1/)"
+cret=$?
+set -e
+if [ "$cret" -ne 0 ]; then code="(curl exit $cret)"; fi
+echo "curl HTTP status (Host: $HOST): $code"
+head -8 /tmp/ff-install-verify.$$ 2>/dev/null || true
+rm -f /tmp/ff-install-verify.$$
+echo "Done."
