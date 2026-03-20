@@ -11,3 +11,10 @@ pb_data/
 .pb-port
 .app-port
 .antfly-port
+
+# Local/system symlinks, vendored trees, runtime data
+formatforgeplus
+antfly-src/
+go-highway-src/
+storage/
+=*

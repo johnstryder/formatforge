@@ -144,6 +144,23 @@ The old vhost set **`Connection: upgrade`** on every proxied request. PocketBase
 2. Confirm PocketBase is up: **`curl -sS -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8090/api/health`**
 3. If admin still misbehaves (redirects, assets), PocketBase **recommends a subdomain** instead of a path — see **`nginx/formatforge-pb-subdomain.conf.example`** and set **`POCKETBASE_PUBLIC_URL`** to that host.
 
+### **`/api/` returns 200 but lists are empty in the browser** (records exist in PocketBase Admin)
+
+The dashboard sends a PocketBase JWT on the **`Authorization`** header. If that header is dropped before the upstream, or a **shared cache** stores an anonymous JSON body, the UI can look “empty” while PHP (which talks to **`127.0.0.1:8090`**) still works.
+
+Shipped config does two things:
+
+- **`nginx/snippets/pocketbase-proxy-common.conf`** — **`proxy_set_header Authorization $http_authorization;`** (forward client JWT to PocketBase for both **`/api/`** and **`/_/`**).
+- **`nginx/snippets/pocketbase-proxy-api-extra.conf`** — included only under **`location /api/`**: **`Cache-Control: private, no-store`** and **`Vary: Authorization, Cookie`** so browsers and middle proxies do not reuse one user’s API response for another.
+
+After updating the repo (snippets live under **`/var/www/formatforge/nginx/snippets/`** when using the install script’s symlink), reload:
+
+```bash
+sudo nginx -t && sudo systemctl reload nginx
+```
+
+**Cloudflare:** add a **Cache Rule** (or equivalent) to **Bypass cache** for URI Path contains **`/api/`**. Origin response headers help, but **Bypass** is the reliable fix at the edge.
+
 **Paste trap:** If you copy `sudo cp /path/to/formatforgeplus.conf` and hit Enter before the destination on the same line, `cp` fails with *missing destination* and nothing is installed — use the script above or keep **source and dest on one line**.
 
 If **`curl` to `127.0.0.1:80` fails** / `ss` shows no `:80` listener, nginx is stopped or crashed: `sudo systemctl status nginx` and `sudo journalctl -u nginx -n 40 --no-pager`.

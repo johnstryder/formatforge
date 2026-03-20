@@ -159,7 +159,7 @@ $CONFIG = [
     'pocketbase_admin_url' => rtrim($pbPublicUrl, '/') . '/_/',
     'site_url'         => $siteUrl,
     'site_name'        => getenv('SITE_NAME') ?: 'FormatForge',
-    'app_version'      => getenv('APP_VERSION') ?: 'v1.0.76',
+    'app_version'      => getenv('APP_VERSION') ?: 'v1.0.78',
     'users_collection' => 'users',
     'garage_endpoint'  => getenv('GARAGE_ENDPOINT') ?: 'http://127.0.0.1:3900',
     'garage_key'       => getenv('GARAGE_ACCESS_KEY') ?: '',
@@ -247,6 +247,24 @@ function ff_debug_logs_get(): array {
 
 function ff_debug_logs_clear(): void {
     $_SESSION['ff_debug_logs'] = [];
+}
+
+/** Non-secret snapshot for in-app debug export (support / troubleshooting). */
+function ff_ui_debug_public_snapshot(): array {
+    $c = $GLOBALS['CONFIG'] ?? [];
+    return [
+        'app_version' => $c['app_version'] ?? '',
+        'site_name' => $c['site_name'] ?? '',
+        'site_url' => $c['site_url'] ?? '',
+        'pocketbase_public_url' => $c['pocketbase_public_url'] ?? '',
+        'php_version' => PHP_VERSION,
+        'server_time' => date('c'),
+    ];
+}
+
+/** Collections the logged-in dashboard may access via pb_proxy (browser → PHP → POCKETBASE_URL). */
+function ff_pb_proxy_collections(): array {
+    return ['instagram_accounts', 'source_links', 'content_items', 'pipelines'];
 }
 
 function pb_superuser_auth_token(): array {
@@ -2865,6 +2883,87 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && $user && $authHeader) {
         exit;
     }
 
+    if ($action === 'ui_debug_bundle') {
+        echo json_encode([
+            'ok' => true,
+            'server' => ff_ui_debug_public_snapshot(),
+            'session' => [
+                'id_prefix' => substr((string) session_id(), 0, 8),
+            ],
+            'request' => [
+                'method' => $_SERVER['REQUEST_METHOD'] ?? '',
+                'uri' => $_SERVER['REQUEST_URI'] ?? '',
+                'query' => ff_debug_sanitize($_GET),
+            ],
+            'logs' => ff_debug_logs_get(),
+        ], JSON_UNESCAPED_SLASHES);
+        exit;
+    }
+
+    if ($action === 'pb_proxy') {
+        $cols = ff_pb_proxy_collections();
+        $coll = (string) ($_POST['collection'] ?? '');
+        if (!in_array($coll, $cols, true)) {
+            echo json_encode(['ok' => false, 'error' => 'Invalid collection', 'pb_http_status' => 0]);
+            exit;
+        }
+        $method = strtoupper(trim((string) ($_POST['http_method'] ?? 'GET')));
+        if (!in_array($method, ['GET', 'PATCH', 'DELETE'], true)) {
+            echo json_encode(['ok' => false, 'error' => 'Invalid method', 'pb_http_status' => 0]);
+            exit;
+        }
+        $recordId = trim((string) ($_POST['record_id'] ?? ''));
+        $query = (string) ($_POST['query'] ?? '');
+        if (strlen($query) > 900) {
+            echo json_encode(['ok' => false, 'error' => 'Query too long', 'pb_http_status' => 0]);
+            exit;
+        }
+        if (preg_match('/[\x00-\x08\x0b\x0c\x0e-\x1f\\\\]/', $query)) {
+            echo json_encode(['ok' => false, 'error' => 'Invalid query', 'pb_http_status' => 0]);
+            exit;
+        }
+        if ($recordId !== '' && !preg_match('/^[a-z0-9]+$/', $recordId)) {
+            echo json_encode(['ok' => false, 'error' => 'Invalid record id', 'pb_http_status' => 0]);
+            exit;
+        }
+        $path = '/api/collections/' . rawurlencode($coll) . '/records';
+        if ($recordId !== '') {
+            $path .= '/' . rawurlencode($recordId);
+        } elseif ($method !== 'GET') {
+            echo json_encode(['ok' => false, 'error' => 'record_id required', 'pb_http_status' => 0]);
+            exit;
+        }
+        if ($method === 'GET' && $query !== '') {
+            $path .= '?' . $query;
+        }
+        $body = null;
+        if ($method === 'PATCH') {
+            $raw = (string) ($_POST['json_body'] ?? '');
+            if (strlen($raw) > 120000) {
+                echo json_encode(['ok' => false, 'error' => 'Body too large', 'pb_http_status' => 0]);
+                exit;
+            }
+            if ($raw === '') {
+                $body = [];
+            } else {
+                $decoded = json_decode($raw, true);
+                if (!is_array($decoded)) {
+                    echo json_encode(['ok' => false, 'error' => 'Invalid json_body', 'pb_http_status' => 0]);
+                    exit;
+                }
+                $body = $decoded;
+            }
+        }
+        $res = pb_request($method, $path, $body, $authHeader);
+        $code = (int) ($res['code'] ?? 0);
+        echo json_encode([
+            'ok' => $code >= 200 && $code < 300,
+            'pb_http_status' => $code,
+            'body' => $res['body'],
+        ], JSON_UNESCAPED_SLASHES);
+        exit;
+    }
+
     if ($action === 'debug_account_snapshot') {
         $list = pb_request('GET', '/api/collections/instagram_accounts/records?sort=-created&perPage=50', null, $authHeader);
         if ($list['code'] !== 200) {
@@ -3519,6 +3618,8 @@ if (!empty($_GET['privacy']) || strpos($reqUri, '/privacy') !== false) {
         .form-group textarea { width: 100%; padding: 0.6rem; border-radius: 8px; background: var(--surface2); border: 1px solid var(--border); color: var(--text); font-family: inherit; font-size: 0.9rem; min-height: 120px; resize: vertical; }
         .form-group select.w-full { width: 100%; padding: 0.6rem; border-radius: 8px; background: var(--surface2); border: 1px solid var(--border); color: var(--text); }
         .pipeline-preview { font-size: 0.8rem; color: var(--muted); max-height: 6rem; overflow-y: auto; padding: 0.5rem; background: var(--surface2); border-radius: 8px; margin-bottom: 0.75rem; white-space: pre-wrap; word-break: break-word; }
+        .ff-debug-panel { border: 1px dashed rgba(245, 158, 11, 0.45); background: rgba(245, 158, 11, 0.04); }
+        .ff-debug-panel textarea { width: 100%; box-sizing: border-box; font-family: ui-monospace, monospace; font-size: 0.68rem; line-height: 1.35; background: var(--surface2); color: var(--text); border: 1px solid var(--border); border-radius: 8px; padding: 0.5rem; resize: vertical; min-height: 14rem; }
     </style>
 </head>
 <body x-data="pipelineApp()" x-init="init()">
@@ -3762,6 +3863,19 @@ if (!empty($_GET['privacy']) || strpos($reqUri, '/privacy') !== false) {
                     </template>
                 </div>
             </div>
+
+            <div class="card ff-debug-panel" style="margin-top: 1.75rem;">
+                <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 0.5rem;">
+                    <h3 style="margin: 0; font-size: 0.95rem; color: var(--warning);">Debug · Curate</h3>
+                    <div style="display: flex; gap: 0.5rem; flex-wrap: wrap;">
+                        <button type="button" class="btn btn-secondary" style="font-size: 0.72rem; padding: 0.3rem 0.55rem;" @click="refreshServerDebug()">Refresh server bundle</button>
+                        <button type="button" class="btn btn-secondary" style="font-size: 0.72rem; padding: 0.3rem 0.55rem;" @click="clearClientDebugLog()">Clear client log</button>
+                        <button type="button" class="btn btn-primary" style="font-size: 0.72rem; padding: 0.3rem 0.55rem;" @click="copyTabDebugReport('curate')">Copy JSON</button>
+                    </div>
+                </div>
+                <p style="font-size: 0.72rem; color: var(--muted); margin: 0.5rem 0 0.5rem 0;">Verbose trace for actions you take while this tab is active, plus PocketBase calls and PHP responses. Use <strong style="color: var(--text);">Refresh server bundle</strong> for session server logs, then copy and paste to chat.</p>
+                <textarea readonly rows="16" :value="tab === 'curate' ? tabDebugText('curate') : ''" @focus="$el.select()"></textarea>
+            </div>
         </div>
 
         <!-- Pipelines (records are created by Cursor or PocketBase superuser via admin API; dashboard users list & run) -->
@@ -3792,6 +3906,19 @@ if (!empty($_GET['privacy']) || strpos($reqUri, '/privacy') !== false) {
                 </template>
             </div>
             <p x-show="!pipelinesLoading && !pipelines.length" class="msg">No pipelines yet. When the Cursor <code style="font-size:0.85em;">agent</code> run finishes it should create <code style="font-size:0.85em;">pipelines</code> records (PocketBase admin API). You can also add rows in PocketBase Admin as superuser.</p>
+
+            <div class="card ff-debug-panel" style="margin-top: 1.75rem;">
+                <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 0.5rem;">
+                    <h3 style="margin: 0; font-size: 0.95rem; color: var(--warning);">Debug · Pipelines</h3>
+                    <div style="display: flex; gap: 0.5rem; flex-wrap: wrap;">
+                        <button type="button" class="btn btn-secondary" style="font-size: 0.72rem; padding: 0.3rem 0.55rem;" @click="refreshServerDebug()">Refresh server bundle</button>
+                        <button type="button" class="btn btn-secondary" style="font-size: 0.72rem; padding: 0.3rem 0.55rem;" @click="clearClientDebugLog()">Clear client log</button>
+                        <button type="button" class="btn btn-primary" style="font-size: 0.72rem; padding: 0.3rem 0.55rem;" @click="copyTabDebugReport('pipelines')">Copy JSON</button>
+                    </div>
+                </div>
+                <p style="font-size: 0.72rem; color: var(--muted); margin: 0.5rem 0 0.5rem 0;">Run pipeline / generation requests and PocketBase traffic are logged here when this tab is active.</p>
+                <textarea readonly rows="16" :value="tab === 'pipelines' ? tabDebugText('pipelines') : ''" @focus="$el.select()"></textarea>
+            </div>
         </div>
 
         <!-- Accounts -->
@@ -3816,6 +3943,19 @@ if (!empty($_GET['privacy']) || strpos($reqUri, '/privacy') !== false) {
                 </template>
             </div>
             <p x-show="!accounts.length" style="color: var(--muted); font-size: 0.9rem;">No accounts connected yet. Click the button above to connect your first Instagram account.</p>
+
+            <div class="card ff-debug-panel" style="margin-top: 1.75rem;">
+                <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 0.5rem;">
+                    <h3 style="margin: 0; font-size: 0.95rem; color: var(--warning);">Debug · Accounts</h3>
+                    <div style="display: flex; gap: 0.5rem; flex-wrap: wrap;">
+                        <button type="button" class="btn btn-secondary" style="font-size: 0.72rem; padding: 0.3rem 0.55rem;" @click="refreshServerDebug()">Refresh server bundle</button>
+                        <button type="button" class="btn btn-secondary" style="font-size: 0.72rem; padding: 0.3rem 0.55rem;" @click="clearClientDebugLog()">Clear client log</button>
+                        <button type="button" class="btn btn-primary" style="font-size: 0.72rem; padding: 0.3rem 0.55rem;" @click="copyTabDebugReport('accounts')">Copy JSON</button>
+                    </div>
+                </div>
+                <p style="font-size: 0.72rem; color: var(--muted); margin: 0.5rem 0 0.5rem 0;">Activate / refresh / disconnect / reconnect flows log PocketBase and PHP actions here.</p>
+                <textarea readonly rows="16" :value="tab === 'accounts' ? tabDebugText('accounts') : ''" @focus="$el.select()"></textarea>
+            </div>
         </div>
 
         <!-- Activity: generated files log -->
@@ -3854,6 +3994,19 @@ if (!empty($_GET['privacy']) || strpos($reqUri, '/privacy') !== false) {
                 </table>
             </div>
             <p x-show="!contentLoading && !content.length" class="msg" style="margin-top: 1rem;">No generated content yet. Run a pipeline or add a link from the Curate tab.</p>
+
+            <div class="card ff-debug-panel" style="margin-top: 1.75rem;">
+                <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 0.5rem;">
+                    <h3 style="margin: 0; font-size: 0.95rem; color: var(--warning);">Debug · Activity</h3>
+                    <div style="display: flex; gap: 0.5rem; flex-wrap: wrap;">
+                        <button type="button" class="btn btn-secondary" style="font-size: 0.72rem; padding: 0.3rem 0.55rem;" @click="refreshServerDebug()">Refresh server bundle</button>
+                        <button type="button" class="btn btn-secondary" style="font-size: 0.72rem; padding: 0.3rem 0.55rem;" @click="clearClientDebugLog()">Clear client log</button>
+                        <button type="button" class="btn btn-primary" style="font-size: 0.72rem; padding: 0.3rem 0.55rem;" @click="copyTabDebugReport('activity')">Copy JSON</button>
+                    </div>
+                </div>
+                <p style="font-size: 0.72rem; color: var(--muted); margin: 0.5rem 0 0.5rem 0;">Content list reloads and related API calls are traced here.</p>
+                <textarea readonly rows="16" :value="tab === 'activity' ? tabDebugText('activity') : ''" @focus="$el.select()"></textarea>
+            </div>
         </div>
 
         <!-- Run pipeline -->
@@ -3917,6 +4070,8 @@ if (!empty($_GET['privacy']) || strpos($reqUri, '/privacy') !== false) {
                 runModal: { open: false, pipeline: null, extraPrompt: '' },
                 rejectModal: { open: false, target: null, reason: '' },
                 fetchDebugText: '',
+                uiDebugLog: [],
+                serverDebugBundle: null,
 
                 isFetchedMedia(c) {
                     if (!c) return false;
@@ -3971,7 +4126,259 @@ if (!empty($_GET['privacy']) || strpos($reqUri, '/privacy') !== false) {
                     return id ? ('Item · ' + id.slice(0, 8)) : 'Untitled';
                 },
 
+                _now() {
+                    return (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
+                },
+
+                pushDebug(kind, detail = {}) {
+                    const cap = 500;
+                    const row = { ts: new Date().toISOString(), tab: this.tab, kind, detail };
+                    this.uiDebugLog.push(row);
+                    if (this.uiDebugLog.length > cap) {
+                        this.uiDebugLog.splice(0, this.uiDebugLog.length - cap);
+                    }
+                },
+
+                clearClientDebugLog() {
+                    this.uiDebugLog = [];
+                    this.pushDebug('client_log_cleared', {});
+                },
+
+                cloneForDebug(obj, depth = 0) {
+                    if (depth > 10) return '[max depth]';
+                    if (obj === null || typeof obj !== 'object') {
+                        if (typeof obj === 'string' && obj.length > 4000) {
+                            return obj.slice(0, 4000) + '…(' + obj.length + ' chars)';
+                        }
+                        return obj;
+                    }
+                    if (Array.isArray(obj)) {
+                        if (obj.length > 100) {
+                            const head = obj.slice(0, 50).map(x => this.cloneForDebug(x, depth + 1));
+                            return head.concat([{ _omitted: (obj.length - 50) + ' more elements' }]);
+                        }
+                        return obj.map(x => this.cloneForDebug(x, depth + 1));
+                    }
+                    const out = {};
+                    let n = 0;
+                    for (const [k, v] of Object.entries(obj)) {
+                        if (n++ >= 100) {
+                            out._truncated_keys = true;
+                            break;
+                        }
+                        const lk = k.toLowerCase();
+                        if (/token|secret|password|authorization|cookie|access_token|fb_app_secret|replicate|garage_secret|openai|openrouter|fal_key|antfly_key/.test(lk)) {
+                            out[k] = '[redacted]';
+                            continue;
+                        }
+                        if (k === 'logs' && Array.isArray(v)) {
+                            const slice = v.slice(-60);
+                            out[k] = slice.map(x => this.cloneForDebug(x, depth + 1));
+                            if (v.length > 60) out._logs_total = v.length;
+                            continue;
+                        }
+                        out[k] = this.cloneForDebug(v, depth + 1);
+                    }
+                    return out;
+                },
+
+                async postToApp(fd) {
+                    const action = String(fd.get('action') || '');
+                    const fields = {};
+                    for (const [k, v] of fd.entries()) {
+                        const s = typeof v === 'string' ? v : String(v);
+                        const lk = k.toLowerCase();
+                        if (/password|token|secret|authorization|cookie|access_token/.test(lk)) {
+                            fields[k] = '[redacted]';
+                        } else {
+                            fields[k] = s.length > 6000 ? (s.slice(0, 6000) + '…(' + s.length + ' chars)') : s;
+                        }
+                    }
+                    this.pushDebug('app_post_start', { action, fields });
+                    const t0 = this._now();
+                    try {
+                        const r = await fetch(location.href, { method: 'POST', body: fd, credentials: 'same-origin' });
+                        const text = await r.text();
+                        let json = {};
+                        try {
+                            json = text ? JSON.parse(text) : {};
+                        } catch (e) {
+                            json = { _parseError: String(e), _rawPreview: text.slice(0, 5000), _rawLen: text.length };
+                        }
+                        this.pushDebug('app_post_done', {
+                            action,
+                            httpStatus: r.status,
+                            ok: r.ok,
+                            ms: Math.round(this._now() - t0),
+                            response: this.cloneForDebug(json),
+                        });
+                        return json;
+                    } catch (e) {
+                        this.pushDebug('app_post_error', { action, error: String(e) });
+                        throw e;
+                    }
+                },
+
+                async pbGet(pathSuffix, label) {
+                    const m = pathSuffix.match(/^\/api\/collections\/([^/]+)\/records(?:\?(.*))?$/);
+                    this.pushDebug('pb_get_start', { label, path: pathSuffix, via: 'php_proxy' });
+                    const t0 = this._now();
+                    try {
+                        if (!m) {
+                            this.pushDebug('pb_get_bad_path', { label, path: pathSuffix });
+                            throw new Error('Unsupported PocketBase path');
+                        }
+                        const fd = new FormData();
+                        fd.append('action', 'pb_proxy');
+                        fd.append('collection', m[1]);
+                        fd.append('http_method', 'GET');
+                        if (m[2]) fd.append('query', m[2]);
+                        const json = await this.postToApp(fd);
+                        const code = typeof json.pb_http_status === 'number' ? json.pb_http_status : 0;
+                        const d = (json.body && typeof json.body === 'object') ? json.body : {};
+                        const r = { status: code, ok: code >= 200 && code < 300 };
+                        const items = d.items;
+                        this.pushDebug('pb_get_done', {
+                            label,
+                            httpStatus: code,
+                            ok: r.ok && json.ok !== false,
+                            ms: Math.round(this._now() - t0),
+                            itemCount: Array.isArray(items) ? items.length : null,
+                            message: d.message || null,
+                            proxy: true,
+                        });
+                        return { r, d };
+                    } catch (e) {
+                        this.pushDebug('pb_get_error', { label, error: String(e) });
+                        throw e;
+                    }
+                },
+
+                async pbSend(method, pathSuffix, label, init = {}) {
+                    const m = pathSuffix.match(/^\/api\/collections\/([^/]+)\/records\/([^/?]+)$/);
+                    this.pushDebug('pb_send_start', { label, method, path: pathSuffix, via: 'php_proxy' });
+                    const t0 = this._now();
+                    try {
+                        if (!m || (method !== 'PATCH' && method !== 'DELETE')) {
+                            this.pushDebug('pb_send_bad_path', { label, method, path: pathSuffix });
+                            throw new Error('Unsupported PocketBase mutation');
+                        }
+                        const fd = new FormData();
+                        fd.append('action', 'pb_proxy');
+                        fd.append('collection', m[1]);
+                        fd.append('http_method', method);
+                        fd.append('record_id', m[2]);
+                        if (method === 'PATCH' && init.body !== undefined && init.body !== null) {
+                            fd.append('json_body', typeof init.body === 'string' ? init.body : JSON.stringify(init.body));
+                        }
+                        const json = await this.postToApp(fd);
+                        const code = typeof json.pb_http_status === 'number' ? json.pb_http_status : 0;
+                        const d = (json.body && typeof json.body === 'object') ? json.body : {};
+                        const r = { status: code, ok: code >= 200 && code < 300 };
+                        this.pushDebug('pb_send_done', {
+                            label,
+                            method,
+                            httpStatus: code,
+                            ok: r.ok && json.ok !== false,
+                            ms: Math.round(this._now() - t0),
+                            response: this.cloneForDebug(d),
+                            proxy: true,
+                        });
+                        return { r, d };
+                    } catch (e) {
+                        this.pushDebug('pb_send_error', { label, method, error: String(e) });
+                        throw e;
+                    }
+                },
+
+                uiStateSnapshot() {
+                    return {
+                        tab: this.tab,
+                        linksCount: this.links.length,
+                        contentCount: this.content.length,
+                        accountsCount: this.accounts.length,
+                        pipelinesCount: this.pipelines.length,
+                        pbAuthPresent: !!this.pbToken(),
+                        userEmail: this.userEmail || null,
+                        msg: this.msg || '',
+                        msgError: !!this.msgError,
+                        contentLoading: !!this.contentLoading,
+                        pipelinesLoading: !!this.pipelinesLoading,
+                        addingLink: !!this.addingLink,
+                        publishing: !!this.publishing,
+                        generating: !!this.generating,
+                        fetchDebugBytes: (this.fetchDebugText || '').length,
+                        viewport: (typeof window !== 'undefined') ? { w: window.innerWidth, h: window.innerHeight } : null,
+                        href: (typeof location !== 'undefined') ? location.href : null,
+                    };
+                },
+
+                tabDebugReport(tabId) {
+                    const forTab = this.uiDebugLog.filter(e => e.tab === tabId);
+                    const tailAll = this.uiDebugLog.slice(-180);
+                    return {
+                        formatforge_ui_debug: '1',
+                        reportTab: tabId,
+                        exportedAt: new Date().toISOString(),
+                        client: {
+                            eventsWhileOnThisTab: forTab,
+                            recentEventsAllTabs: tailAll,
+                            totalClientEvents: this.uiDebugLog.length,
+                        },
+                        serverBundle: this.serverDebugBundle || { note: 'Click “Refresh server bundle” on any tab to load PHP session logs + public config.' },
+                        uiSnapshot: this.uiStateSnapshot(),
+                    };
+                },
+
+                tabDebugText(tabId) {
+                    try {
+                        return JSON.stringify(this.tabDebugReport(tabId), null, 2);
+                    } catch (e) {
+                        return String(e);
+                    }
+                },
+
+                async refreshServerDebug() {
+                    const fd = new FormData();
+                    fd.append('action', 'ui_debug_bundle');
+                    try {
+                        const d = await this.postToApp(fd);
+                        if (d && d.ok) {
+                            this.serverDebugBundle = d;
+                            this.msg = 'Server debug bundle refreshed.';
+                            this.msgError = false;
+                        } else {
+                            this.serverDebugBundle = { ok: false, error: (d && d.error) ? d.error : 'bundle_failed', response: this.cloneForDebug(d || {}) };
+                            this.msg = 'Server debug bundle failed.';
+                            this.msgError = true;
+                        }
+                    } catch (e) {
+                        this.serverDebugBundle = { ok: false, error: String(e) };
+                        this.msg = 'Server debug request failed.';
+                        this.msgError = true;
+                    }
+                },
+
+                copyTabDebugReport(tabId) {
+                    const text = this.tabDebugText(tabId);
+                    if (navigator.clipboard && navigator.clipboard.writeText) {
+                        navigator.clipboard.writeText(text).then(() => {
+                            this.msg = 'Debug JSON copied (' + tabId + ').';
+                            this.msgError = false;
+                        }).catch(() => {});
+                    }
+                },
+
                 init() {
+                    this.pushDebug('session_boot', {
+                        initialTab: this.tab,
+                        href: typeof location !== 'undefined' ? location.href : '',
+                        pbPublic: this.PB_URL,
+                        userAgent: typeof navigator !== 'undefined' ? navigator.userAgent : '',
+                    });
+                    if (typeof this.$watch === 'function') {
+                        this.$watch('tab', (v, prev) => this.pushDebug('tab_change', { from: prev, to: v }));
+                    }
                     if (this.tab === 'curate') { this.loadLinks(); this.loadContent(); this.loadAccounts(); }
                     if (this.tab === 'pipelines') { this.loadPipelines(); this.loadAccounts(); }
                     if (this.tab === 'accounts') this.loadAccounts();
@@ -4029,10 +4436,7 @@ if (!empty($_GET['privacy']) || strpos($reqUri, '/privacy') !== false) {
 
                 async loadLinks() {
                     try {
-                        const r = await fetch(this.PB_URL + '/api/collections/source_links/records?sort=-created', {
-                            headers: this.pbHeaders()
-                        });
-                        const d = await r.json();
+                        const { d } = await this.pbGet('/api/collections/source_links/records?sort=-created', 'loadLinks');
                         this.links = (d.items || []).map(l => ({ ...l, fetching: false }));
                     } catch (e) { this.links = []; }
                 },
@@ -4053,12 +4457,12 @@ if (!empty($_GET['privacy']) || strpos($reqUri, '/privacy') !== false) {
                     l.fetching = true;
                     this.msg = '';
                     this.fetchDebugText = '';
+                    this.pushDebug('fetch_link_click', { link_id: l.id, url: (l.url || '').slice(0, 500) });
                     const fd = new FormData();
                     fd.append('action', 'fetch_link');
                     fd.append('link_id', l.id);
                     try {
-                        const r = await fetch(location.href, { method: 'POST', body: fd });
-                        const d = await r.json();
+                        const d = await this.postToApp(fd);
                         if (d.ok) {
                             this.msg = `Fetched ${d.created} file(s)${d.via ? ' via ' + d.via : ''}.`;
                             this.fetchDebugText = '';
@@ -4082,13 +4486,13 @@ if (!empty($_GET['privacy']) || strpos($reqUri, '/privacy') !== false) {
                     if (!this.linkUrl.trim()) return;
                     this.addingLink = true;
                     this.msg = '';
+                    this.pushDebug('add_link_click', { url: this.linkUrl.trim().slice(0, 500), account_id: this.linkAccountId || null });
                     const fd = new FormData();
                     fd.append('action', 'add_link');
                     fd.append('url', this.linkUrl.trim());
                     if (this.linkAccountId) fd.append('account_id', this.linkAccountId);
                     try {
-                        const r = await fetch(location.href, { method: 'POST', body: fd });
-                        const d = await r.json();
+                        const d = await this.postToApp(fd);
                         if (d.ok) {
                             this.msg = 'Link added.';
                             this.linkUrl = '';
@@ -4107,22 +4511,18 @@ if (!empty($_GET['privacy']) || strpos($reqUri, '/privacy') !== false) {
 
                 async loadContent() {
                     this.contentLoading = true;
+                    this.pushDebug('load_content_start', {});
                     try {
-                        const r = await fetch(this.PB_URL + '/api/collections/content_items/records?sort=-created', {
-                            headers: this.pbHeaders()
-                        });
-                        const d = await r.json();
+                        const { d } = await this.pbGet('/api/collections/content_items/records?sort=-created', 'loadContent');
                         this.content = (d.items || []).map(c => ({ ...c, selectedAccount: c.instagram_account_id || '' }));
                     } catch (e) { this.msg = ''; this.msgError = false; }
                     finally { this.contentLoading = false; }
                 },
 
                 async loadAccounts() {
+                    this.pushDebug('load_accounts_start', {});
                     try {
-                        const r = await fetch(this.PB_URL + '/api/collections/instagram_accounts/records?sort=-created', {
-                            headers: this.pbHeaders()
-                        });
-                        const d = await r.json();
+                        const { d } = await this.pbGet('/api/collections/instagram_accounts/records?sort=-created', 'loadAccounts');
                         this.accounts = (d.items || []).map(a => this.normalizeAccount(a));
                         const stale = this.accounts.find(a => this.shouldShowRefresh(a));
                         if (stale) this.refreshUsername(stale, { silent: true });
@@ -4140,9 +4540,8 @@ if (!empty($_GET['privacy']) || strpos($reqUri, '/privacy') !== false) {
                     this.msg = '';
                     this.msgError = false;
                     try {
-                        const r = await fetch(this.PB_URL + '/api/collections/instagram_accounts/records/' + a.id, {
-                            method: 'PATCH',
-                            headers: this.pbHeaders({ 'Content-Type': 'application/json' }),
+                        const { r, d } = await this.pbSend('PATCH', '/api/collections/instagram_accounts/records/' + a.id, 'activateAccount', {
+                            headers: { 'Content-Type': 'application/json' },
                             body: JSON.stringify({ is_active: true })
                         });
                         if (r.status >= 200 && r.status < 300) {
@@ -4150,7 +4549,6 @@ if (!empty($_GET['privacy']) || strpos($reqUri, '/privacy') !== false) {
                             this.msg = 'Account activated.';
                             this.msgError = false;
                         } else {
-                            const d = await r.json().catch(() => ({}));
                             this.msg = d.message || d.error || 'Failed to activate';
                             this.msgError = true;
                         }
@@ -4177,8 +4575,7 @@ if (!empty($_GET['privacy']) || strpos($reqUri, '/privacy') !== false) {
                         const fd = new FormData();
                         fd.append('action', 'refresh_instagram_username');
                         fd.append('account_id', a.id);
-                        const r = await fetch(location.href, { method: 'POST', body: fd, credentials: 'same-origin' });
-                        const d = await r.json();
+                        const d = await this.postToApp(fd);
                         if (d.ok && d.username) {
                             a.username = this.normalizeUsername(d.username, a.instagram_user_id || '');
                             a.is_active = true;
@@ -4208,10 +4605,7 @@ if (!empty($_GET['privacy']) || strpos($reqUri, '/privacy') !== false) {
                     this.disconnectingId = a.id;
                     this.msgError = false;
                     try {
-                        const r = await fetch(this.PB_URL + '/api/collections/instagram_accounts/records/' + a.id, {
-                            method: 'DELETE',
-                            headers: this.pbHeaders()
-                        });
+                        const { r, d } = await this.pbSend('DELETE', '/api/collections/instagram_accounts/records/' + a.id, 'disconnectAccount');
                         if (r.status >= 200 && r.status < 300) {
                             this.accounts = this.accounts.filter(x => x.id !== a.id);
                             if (this.linkAccountId === a.id) this.linkAccountId = '';
@@ -4219,7 +4613,6 @@ if (!empty($_GET['privacy']) || strpos($reqUri, '/privacy') !== false) {
                             this.msg = 'Account disconnected.';
                             this.msgError = false;
                         } else {
-                            const d = await r.json().catch(() => ({}));
                             this.msg = d.message || d.error || 'Failed to disconnect';
                             this.msgError = true;
                         }
@@ -4238,10 +4631,7 @@ if (!empty($_GET['privacy']) || strpos($reqUri, '/privacy') !== false) {
                     this.msg = '';
                     this.msgError = false;
                     try {
-                        const r = await fetch(this.PB_URL + '/api/collections/instagram_accounts/records/' + a.id, {
-                            method: 'DELETE',
-                            headers: this.pbHeaders()
-                        });
+                        const { r, d } = await this.pbSend('DELETE', '/api/collections/instagram_accounts/records/' + a.id, 'reconnectAccount_delete');
                         if (r.status >= 200 && r.status < 300) {
                             this.accounts = this.accounts.filter(x => x.id !== a.id);
                             if (this.linkAccountId === a.id) this.linkAccountId = '';
@@ -4249,7 +4639,6 @@ if (!empty($_GET['privacy']) || strpos($reqUri, '/privacy') !== false) {
                             window.location.href = '?instagram_oauth=1';
                             return;
                         }
-                        const d = await r.json().catch(() => ({}));
                         this.msg = d.message || d.error || 'Failed to reconnect';
                         this.msgError = true;
                     } catch (e) {
@@ -4262,14 +4651,19 @@ if (!empty($_GET['privacy']) || strpos($reqUri, '/privacy') !== false) {
 
                 async approveContent(c) {
                     if (!c.selectedAccount) return;
+                    this.pushDebug('approve_content', { content_id: c.id, account_id: c.selectedAccount });
                     const fd = new FormData();
                     fd.append('action', 'approve_content');
                     fd.append('id', c.id);
                     fd.append('account_id', c.selectedAccount);
-                    const r = await fetch(location.href, { method: 'POST', body: fd });
-                    const d = await r.json();
-                    if (d.ok) { c.status = 'approved'; this.msg = 'Approved.'; }
-                    else { this.msg = d.error || 'Failed'; this.msgError = true; }
+                    try {
+                        const d = await this.postToApp(fd);
+                        if (d.ok) { c.status = 'approved'; this.msg = 'Approved.'; }
+                        else { this.msg = d.error || 'Failed'; this.msgError = true; }
+                    } catch (e) {
+                        this.msg = 'Request failed';
+                        this.msgError = true;
+                    }
                 },
 
                 openRejectContent(c) {
@@ -4287,8 +4681,8 @@ if (!empty($_GET['privacy']) || strpos($reqUri, '/privacy') !== false) {
                     fd.append('id', c.id);
                     fd.append('reason', reason);
                     try {
-                        const r = await fetch(location.href, { method: 'POST', body: fd });
-                        const d = await r.json();
+                        this.pushDebug('reject_content', { content_id: c.id, reason_len: reason.length });
+                        const d = await this.postToApp(fd);
                         if (d.ok) {
                             c.status = 'rejected';
                             this.msg = 'Rejected.';
@@ -4308,13 +4702,13 @@ if (!empty($_GET['privacy']) || strpos($reqUri, '/privacy') !== false) {
                 async publishContent(c) {
                     if (!c.selectedAccount) return;
                     this.publishing = true;
+                    this.pushDebug('publish_content', { content_id: c.id, account_id: c.selectedAccount });
                     const fd = new FormData();
                     fd.append('action', 'publish_content');
                     fd.append('id', c.id);
                     fd.append('account_id', c.selectedAccount);
                     try {
-                        const r = await fetch(location.href, { method: 'POST', body: fd });
-                        const d = await r.json();
+                        const d = await this.postToApp(fd);
                         if (d.ok) { c.status = 'published'; this.msg = 'Published to Instagram!'; this.loadContent(); }
                         else { this.msg = d.error || 'Publish failed'; this.msgError = true; }
                     } finally { this.publishing = false; }
@@ -4322,11 +4716,9 @@ if (!empty($_GET['privacy']) || strpos($reqUri, '/privacy') !== false) {
 
                 async loadPipelines() {
                     this.pipelinesLoading = true;
+                    this.pushDebug('load_pipelines_start', {});
                     try {
-                        const r = await fetch(this.PB_URL + '/api/collections/pipelines/records?sort=name', {
-                            headers: this.pbHeaders()
-                        });
-                        const d = await r.json();
+                        const { d } = await this.pbGet('/api/collections/pipelines/records?sort=name', 'loadPipelines');
                         this.pipelines = (d.items || []).map(p => ({
                             ...p,
                             is_active: p.is_active !== false,
@@ -4369,14 +4761,14 @@ if (!empty($_GET['privacy']) || strpos($reqUri, '/privacy') !== false) {
                     this.generating = true;
                     this.msg = '';
                     this.msgError = false;
+                    this.pushDebug('generate_content', { pipeline_id: pipelineId || null, prompt_len: (userPrompt || '').length });
                     const fd = new FormData();
                     fd.append('action', 'generate_content');
                     fd.append('pipeline_id', pipelineId || '');
                     fd.append('prompt', userPrompt || '');
                     fd.append('type', 'reel');
                     try {
-                        const r = await fetch(location.href, { method: 'POST', body: fd });
-                        const d = await r.json();
+                        const d = await this.postToApp(fd);
                         if (d.ok) {
                             this.msg = 'Generation started. Open Curate to review the new item.';
                             setTimeout(() => this.loadContent(), 3000);
