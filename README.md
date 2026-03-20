@@ -54,6 +54,8 @@ Single-file PHP dashboard for AI content generation, curation, and Instagram pub
 - **gallery-dl / yt-dlp** — Install on the server (e.g. `pip install --user gallery-dl yt-dlp`) and set **`GALLERY_DL_PATH`** / **`YT_DLP_PATH`** in `.env` if they are not on `PATH`. For **Instagram**, add Netscape cookies as **`storage/cookies/instagram_cookies.txt`** or **`storage/cookies/cookies.txt`** (see `storage/cookies/README.md`).
 - **Direct URLs** — `.png`, `.jpg`, `.mp4`, etc. (e.g. Garage/S3) use HTTP from the app server first
 
+**Upgrade (old `.pi/`):** If you already have data under **`.pi/triggers`** or **`.pi/prompts`**, move it to **`.cursor-pipeline/triggers`** and **`.cursor-pipeline/prompts`**, or set **`PI_TRIGGER_DIR`** / **`CURSOR_PIPELINE_TRIGGER_DIR`** to your old path until you migrate.
+
 ## Autonomous pipeline triggers (Cursor Agent CLI)
 
 After **Fetch**, if Antfly reports the item as **novel** vs synced **`pipeline_refs`** (semantic distance above **`NOVEL_DISTANCE_THRESHOLD`**), or there are **no active pipelines**, **PHP** (same request as the Curate POST) queues Cursor to **create** a pipeline. After **three consecutive rejects** for the same `metadata.pipeline_id`, **PHP** queues Cursor to **edit** that pipeline. No separate scheduler is required for this kick-off.
@@ -66,8 +68,10 @@ After **Fetch**, if Antfly reports the item as **novel** vs synced **`pipeline_r
 3. Spawns **`agent`** in the background ([Cursor CLI](https://cursor.com/cli)) with **`-p`**, **`--trust`**, **`-f`**, **`--model composer-2-fast`** by default ([Composer 2 / Cursor 2.0](https://cursor.com/blog/2-0))
 
 **Setup:**
-1. Install CLI: [cursor.com/install](https://cursor.com/install) — `agent` on `PATH` (or set `CURSOR_AGENT_BIN`)
-2. **Auth:** `agent login` on the server is enough (no `CURSOR_API_KEY` required). Log in as the **same OS user that runs PHP-FPM** (often `www-data`), e.g. `sudo -u www-data agent login`. Optional: set `CURSOR_API_KEY` in `.env` instead for headless-only setups.
+1. Install CLI: [cursor.com/install](https://cursor.com/install). Put **`agent`** somewhere **`www-data` can execute** — usually **`/usr/local/bin`** (see below). In **`.env`**, set **`CURSOR_AGENT_BIN=/usr/local/bin/agent`** (or the real path) so PHP does not depend on aLogin user’s `PATH`.
+2. **Auth:** `agent login` is enough (no `CURSOR_API_KEY` required). Run login **as `www-data`**, with an explicit binary path, e.g. `sudo -u www-data /usr/local/bin/agent login`. Optional: **`CURSOR_API_KEY`** in `.env` for non-interactive setups.
+
+**`sudo: agent: command not found`:** `sudo -u www-data` uses a **short `PATH`** and often **cannot see** `agent` in your home directory. As your deploy user, find the binary: `command -v agent` or `ls ~/.local/bin/agent ~/.cursor/**/agent 2>/dev/null`. Then install for everyone, e.g. `sudo cp "$(command -v agent)" /usr/local/bin/agent && sudo chmod 755 /usr/local/bin/agent`, and log in: `sudo -u www-data /usr/local/bin/agent login`. If the binary stays under **`/home/you/`**, either **`chmod o+x /home/you`** so `www-data` can traverse and execute (less ideal) or always **`CURSOR_AGENT_BIN=/absolute/path`** and ensure that path is world-executable.
 3. **`CURSOR_PIPELINE_TRIGGER_DIR`** in `.env` if you want a non-default path (default: **`.cursor-pipeline/triggers`**; legacy **`PI_TRIGGER_DIR`** still works)
 4. **`ANTFLY_URL`** + run `./scripts/init-antfly.sh` (tables **`content`** + **`pipeline_refs`**). Antfly needs OpenRouter for the table embedder (`EMBED_MODEL`, API key in Antfly env or embedder JSON). PHP **`OPENROUTER_API_KEY`** is still used for `embed_text()` in **`php index.php test-embed`** only.
 5. Optional: `CURSOR_AGENT_MODEL`, `CURSOR_AGENT_ENABLED=0` to disable auto-spawn
