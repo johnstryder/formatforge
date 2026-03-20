@@ -23,7 +23,7 @@ go build -o pipeline-generate .
 | `PROMPT` | no | Default video prompt |
 | `PROMPT_TEMPLATE` | no | Template with `{{.SourceURL}}`, `{{.SourceTitle}}` |
 
-\* At least one of REPLICATE_API_TOKEN or FAL_KEY must be set. Pi coding agents can choose which provider each pipeline uses.
+\* At least one of REPLICATE_API_TOKEN or FAL_KEY must be set. Cursor (or whoever authors the pipeline) can choose which provider each pipeline uses.
 
 ## Cron
 

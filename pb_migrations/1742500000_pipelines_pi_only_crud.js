@@ -1,4 +1,4 @@
-/// Pipelines are listed and run by dashboard users; only superusers (e.g. Pi via admin API) may create/update/delete.
+/// Pipelines are listed and run by dashboard users; only superusers (Cursor / admin API) may create/update/delete.
 migrate((db) => {
   const dao = new Dao(db)
   let col

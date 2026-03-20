@@ -89,9 +89,11 @@ cd pipelines/pipeline-<id> && go build -o pipeline-generate .
 # Cron: 0 */6 * * * cd /path/to/pipelines/pipeline-<id> && set -a && . .env && set +a && ./pipeline-generate
 ```
 
-## pi-autoresearch
+## Optional: A/B experimentation (pi-autoresearch)
 
-For the experimentation loop (A/B testing, winning templates), use [pi-autoresearch](https://github.com/davebcn87/pi-autoresearch):
+**Pipeline authoring** in this repo is **Cursor** (CLI `agent` + IDE) and PocketBase admin — not Pi as the primary agent.
+
+For an **optional** experimentation loop (A/B tests, winning templates) you can still use the separate tool [pi-autoresearch](https://github.com/davebcn87/pi-autoresearch):
 
 ```bash
 pi install https://github.com/davebcn87/pi-autoresearch

@@ -140,7 +140,7 @@ $CONFIG = [
     'pocketbase_public_url' => $pbPublicUrl,
     'site_url'         => $siteUrl,
     'site_name'        => getenv('SITE_NAME') ?: 'FormatForge',
-    'app_version'      => getenv('APP_VERSION') ?: 'v1.0.52',
+    'app_version'      => getenv('APP_VERSION') ?: 'v1.0.53',
     'users_collection' => 'users',
     'garage_endpoint'  => getenv('GARAGE_ENDPOINT') ?: 'http://127.0.0.1:3900',
     'garage_key'       => getenv('GARAGE_ACCESS_KEY') ?: '',
@@ -3174,12 +3174,12 @@ if (!empty($_GET['privacy']) || strpos($reqUri, '/privacy') !== false) {
             </div>
         </div>
 
-        <!-- Pipelines (records are created by the Pi agent via PocketBase admin API; users only list & run) -->
+        <!-- Pipelines (records are created by Cursor or PocketBase superuser via admin API; dashboard users list & run) -->
         <div x-show="tab === 'pipelines'" x-transition>
             <div style="display: flex; justify-content: space-between; align-items: flex-start; flex-wrap: wrap; gap: 1rem; margin-bottom: 1rem;">
                 <div>
                     <h2 style="margin-bottom: 0.35rem;">Pipelines</h2>
-                    <p style="color: var(--muted); font-size: 0.9rem; max-width: 42rem;">Pipelines are defined by the <strong style="color: var(--text);">Pi coding agent</strong> (PocketBase admin). You can run one here: optional extra instructions are merged with the saved template for video generation.</p>
+                    <p style="color: var(--muted); font-size: 0.9rem; max-width: 42rem;">Pipelines are created with <strong style="color: var(--text);">Cursor</strong> (CLI <code style="font-size:0.85em;">agent</code> / IDE) or PocketBase <strong style="color: var(--text);">superuser</strong> on the <code style="font-size:0.85em;">pipelines</code> collection. Here you only <strong style="color: var(--text);">run</strong> them: optional extra instructions merge with the saved template for video generation.</p>
                 </div>
                 <button type="button" class="btn btn-secondary" @click="loadPipelines()">Refresh</button>
             </div>
@@ -3271,7 +3271,7 @@ if (!empty($_GET['privacy']) || strpos($reqUri, '/privacy') !== false) {
             <div class="modal-panel" role="dialog" aria-modal="true" aria-labelledby="run-pipeline-title" @click.stop>
                 <h3 id="run-pipeline-title">Run pipeline</h3>
                 <p style="font-size: 0.9rem; color: var(--accent); margin-bottom: 0.5rem;" x-text="runModal.pipeline ? pipelineLabel(runModal.pipeline) : ''"></p>
-                <p style="font-size: 0.8rem; color: var(--muted); margin-bottom: 0.5rem;">Template (from Pi / admin)</p>
+                <p style="font-size: 0.8rem; color: var(--muted); margin-bottom: 0.5rem;">Template (from Cursor / PocketBase admin)</p>
                 <div class="pipeline-preview" x-text="runModal.pipeline && (runModal.pipeline.prompt_template || '').trim() ? runModal.pipeline.prompt_template : '(no template yet — add extra instructions below, or have Cursor agent set it via PocketBase)'"></div>
                 <div class="form-group">
                     <label for="run-extra-prompt">Extra instructions (optional)</label>
