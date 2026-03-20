@@ -140,7 +140,7 @@ $CONFIG = [
     'pocketbase_public_url' => $pbPublicUrl,
     'site_url'         => $siteUrl,
     'site_name'        => getenv('SITE_NAME') ?: 'FormatForge',
-    'app_version'      => getenv('APP_VERSION') ?: 'v1.0.50',
+    'app_version'      => getenv('APP_VERSION') ?: 'v1.0.51',
     'users_collection' => 'users',
     'garage_endpoint'  => getenv('GARAGE_ENDPOINT') ?: 'http://127.0.0.1:3900',
     'garage_key'       => getenv('GARAGE_ACCESS_KEY') ?: '',
@@ -223,11 +223,6 @@ function ff_debug_logs_get(): array {
 
 function ff_debug_logs_clear(): void {
     $_SESSION['ff_debug_logs'] = [];
-}
-
-/** One-shot debug payload for the Instagram Accounts tab after OAuth redirect (no secrets). */
-function ff_instagram_connect_audit_flash(array $payload): void {
-    $_SESSION['ff_instagram_connect_audit'] = array_merge(['at' => date('c')], $payload);
 }
 
 function pb_superuser_auth_token(): array {
@@ -1913,12 +1908,6 @@ $user = $_SESSION['pb_user'] ?? null;
 $token = $_SESSION['pb_token'] ?? null;
 $authHeader = $token ?: null;
 
-$instagramConnectAuditForView = null;
-if ($user && (($_GET['tab'] ?? '') === 'accounts') && isset($_SESSION['ff_instagram_connect_audit']) && is_array($_SESSION['ff_instagram_connect_audit'])) {
-    $instagramConnectAuditForView = $_SESSION['ff_instagram_connect_audit'];
-    unset($_SESSION['ff_instagram_connect_audit']);
-}
-
 // Meta/Facebook webhook verification (must respond to GET with hub.challenge)
 $hubMode = $_GET['hub_mode'] ?? $_GET['hub.mode'] ?? '';
 $hubVerify = $_GET['hub_verify_token'] ?? $_GET['hub.verify_token'] ?? '';
@@ -1971,11 +1960,6 @@ if ($isInstagramCallback && $user && !empty($_GET['error'])) {
         'error_reason' => $_GET['error_reason'] ?? null,
         'error_description' => $_GET['error_description'] ?? null,
     ]);
-    ff_instagram_connect_audit_flash([
-        'stage' => 'oauth_cancelled',
-        'error' => $_GET['error'] ?? null,
-        'error_description' => $_GET['error_description'] ?? null,
-    ]);
     header('Location: ' . $baseUrl . '?tab=accounts&msg=' . rawurlencode('Instagram connection was cancelled.') . '&msgError=1');
     exit;
 }
@@ -2003,7 +1987,6 @@ if ($isInstagramCallback && isset($_GET['code']) && $user) {
             'expected_user_id' => $expectedState['user_id'] ?? null,
             'expected_nonce_present' => !empty($expectedState['nonce']),
         ]);
-        ff_instagram_connect_audit_flash(['stage' => 'oauth_state_invalid']);
         header('Location: ' . $baseUrl . '?tab=accounts&msg=' . rawurlencode('Instagram connection failed: invalid OAuth state. Please try again.') . '&msgError=1');
         exit;
     }
@@ -2029,10 +2012,6 @@ if ($isInstagramCallback && isset($_GET['code']) && $user) {
         ff_debug_log('facebook_token_exchange_failed', [
             'error' => $data['error'] ?? $data,
         ]);
-        ff_instagram_connect_audit_flash([
-            'stage' => 'facebook_token_exchange_failed',
-            'message' => $err,
-        ]);
         header('Location: ' . $baseUrl . '?tab=accounts&msg=' . rawurlencode('Instagram connection failed: ' . $err) . '&msgError=1');
         exit;
     }
@@ -2048,11 +2027,6 @@ if ($isInstagramCallback && isset($_GET['code']) && $user) {
         ff_debug_log('facebook_pages_lookup_failed', [
             'error' => $accounts['error'] ?? null,
             'response_preview' => substr($r2 ?: '', 0, 300),
-        ]);
-        $pgErr = $accounts['error']['message'] ?? json_encode($accounts['error'] ?? []);
-        ff_instagram_connect_audit_flash([
-            'stage' => 'facebook_pages_lookup_failed',
-            'message' => $pgErr,
         ]);
         header('Location: ' . $baseUrl . '?tab=accounts&msg=' . rawurlencode('Facebook Pages lookup failed: ' . $accounts['error']['message']) . '&msgError=1');
         exit;
@@ -2264,16 +2238,6 @@ if ($isInstagramCallback && isset($_GET['code']) && $user) {
     } elseif (!empty($pages)) {
         $outcome = 'pages_but_no_usable_ig';
     }
-    ff_instagram_connect_audit_flash([
-        'stage' => 'pages_scan_complete',
-        'outcome' => $outcome,
-        'saved_to_pocketbase' => $saved,
-        'facebook_pages_total' => count($pages),
-        'graph_rows_reporting_ig_linked' => $graphIgRowCount,
-        'per_page' => $pagesAudit,
-        'schema_issue' => $schemaIssue,
-    ]);
-
     if ($schemaIssue) {
         header('Location: ' . $baseUrl . '?tab=accounts&msg=' . rawurlencode($schemaIssue) . '&msgError=1');
     } elseif ($saved > 0) {
@@ -3206,13 +3170,6 @@ if (!empty($_GET['privacy']) || strpos($reqUri, '/privacy') !== false) {
         <div x-show="tab === 'accounts'" x-transition>
             <h2>Instagram Accounts</h2>
             <p style="margin-bottom: 1rem; color: var(--muted);">Connect multiple Instagram Business/Creator accounts to publish content.</p>
-            <?php if (!empty($instagramConnectAuditForView)): ?>
-            <details class="card" style="margin-bottom: 1.25rem;" open>
-                <summary style="cursor: pointer; font-weight: 600; color: var(--muted);">Last Instagram connect — API debug</summary>
-                <p style="font-size: 0.8rem; color: var(--muted); margin: 0.75rem 0 0.5rem;">What Meta returned for your Facebook login (page IDs, whether <code style="font-size:0.85em;">instagram_business_account</code> was present). No access tokens.</p>
-                <pre style="margin: 0; padding: 0.75rem; background: var(--surface2); border-radius: 8px; font-size: 0.72rem; overflow-x: auto; white-space: pre-wrap; word-break: break-word; border: 1px solid var(--border);"><?= htmlspecialchars(json_encode($instagramConnectAuditForView, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES), ENT_QUOTES, 'UTF-8') ?></pre>
-            </details>
-            <?php endif; ?>
             <a :href="'?instagram_oauth=1'" class="btn btn-primary" style="margin-bottom: 1.5rem; display: inline-block;" x-text="accounts.length ? 'Connect another account' : 'Connect Instagram Account'"></a>
             <div class="content-grid" x-show="accounts.length">
                 <template x-for="a in accounts" :key="a.id">
