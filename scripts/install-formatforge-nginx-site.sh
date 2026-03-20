@@ -21,6 +21,17 @@ echo "Repo: $ROOT"
 mkdir -p /var/www
 ln -sfn "$ROOT" /var/www/formatforge
 
+if id www-data >/dev/null 2>&1; then
+  if sudo -u www-data test -r "$ROOT/index.php"; then
+    echo "OK: www-data can read $ROOT/index.php (symlink + directory permissions)."
+  else
+    echo "!!! www-data CANNOT read $ROOT/index.php — PHP-FPM often returns: File not found." >&2
+    echo "    Repo under \$HOME? Allow traverse for \"others\" on each path segment, e.g.:" >&2
+    echo "    sudo chmod o+x \"$(dirname "$ROOT")\"   # e.g. /home/jhs" >&2
+    echo "    sudo chmod o+x /home   # only if /home is not world-executable" >&2
+  fi
+fi
+
 rm -f /etc/nginx/sites-enabled/default
 cp -a "$SRC" "$AVAIL"   # one cp, explicit dest — do not break this across shell lines
 ln -sfn "$AVAIL" "$ENAB"

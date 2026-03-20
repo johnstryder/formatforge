@@ -125,7 +125,14 @@ This symlinks the clone to **`/var/www/formatforge`**, copies **`nginx/formatfor
 
 If **`curl` to `127.0.0.1:80` fails** / `ss` shows no `:80` listener, nginx is stopped or crashed: `sudo systemctl status nginx` and `sudo journalctl -u nginx -n 40 --no-pager`.
 
-**`curl: (2) no URL specified`:** the URL was split onto the next line. Keep the whole command on **one** line, e.g. `curl -sS -w '%{http_code}\n' -H 'Host: formatforgeplus.com' http://127.0.0.1/` — or rely on **`install-formatforge-nginx-site.sh`**, which runs a verification `curl` at the end.
+**`curl: (2) no URL specified`:** the URL or `-H` value was split across lines (your terminal may also wrap **`formatforgeplus.com`** in the middle — the shell then sees two broken tokens). Use a short helper: **`./scripts/curl-local-formatforge.sh`** (no long line to paste), or type the URL on the **same line** as `curl`.
+
+**PHP-FPM responds with `File not found.`** (plain text): nginx reached PHP, but **`www-data` cannot read `index.php`** through `/var/www/formatforge` when the real tree lives under **`/home/you/...`** and your home dir is **`700`/`750`**. Fix traverse bits, then reload nginx if needed:
+
+```bash
+sudo chmod o+x /home/youruser
+sudo -u www-data test -r /var/www/formatforge/index.php && echo OK
+```
 
 ### You see Apache’s “It works!” default page instead of FormatForge
 
