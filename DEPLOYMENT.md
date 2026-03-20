@@ -131,9 +131,35 @@ sudo systemctl enable --now nginx
 
 Then install your FormatForge site config (below), run `sudo nginx -t && sudo systemctl reload nginx`, and try again. If you must keep Apache for something else, move it off 80/443 and leave those ports for nginx.
 
+### Apache is gone but you still see a “default” welcome page
+
+Usually **nginx is running** and still serving **`/var/www/html`** from the **stock `default` site**:
+
+- You open the site **by IP** or a hostname that does **not** match `server_name` in `formatforgeplus.conf` → nginx uses the **`default_server`** for port 80, which is often **`/etc/nginx/sites-enabled/default`**.
+- Or **`formatforgeplus`** was never symlinked into **`sites-enabled/`**.
+
+**Fix**
+
+```bash
+sudo rm -f /etc/nginx/sites-enabled/default
+sudo cp /var/www/formatforge/nginx/formatforgeplus.conf /etc/nginx/sites-available/formatforgeplus
+sudo ln -sf /etc/nginx/sites-available/formatforgeplus /etc/nginx/sites-enabled/formatforgeplus
+sudo nginx -t && sudo systemctl reload nginx
+```
+
+Browse with your real domain (same as `server_name` in that file), or temporarily add `default_server` to the first `listen` lines in `formatforgeplus.conf` if you must test by IP.
+
+**Still see the old Apache wording?** That is almost always **CDN or browser cache** (or DNS pointing at a **different** host). Try an incognito window, pause Cloudflare proxy (grey cloud) to bypass cache, and run on the box:
+
+```bash
+cd /path/to/formatforge && ./scripts/diagnose-web-front.sh formatforgeplus.com
+```
+
+If you have not yet installed the site config (same commands as **Fix** above):
+
 ```bash
 sudo cp /var/www/formatforge/nginx/formatforgeplus.conf /etc/nginx/sites-available/formatforgeplus
-sudo ln -sf /etc/nginx/sites-available/formatforgeplus /etc/nginx/sites-enabled/
+sudo ln -sf /etc/nginx/sites-available/formatforgeplus /etc/nginx/sites-enabled/formatforgeplus
 sudo rm -f /etc/nginx/sites-enabled/default
 ```
 
