@@ -152,8 +152,10 @@ Browse with your real domain (same as `server_name` in that file), or temporaril
 **Still see the old Apache wording?** That is almost always **CDN or browser cache** (or DNS pointing at a **different** host). Try an incognito window, pause Cloudflare proxy (grey cloud) to bypass cache, and run on the box:
 
 ```bash
-cd /path/to/formatforge && ./scripts/diagnose-web-front.sh formatforgeplus.com
+cd /path/to/formatforge && sudo ./scripts/diagnose-web-front.sh formatforgeplus.com
 ```
+
+Use **`sudo ./scripts/...`** so `ss`, `nginx -T`, and `/etc/nginx/sites-enabled` are reliable (password once). If **`formatforgeplus` is still missing** from `sites-enabled`, the script prints exact **`sudo cp` / `ln -sf`** lines using your clone path.
 
 If you have not yet installed the site config (same commands as **Fix** above):
 
