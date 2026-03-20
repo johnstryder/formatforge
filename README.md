@@ -58,23 +58,23 @@ Single-file PHP dashboard for AI content generation, curation, and Instagram pub
 
 After **Fetch**, if Antfly reports the item as **novel** vs synced **`pipeline_refs`** (semantic distance above **`NOVEL_DISTANCE_THRESHOLD`**), or there are **no active pipelines**, **PHP** (same request as the Curate POST) queues Cursor to **create** a pipeline. After **three consecutive rejects** for the same `metadata.pipeline_id`, **PHP** queues Cursor to **edit** that pipeline. No separate scheduler is required for this kick-off.
 
-1. Writes a trigger file to `PI_TRIGGER_DIR`
+1. Writes a trigger file to **`.cursor-pipeline/triggers/`** (or `CURSOR_PIPELINE_TRIGGER_DIR`)
 2. Runs `setup_pipeline_from_trigger()` (in `index.php`) which:
    - Creates `pipelines/pipeline-<id>/` from the template
    - Copies `.env` (Replicate, PocketBase, Garage, login) into the pipeline dir
-   - Writes `.pi/prompts/pipeline-<id>.md` — task prompt for the agent
+   - Writes **`.cursor-pipeline/prompts/pipeline-<id>.md`** — task prompt for the agent (same repo; Cursor `--workspace` is the project root)
 3. Spawns **`agent`** in the background ([Cursor CLI](https://cursor.com/cli)) with **`-p`**, **`--trust`**, **`-f`**, **`--model composer-2-fast`** by default ([Composer 2 / Cursor 2.0](https://cursor.com/blog/2-0))
 
 **Setup:**
 1. Install CLI: [cursor.com/install](https://cursor.com/install) — `agent` on `PATH` (or set `CURSOR_AGENT_BIN`)
 2. **Auth:** `agent login` on the server is enough (no `CURSOR_API_KEY` required). Log in as the **same OS user that runs PHP-FPM** (often `www-data`), e.g. `sudo -u www-data agent login`. Optional: set `CURSOR_API_KEY` in `.env` instead for headless-only setups.
-3. `PI_TRIGGER_DIR` in `.env` (default: `.pi/triggers`)
+3. **`CURSOR_PIPELINE_TRIGGER_DIR`** in `.env` if you want a non-default path (default: **`.cursor-pipeline/triggers`**; legacy **`PI_TRIGGER_DIR`** still works)
 4. **`ANTFLY_URL`** + run `./scripts/init-antfly.sh` (tables **`content`** + **`pipeline_refs`**). Antfly needs OpenRouter for the table embedder (`EMBED_MODEL`, API key in Antfly env or embedder JSON). PHP **`OPENROUTER_API_KEY`** is still used for `embed_text()` in **`php index.php test-embed`** only.
 5. Optional: `CURSOR_AGENT_MODEL`, `CURSOR_AGENT_ENABLED=0` to disable auto-spawn
 
 **Manual prep (no agent):** `php index.php setup-pipeline [trigger_file]` (uses latest trigger if no arg)
 
-**Manual agent:** `php index.php cursor-agent-run .pi/prompts/pipeline-<id>.md`
+**Manual agent:** `php index.php cursor-agent-run .cursor-pipeline/prompts/pipeline-<id>.md`
 
 **Reset PocketBase (dev):** Stop `formatforge-pb`, remove `pb_data/*.db` (and `types.d.ts` if present), keep `pb_data/pb_migrations` → `../pb_migrations`, then start PocketBase and create a new superuser + app user.
 

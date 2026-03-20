@@ -109,6 +109,16 @@ function ff_pick_storage_cookie_file(): string {
     return '';
 }
 
+/** Repo-local Cursor automation dir (triggers, prompts, agent log) — inside the FormatForge tree so `agent --workspace` sees it. */
+function ff_cursor_pipeline_dir(): string {
+    return __DIR__ . DIRECTORY_SEPARATOR . '.cursor-pipeline';
+}
+
+/** Absolute path prefix for prompt `.md` files (must stay under ff_cursor_pipeline_dir()). */
+function ff_cursor_pipeline_prompts_dir(): string {
+    return ff_cursor_pipeline_dir() . DIRECTORY_SEPARATOR . 'prompts';
+}
+
 $pbUrl = null;
 if (file_exists(__DIR__ . '/.pb-port')) {
     $pbUrl = 'http://127.0.0.1:' . trim(file_get_contents(__DIR__ . '/.pb-port') ?: '');
@@ -133,12 +143,21 @@ $ytCookiesEnv = getenv('YT_DLP_COOKIES');
 $ytCookiesPath = ($ytCookiesEnv !== false && trim((string)$ytCookiesEnv) !== '')
     ? trim((string)$ytCookiesEnv)
     : $galleryCookiesPath;
+$cursorPipelineTriggerDir = getenv('CURSOR_PIPELINE_TRIGGER_DIR');
+if (!is_string($cursorPipelineTriggerDir) || trim($cursorPipelineTriggerDir) === '') {
+    $legacyPiTrigger = getenv('PI_TRIGGER_DIR');
+    $cursorPipelineTriggerDir = (is_string($legacyPiTrigger) && trim($legacyPiTrigger) !== '')
+        ? trim($legacyPiTrigger)
+        : (__DIR__ . '/.cursor-pipeline/triggers');
+} else {
+    $cursorPipelineTriggerDir = trim($cursorPipelineTriggerDir);
+}
 $CONFIG = [
     'pocketbase_url'   => $pbUrl,
     'pocketbase_public_url' => $pbPublicUrl,
     'site_url'         => $siteUrl,
     'site_name'        => getenv('SITE_NAME') ?: 'FormatForge',
-    'app_version'      => getenv('APP_VERSION') ?: 'v1.0.57',
+    'app_version'      => getenv('APP_VERSION') ?: 'v1.0.58',
     'users_collection' => 'users',
     'garage_endpoint'  => getenv('GARAGE_ENDPOINT') ?: 'http://127.0.0.1:3900',
     'garage_key'       => getenv('GARAGE_ACCESS_KEY') ?: '',
@@ -168,7 +187,7 @@ $CONFIG = [
     'openai_key'       => getenv('OPENAI_API_KEY') ?: '',
     'openrouter_key'   => getenv('OPENROUTER_API_KEY') ?: '',
     'embed_model'      => getenv('EMBED_MODEL') ?: 'google/gemini-embedding-001',  // OpenRouter embeddings id
-    'pi_trigger_dir'  => getenv('PI_TRIGGER_DIR') ?: (__DIR__ . '/.pi/triggers'),
+    'cursor_pipeline_trigger_dir' => $cursorPipelineTriggerDir,
     'novel_threshold'  => (float)(getenv('NOVEL_DISTANCE_THRESHOLD') ?: '0.35'),  // cosine distance above = novel
     'pipeline_reject_streak' => max(1, (int)(getenv('PIPELINE_REJECT_STREAK') ?: '3')),  // edit pipeline after N consecutive rejects
     'cursor_agent_bin' => getenv('CURSOR_AGENT_BIN') ?: 'agent',
@@ -1332,7 +1351,7 @@ function count_consecutive_rejects_for_pipeline(string $pipelineId, ?string $aut
  */
 function maybe_trigger_cursor_create_pipeline_after_fetch(array $novelIndexPrompts, ?string $authHeader): void {
     $cfg = $GLOBALS['CONFIG'];
-    if (empty($cfg['pi_trigger_dir']) || $novelIndexPrompts === []) return;
+    if (empty($cfg['cursor_pipeline_trigger_dir']) || $novelIndexPrompts === []) return;
     if (!formatforge_antfly_novelty_configured()) return;
     $novelIndexPrompts = array_values(array_unique(array_filter(array_map('trim', $novelIndexPrompts))));
     if ($novelIndexPrompts === []) return;
@@ -1348,7 +1367,7 @@ function maybe_trigger_cursor_create_pipeline_after_fetch(array $novelIndexPromp
  */
 function maybe_trigger_cursor_edit_pipeline_after_reject(array $itemBody, string $contentItemId, string $reason, ?string $authHeader): void {
     $cfg = $GLOBALS['CONFIG'];
-    if (empty($cfg['pi_trigger_dir']) || !$authHeader) return;
+    if (empty($cfg['cursor_pipeline_trigger_dir']) || !$authHeader) return;
     $meta = $itemBody['metadata'] ?? [];
     if (!is_array($meta)) return;
     $pipelineId = trim((string)($meta['pipeline_id'] ?? ''));
@@ -1416,11 +1435,11 @@ function spawn_cursor_agent_background(string $promptFile): void {
     if (!$promptReal || !is_file($promptReal) || strncmp($promptReal, $root, strlen($root)) !== 0) {
         return;
     }
-    $prefix = $root . DIRECTORY_SEPARATOR . '.pi' . DIRECTORY_SEPARATOR . 'prompts' . DIRECTORY_SEPARATOR;
+    $prefix = ff_cursor_pipeline_prompts_dir() . DIRECTORY_SEPARATOR;
     if (strncmp($promptReal, $prefix, strlen($prefix)) !== 0) {
         return;
     }
-    $logDir = $root . '/.pi';
+    $logDir = ff_cursor_pipeline_dir();
     if (!is_dir($logDir) && !@mkdir($logDir, 0755, true)) {
         $logDir = sys_get_temp_dir();
     }
@@ -1439,7 +1458,7 @@ function spawn_cursor_agent_background(string $promptFile): void {
 
 function trigger_pipeline_cursor_agent(string $reason, array $context): void {
     $cfg = $GLOBALS['CONFIG'];
-    $dir = $cfg['pi_trigger_dir'] ?? '';
+    $dir = $cfg['cursor_pipeline_trigger_dir'] ?? '';
     if (!$dir) return;
     if (!is_dir($dir) && !@mkdir($dir, 0755, true)) return;
     if (!is_writable($dir)) return;
@@ -1486,10 +1505,11 @@ function setup_pipeline_from_trigger(string $triggerFile, bool $spawnCursorAgent
         }
     }
     file_put_contents($pipelineDir . '/.env', implode("\n", array_unique($pipelineEnvLines)) . "\n");
-    $piDir = $projectRoot . '/.pi';
-    if (!is_dir($piDir)) mkdir($piDir, 0755, true);
-    if (!is_dir($piDir . '/prompts')) mkdir($piDir . '/prompts', 0755, true);
-    $promptFile = $piDir . '/prompts/pipeline-' . $pipelineId . '.md';
+    $cursorBase = $projectRoot . DIRECTORY_SEPARATOR . '.cursor-pipeline';
+    if (!is_dir($cursorBase)) mkdir($cursorBase, 0755, true);
+    $promptsDir = $cursorBase . DIRECTORY_SEPARATOR . 'prompts';
+    if (!is_dir($promptsDir)) mkdir($promptsDir, 0755, true);
+    $promptFile = $promptsDir . DIRECTORY_SEPARATOR . 'pipeline-' . $pipelineId . '.md';
     $contextJson = json_encode($context, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES);
     if ($reason === 'pipeline_edit_streak') {
         $pid = (string)($context['pipeline_id'] ?? '');
@@ -1513,7 +1533,7 @@ function setup_pipeline_from_trigger(string $triggerFile, bool $spawnCursorAgent
         $task = "Pipeline maintenance.\n\n1. Pipeline dir: `$pipelineDir`\n2. Build: `cd $pipelineDir && go build -o pipeline-generate .`\n3. Update PocketBase **`pipelines`** as needed.";
     }
     $agentModel = $cfg['cursor_agent_model'] ?? 'composer-2-fast';
-    $promptContent = "# FormatForge pipeline setup\n\n**Trigger:** $reason\n**Created:** $created\n\n## Context\n\n```json\n$contextJson\n```\n\n## Task\n\n$task\n\n## Cursor Agent (headless)\n\nFormatForge spawns the [Cursor CLI](https://cursor.com/cli) **`agent`** with **`-p`** (print), **`--trust`**, **`-f`** (force), **`--model $agentModel`** ([Composer 2 Fast](https://cursor.com/blog/2-0)), **`--workspace`** = project root.\n\nManual re-run:\n\n```bash\nagent -p --trust -f --model $agentModel --workspace \"$projectRoot\" \"Execute every step in: $promptFile\"\n```\n\nAuth: usually **`agent login`** as the PHP-FPM user (no API key). Optional **`CURSOR_API_KEY`** in `.env`. Logs: **`.pi/cursor-agent.log`**.\n";
+    $promptContent = "# FormatForge pipeline setup\n\n**Project tree:** Triggers, this prompt, and the agent log live under **`.cursor-pipeline/`** next to `index.php` (same FormatForge repo). Cursor is started with **`--workspace \"$projectRoot\"`**, so treat **`.cursor-pipeline/`** as part of the app — open and edit files there like any other project path.\n\n**Trigger:** $reason\n**Created:** $created\n\n## Context\n\n```json\n$contextJson\n```\n\n## Task\n\n$task\n\n## Cursor Agent (headless)\n\nFormatForge spawns the [Cursor CLI](https://cursor.com/cli) **`agent`** with **`-p`** (print), **`--trust`**, **`-f`** (force), **`--model $agentModel`** ([Composer 2 Fast](https://cursor.com/blog/2-0)), **`--workspace`** = **`$projectRoot`** (repo root).\n\nManual re-run:\n\n```bash\nagent -p --trust -f --model $agentModel --workspace \"$projectRoot\" \"Execute every step in: $promptFile\"\n```\n\nAuth: usually **`agent login`** as the PHP-FPM user (no API key). Optional **`CURSOR_API_KEY`** in `.env`. Logs: **`.cursor-pipeline/cursor-agent.log`**.\n";
     file_put_contents($promptFile, $promptContent);
     if ($spawnCursorAgent) {
         spawn_cursor_agent_background($promptFile);
@@ -1584,7 +1604,7 @@ if (PHP_SAPI === 'cli' && ($argv[1] ?? '') === 'probe-garage') {
 // CLI: php index.php setup-pipeline [trigger_file]
 if (PHP_SAPI === 'cli' && ($argv[1] ?? '') === 'setup-pipeline') {
     $triggerFile = $argv[2] ?? null;
-    $triggerDir = $GLOBALS['CONFIG']['pi_trigger_dir'] ?? __DIR__ . '/.pi/triggers';
+    $triggerDir = $GLOBALS['CONFIG']['cursor_pipeline_trigger_dir'] ?? (__DIR__ . '/.cursor-pipeline/triggers');
     if (!$triggerFile) {
         $files = glob($triggerDir . '/trigger_*.json');
         if (empty($files)) { fwrite(STDERR, "No trigger. Usage: php index.php setup-pipeline [trigger_file]\n"); exit(1); }
@@ -1596,14 +1616,14 @@ if (PHP_SAPI === 'cli' && ($argv[1] ?? '') === 'setup-pipeline') {
     exit(0);
 }
 
-// CLI: php index.php cursor-agent-run /abs/path/to/.pi/prompts/pipeline-….md
+// CLI: php index.php cursor-agent-run /abs/path/to/.cursor-pipeline/prompts/pipeline-….md
 if (PHP_SAPI === 'cli' && ($argv[1] ?? '') === 'cursor-agent-run') {
     $pf = $argv[2] ?? '';
     $root = __DIR__;
     $real = $pf !== '' ? realpath($pf) : false;
-    $prefix = $root . DIRECTORY_SEPARATOR . '.pi' . DIRECTORY_SEPARATOR . 'prompts' . DIRECTORY_SEPARATOR;
+    $prefix = ff_cursor_pipeline_prompts_dir() . DIRECTORY_SEPARATOR;
     if (!$real || !is_file($real) || strncmp($real, $prefix, strlen($prefix)) !== 0) {
-        fwrite(STDERR, "cursor-agent-run: need a file under .pi/prompts/\n");
+        fwrite(STDERR, "cursor-agent-run: need a file under .cursor-pipeline/prompts/\n");
         exit(1);
     }
     $cfg = $GLOBALS['CONFIG'];
