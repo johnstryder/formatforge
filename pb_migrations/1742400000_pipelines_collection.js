@@ -1,7 +1,6 @@
-migrate((db) => {
-  const dao = new Dao(db)
+migrate((app) => {
   try {
-    dao.findCollectionByNameOrId("pipelines")
+    app.findCollectionByNameOrId("pipelines")
     return
   } catch (_) {}
 
@@ -22,5 +21,5 @@ migrate((db) => {
       { name: "metadata", type: "json" },
     ],
   })
-  dao.saveCollection(collection)
+  app.save(collection)
 })

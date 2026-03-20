@@ -1,0 +1,35 @@
+# OPTIONAL: PocketBase at https://pb.yourdomain.com/ (no /pb path —recommended by PocketBase).
+#
+# 1) DNS A/AAAA: pb.formatforgeplus.com → server
+# 2) certbot certonly for pb.formatforgeplus.com
+# 3) Install map once: sudo cp nginx/snippets/formatforge_pb_map.conf /etc/nginx/conf.d/
+# 4) Merge the server block below into sites-enabled, fix ssl paths, reload nginx
+# 5) .env: POCKETBASE_PUBLIC_URL=https://pb.formatforgeplus.com
+#
+# server {
+#     listen 443 ssl http2;
+#     listen [::]:443 ssl http2;
+#     server_name pb.formatforgeplus.com;
+#
+#     ssl_certificate     /etc/letsencrypt/live/pb.formatforgeplus.com/fullchain.pem;
+#     ssl_certificate_key /etc/letsencrypt/live/pb.formatforgeplus.com/privkey.pem;
+#
+#     client_max_body_size 50M;
+#
+#     location / {
+#         proxy_http_version 1.1;
+#         proxy_read_timeout 360s;
+#         proxy_send_timeout 360s;
+#         proxy_connect_timeout 60s;
+#         proxy_buffering off;
+#
+#         proxy_set_header Host $host;
+#         proxy_set_header X-Real-IP $remote_addr;
+#         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+#         proxy_set_header X-Forwarded-Proto $scheme;
+#         proxy_set_header Upgrade $http_upgrade;
+#         proxy_set_header Connection $formatforge_pb_connection;
+#
+#         proxy_pass http://127.0.0.1:8090;
+#     }
+# }

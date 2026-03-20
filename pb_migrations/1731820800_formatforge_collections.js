@@ -1,12 +1,12 @@
-migrate((db) => {
-  const dao = new Dao(db)
+/// PocketBase v0.23+ JS migrations use (app) => { ... } and app.save(collection), not Dao.
+migrate((app) => {
   const createIfMissing = (config) => {
     try {
-      dao.findCollectionByNameOrId(config.name)
+      app.findCollectionByNameOrId(config.name)
       return
     } catch (_) {}
     const collection = new Collection(config)
-    dao.saveCollection(collection)
+    app.save(collection)
   }
 
   // users collection is created by PocketBase by default

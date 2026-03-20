@@ -1,0 +1,25 @@
+# systemd unit for the FormatForge PocketBase binary: formatforge-pb
+# (Same naming as ./scripts/start.sh: "$(basename parent_dir)-pb".)
+#
+# Copy: sudo cp scripts/formatforge-pb.service.example /etc/systemd/system/formatforge-pb.service
+# Edit paths if your clone is not /var/www/formatforge, then:
+#   sudo systemctl daemon-reload && sudo systemctl enable --now formatforge-pb
+#
+# Unit filename can be anything; these docs use formatforge-pb.service so
+#   journalctl -u formatforge-pb matches the binary name.
+
+[Unit]
+Description=FormatForge PocketBase (formatforge-pb)
+After=network.target
+
+[Service]
+Type=simple
+User=www-data
+Group=www-data
+WorkingDirectory=/var/www/formatforge
+ExecStart=/var/www/formatforge/formatforge-pb serve --http=127.0.0.1:8090 --dir=/var/www/formatforge/pb_data --migrationsDir=/var/www/formatforge/pb_migrations
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

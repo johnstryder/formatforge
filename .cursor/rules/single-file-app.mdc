@@ -1,0 +1,33 @@
+---
+description: FormatForge single-file architecture — app logic only in index.php
+alwaysApply: true
+---
+
+# Single-File App Logic
+
+All application logic must live in `index.php`. No separate PHP files for app logic.
+
+## Allowed
+
+- `index.php` — routing, handlers, helpers, config, HTML
+- `config.php` — optional override (merged into CONFIG)
+- `pb_migrations/*.js` — PocketBase schema
+- `pipelines/template/*` — Go binary template (not PHP)
+- `scripts/*` — shell scripts only (e.g. download-pocketbase.sh, start.sh)
+
+## Not Allowed
+
+- `scripts/*.php` — no PHP scripts; use `php index.php <command>` CLI instead
+- Separate PHP files for features, helpers, or API handlers
+
+## Adding New Logic
+
+Put new functions and request handlers in `index.php`. Use CLI mode for commands:
+
+```php
+// CLI: php index.php my-command [args]
+if (PHP_SAPI === 'cli' && ($argv[1] ?? '') === 'my-command') {
+    my_command_handler($argv[2] ?? null);
+    exit(0);
+}
+```

@@ -1,0 +1,21 @@
+# Copy to e.g. /etc/systemd/system/formatforge-cursor-agent-sync.service
+# Adjust paths and CURSOR_AGENT_SOURCE_USER to your deploy user.
+#
+# sudo cp scripts/cursor-agent-sync.service.example /etc/systemd/system/formatforge-cursor-agent-sync.service
+# sudo systemctl daemon-reload
+# sudo systemctl enable --now formatforge-cursor-agent-sync.timer
+
+[Unit]
+Description=Sync Cursor Agent CLI from deploy user to /opt/cursor-agent
+After=network.target
+
+[Service]
+Type=oneshot
+# User whose ~/.local/share/cursor-agent/versions/ is the source of truth
+Environment=CURSOR_AGENT_SOURCE_USER=jhs
+Environment=CURSOR_AGENT_OPT_DIR=/opt/cursor-agent
+# Set to 1 to reload php-fpm after a successful sync
+Environment=CURSOR_AGENT_SYNC_RELOAD_PHP=1
+ExecStart=/var/www/formatforge/scripts/sync-cursor-agent-to-opt.sh --systemd
+# Repo path — must match your install:
+WorkingDirectory=/var/www/formatforge

@@ -1,0 +1,29 @@
+---
+description: Production server assumptions — cautious ops, no dev-by-default, stack constraints
+alwaysApply: true
+---
+
+# Production host (FormatForge)
+
+Treat this workspace as a **live production** FormatForge deployment unless the human says otherwise.
+
+**Local dev clones:** set `alwaysApply: false` in this file (or remove it) so day-to-day coding is not constrained.
+
+## Operations
+
+- Prefer **inspect first** (`read`, `grep`, logs, `php -l`) before **destructive** work (DB drops, bulk deletes, `rm -rf`, stopping services that serve traffic).
+- Do **not** start dev stacks, watchers, or **new listeners on public ports** unless explicitly requested.
+- **Git:** the human typically **commits and pushes**; do not assume you should `git push` to prod remotes without instruction.
+
+## Secrets and data
+
+- Never print, log, or paste **`.env`**, API keys, session tokens, or cookie contents. Ask for **sanitized** logs/snippets if needed.
+
+## Stack (this project)
+
+- App logic stays in **`index.php`** with PocketBase; see **`.cursor/rules/formatforge-stack.mdc`** and **`DEPLOYMENT.md`**.
+- Do not introduce **Docker** for FormatForge or run **`npm`/`pnpm`** tooling as a default after edits unless the human asks (no `/frontend` TS app in repo).
+
+## Versioning
+
+- When changing app behavior the human asked for, **patch bump** default **`APP_VERSION`** in **`index.php`** and **`APP_VERSION`** in **`.env.example`** together.
