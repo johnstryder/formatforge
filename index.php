@@ -110,9 +110,7 @@ function ff_pick_storage_cookie_file(): string {
 }
 
 $pbUrl = null;
-if (file_exists('/.dockerenv')) {
-    $pbUrl = 'http://pocketbase:8090';
-} elseif (file_exists(__DIR__ . '/.pb-port')) {
+if (file_exists(__DIR__ . '/.pb-port')) {
     $pbUrl = 'http://127.0.0.1:' . trim(file_get_contents(__DIR__ . '/.pb-port') ?: '');
 } else {
     $pbUrl = getenv('POCKETBASE_URL') ?: 'http://127.0.0.1:8090';
@@ -140,7 +138,7 @@ $CONFIG = [
     'pocketbase_public_url' => $pbPublicUrl,
     'site_url'         => $siteUrl,
     'site_name'        => getenv('SITE_NAME') ?: 'FormatForge',
-    'app_version'      => getenv('APP_VERSION') ?: 'v1.0.54',
+    'app_version'      => getenv('APP_VERSION') ?: 'v1.0.55',
     'users_collection' => 'users',
     'garage_endpoint'  => getenv('GARAGE_ENDPOINT') ?: 'http://127.0.0.1:3900',
     'garage_key'       => getenv('GARAGE_ACCESS_KEY') ?: '',
@@ -1544,7 +1542,7 @@ if (PHP_SAPI === 'cli' && ($argv[1] ?? '') === 'probe-garage') {
         echo "OK signed PUT\nendpoint: {$cfg['garage_endpoint']}\nbucket: {$cfg['garage_bucket']}\nkey: $key\nurl: $url\n";
         exit(0);
     }
-    fwrite(STDERR, "FAIL: s3_upload() returned null. PHP cannot complete SigV4 PUT to GARAGE_ENDPOINT from this process (wrong host/port if PHP runs in Docker — use e.g. http://garage:3900).\n");
+    fwrite(STDERR, "FAIL: s3_upload() returned null. PHP cannot complete SigV4 PUT to GARAGE_ENDPOINT — check GARAGE_ENDPOINT is reachable from this host (e.g. http://127.0.0.1:3900), keys/bucket, and firewall.\n");
     exit(1);
 }
 
@@ -2561,11 +2559,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && $user && $authHeader) {
                 'yt_dlp_path' => $GLOBALS['CONFIG']['yt_dlp_path'] ?? '',
             ];
             if ($all127) {
-                $report['exit_127_note'] = 'Both tools returned 127 (not found). If using Docker: use compose with entrypoint-fetch-tools.sh + ff_fetch_tools volume, then `docker compose up -d --force-recreate php` and check `docker logs formatforge-php` for the first-run pip install.';
+                $report['exit_127_note'] = 'gallery-dl and yt-dlp both exited 127 (command not found). On the host: `pip install --user gallery-dl yt-dlp` (or apt install), set GALLERY_DL_PATH / YT_DLP_PATH in .env to absolute paths, and ensure php-fpm sees a PATH that includes those dirs (see DEPLOYMENT.md §2).';
             }
             ff_debug_log('fetch_link_zero_files', $report);
             $copyPayload = ff_debug_sanitize($report);
-            $errExtra = $all127 ? ' Fetch tools not found in PHP — redeploy compose (entrypoint installs gallery-dl/yt-dlp on first start) or check `docker logs formatforge-php`.' : '';
+            $errExtra = $all127 ? ' Install gallery-dl / yt-dlp on the server (pip or apt), set GALLERY_DL_PATH / YT_DLP_PATH if needed, reload php-fpm.' : '';
             echo json_encode([
                 'ok' => false,
                 'error' => 'No files were downloaded. The server tries direct HTTP (file-like URLs), then gallery-dl, then yt-dlp.' . ff_fetch_failure_hint($url) . $errExtra,

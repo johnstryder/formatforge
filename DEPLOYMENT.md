@@ -1,6 +1,6 @@
-# Deploy FormatForge to formatforgeplus.com (no Docker)
+# Deploy FormatForge to formatforgeplus.com (host only — no Docker)
 
-Stack: **nginx**, **PHP-FPM** (8.2+), **PocketBase** binary, optional **certbot**. Your app code and `pb_data/` stay on disk.
+Stack: **nginx**, **PHP-FPM** (8.2+), **PocketBase** binary, optional **certbot**, all on the **bare-metal or VM**. Your app code and `pb_data/` stay on disk. This project does **not** ship or target a containerized app runtime.
 
 ## Before you start
 
