@@ -138,7 +138,7 @@ $CONFIG = [
     'pocketbase_public_url' => $pbPublicUrl,
     'site_url'         => $siteUrl,
     'site_name'        => getenv('SITE_NAME') ?: 'FormatForge',
-    'app_version'      => getenv('APP_VERSION') ?: 'v1.0.56',
+    'app_version'      => getenv('APP_VERSION') ?: 'v1.0.57',
     'users_collection' => 'users',
     'garage_endpoint'  => getenv('GARAGE_ENDPOINT') ?: 'http://127.0.0.1:3900',
     'garage_key'       => getenv('GARAGE_ACCESS_KEY') ?: '',
@@ -1513,7 +1513,7 @@ function setup_pipeline_from_trigger(string $triggerFile, bool $spawnCursorAgent
         $task = "Pipeline maintenance.\n\n1. Pipeline dir: `$pipelineDir`\n2. Build: `cd $pipelineDir && go build -o pipeline-generate .`\n3. Update PocketBase **`pipelines`** as needed.";
     }
     $agentModel = $cfg['cursor_agent_model'] ?? 'composer-2-fast';
-    $promptContent = "# FormatForge pipeline setup\n\n**Trigger:** $reason\n**Created:** $created\n\n## Context\n\n```json\n$contextJson\n```\n\n## Task\n\n$task\n\n## Cursor Agent (headless)\n\nFormatForge spawns the [Cursor CLI](https://cursor.com/cli) **`agent`** with **`-p`** (print), **`--trust`**, **`-f`** (force), **`--model $agentModel`** ([Composer 2 Fast](https://cursor.com/blog/2-0)), **`--workspace`** = project root.\n\nManual re-run:\n\n```bash\nagent -p --trust -f --model $agentModel --workspace \"$projectRoot\" \"Execute every step in: $promptFile\"\n```\n\nAuth: **`CURSOR_API_KEY`** or `agent login`. Logs: **`.pi/cursor-agent.log`**.\n";
+    $promptContent = "# FormatForge pipeline setup\n\n**Trigger:** $reason\n**Created:** $created\n\n## Context\n\n```json\n$contextJson\n```\n\n## Task\n\n$task\n\n## Cursor Agent (headless)\n\nFormatForge spawns the [Cursor CLI](https://cursor.com/cli) **`agent`** with **`-p`** (print), **`--trust`**, **`-f`** (force), **`--model $agentModel`** ([Composer 2 Fast](https://cursor.com/blog/2-0)), **`--workspace`** = project root.\n\nManual re-run:\n\n```bash\nagent -p --trust -f --model $agentModel --workspace \"$projectRoot\" \"Execute every step in: $promptFile\"\n```\n\nAuth: usually **`agent login`** as the PHP-FPM user (no API key). Optional **`CURSOR_API_KEY`** in `.env`. Logs: **`.pi/cursor-agent.log`**.\n";
     file_put_contents($promptFile, $promptContent);
     if ($spawnCursorAgent) {
         spawn_cursor_agent_background($promptFile);

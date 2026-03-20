@@ -67,7 +67,7 @@ After **Fetch**, if Antfly reports the item as **novel** vs synced **`pipeline_r
 
 **Setup:**
 1. Install CLI: [cursor.com/install](https://cursor.com/install) — `agent` on `PATH` (or set `CURSOR_AGENT_BIN`)
-2. `CURSOR_API_KEY` or `agent login` on the server
+2. **Auth:** `agent login` on the server is enough (no `CURSOR_API_KEY` required). Log in as the **same OS user that runs PHP-FPM** (often `www-data`), e.g. `sudo -u www-data agent login`. Optional: set `CURSOR_API_KEY` in `.env` instead for headless-only setups.
 3. `PI_TRIGGER_DIR` in `.env` (default: `.pi/triggers`)
 4. **`ANTFLY_URL`** + run `./scripts/init-antfly.sh` (tables **`content`** + **`pipeline_refs`**). Antfly needs OpenRouter for the table embedder (`EMBED_MODEL`, API key in Antfly env or embedder JSON). PHP **`OPENROUTER_API_KEY`** is still used for `embed_text()` in **`php index.php test-embed`** only.
 5. Optional: `CURSOR_AGENT_MODEL`, `CURSOR_AGENT_ENABLED=0` to disable auto-spawn
