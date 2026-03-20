@@ -138,7 +138,7 @@ $CONFIG = [
     'pocketbase_public_url' => $pbPublicUrl,
     'site_url'         => $siteUrl,
     'site_name'        => getenv('SITE_NAME') ?: 'FormatForge',
-    'app_version'      => getenv('APP_VERSION') ?: 'v1.0.55',
+    'app_version'      => getenv('APP_VERSION') ?: 'v1.0.56',
     'users_collection' => 'users',
     'garage_endpoint'  => getenv('GARAGE_ENDPOINT') ?: 'http://127.0.0.1:3900',
     'garage_key'       => getenv('GARAGE_ACCESS_KEY') ?: '',
@@ -1371,11 +1371,44 @@ function maybe_trigger_cursor_edit_pipeline_after_reject(array $itemBody, string
 }
 
 /**
+ * PATH/HOME/API key for the shell that starts `php … cursor-agent-run` (php-fpm often has a tiny PATH).
+ */
+function ff_shell_env_prefix_for_cursor_agent(): string {
+    $path = getenv('PATH');
+    if (!is_string($path) || trim($path) === '') {
+        $path = '/usr/local/bin:/usr/bin:/bin:/sbin';
+    } else {
+        foreach (['/usr/local/bin', '/usr/bin', '/bin'] as $seg) {
+            if (!str_contains($path, $seg)) {
+                $path = $seg . ':' . $path;
+            }
+        }
+    }
+    $parts = ['PATH=' . escapeshellarg($path)];
+    $home = getenv('HOME');
+    if (is_string($home) && $home !== '') {
+        $parts[] = 'HOME=' . escapeshellarg($home);
+    }
+    foreach (['USER', 'CURSOR_API_KEY'] as $k) {
+        $v = getenv($k);
+        if (is_string($v) && $v !== '') {
+            $parts[] = $k . '=' . escapeshellarg($v);
+        }
+    }
+    return implode(' ', $parts) . ' ';
+}
+
+/**
  * Queue a headless Cursor Agent run (composer-2-fast by default) after pipeline files exist.
+ * Called from PHP web requests (POST fetch_link / reject_content) and CLI alike: exec + nohup so FPM can exit without killing the agent.
  */
 function spawn_cursor_agent_background(string $promptFile): void {
     $cfg = $GLOBALS['CONFIG'];
     if (empty($cfg['cursor_agent_enabled'])) {
+        return;
+    }
+    if (!function_exists('exec')) {
+        ff_debug_log('cursor_agent_spawn_failed', ['reason' => 'exec_unavailable']);
         return;
     }
     $root = __DIR__;
@@ -1395,11 +1428,13 @@ function spawn_cursor_agent_background(string $promptFile): void {
     $php = PHP_BINARY && is_executable(PHP_BINARY) ? PHP_BINARY : 'php';
     $self = __FILE__;
     $cmd = implode(' ', array_map('escapeshellarg', [$php, $self, 'cursor-agent-run', $promptReal]));
+    $envP = ff_shell_env_prefix_for_cursor_agent();
     if (PHP_OS_FAMILY === 'Windows') {
-        exec($cmd . ' >> ' . escapeshellarg($log) . ' 2>&1');
+        @exec($envP . $cmd . ' >> ' . escapeshellarg($log) . ' 2>&1');
     } else {
-        exec($cmd . ' >> ' . escapeshellarg($log) . ' 2>&1 &');
+        @exec($envP . 'nohup ' . $cmd . ' >> ' . escapeshellarg($log) . ' 2>&1 &');
     }
+    ff_debug_log('cursor_agent_spawn', ['prompt' => basename($promptReal), 'log' => $log]);
 }
 
 function trigger_pipeline_cursor_agent(string $reason, array $context): void {

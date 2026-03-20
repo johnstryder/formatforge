@@ -56,7 +56,7 @@ Single-file PHP dashboard for AI content generation, curation, and Instagram pub
 
 ## Autonomous pipeline triggers (Cursor Agent CLI)
 
-After **Fetch**, if Antfly reports the item as **novel** vs synced **`pipeline_refs`** (semantic distance above **`NOVEL_DISTANCE_THRESHOLD`**), or there are **no active pipelines**, FormatForge queues Cursor to **create** a pipeline. After **three consecutive rejects** for the same `metadata.pipeline_id`, it queues Cursor to **edit** that pipeline.
+After **Fetch**, if Antfly reports the item as **novel** vs synced **`pipeline_refs`** (semantic distance above **`NOVEL_DISTANCE_THRESHOLD`**), or there are **no active pipelines**, **PHP** (same request as the Curate POST) queues Cursor to **create** a pipeline. After **three consecutive rejects** for the same `metadata.pipeline_id`, **PHP** queues Cursor to **edit** that pipeline. No separate scheduler is required for this kick-off.
 
 1. Writes a trigger file to `PI_TRIGGER_DIR`
 2. Runs `setup_pipeline_from_trigger()` (in `index.php`) which:
