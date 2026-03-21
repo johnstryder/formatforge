@@ -109,14 +109,318 @@ function ff_pick_storage_cookie_file(): string {
     return '';
 }
 
-/** Repo-local Cursor automation dir (triggers, prompts, agent log) — inside the FormatForge tree so `agent --workspace` sees it. */
+/**
+ * Non-secret diagnostics for Curate → Fetch (why gallery-dl/yt-dlp had no --cookies).
+ * Key names must not contain "cookie" (ff_debug_sanitize redacts those keys).
+ */
+function ff_fetch_auth_file_status(): array {
+    $cfg = $GLOBALS['CONFIG'];
+    $gd = trim((string) ($cfg['gallery_dl_cookies'] ?? ''));
+    $yt = trim((string) ($cfg['yt_dlp_cookies'] ?? ''));
+    $dir = __DIR__ . '/storage/cookies';
+    $storage = [];
+    foreach (['instagram_cookies.txt', 'cookies.txt'] as $name) {
+        $p = $dir . '/' . $name;
+        $sz = (is_file($p) && is_readable($p)) ? @filesize($p) : null;
+        $storage[] = [
+            'filename' => $name,
+            'path' => $p,
+            'exists' => is_file($p),
+            'readable' => is_file($p) && is_readable($p),
+            'size_bytes' => $sz,
+            'large_enough' => $sz !== null && $sz > 32,
+        ];
+    }
+    $usable = $gd !== '' && is_file($gd) && is_readable($gd) && (int) @filesize($gd) > 32;
+    $who = null;
+    if (function_exists('posix_geteuid') && function_exists('posix_getpwuid')) {
+        $pw = @posix_getpwuid(posix_geteuid());
+        $who = is_array($pw) ? ($pw['name'] ?? null) : null;
+    }
+    return [
+        'gallery_dl_netscape_path' => $gd === '' ? null : $gd,
+        'yt_dlp_netscape_path' => $yt === '' ? null : $yt,
+        'usable_netscape_for_fetch' => $usable,
+        'storage_netscape_files' => $storage,
+        'php_effective_user' => $who,
+    ];
+}
+
+/**
+ * Writable tree for Cursor triggers, prompts, trace JSONL, agent log.
+ * Prefers `.cursor-pipeline/`; if PHP cannot write there (common under www-data), falls back to `storage/cursor-pipeline/`.
+ * Override with CURSOR_PIPELINE_RUNTIME_DIR (must stay under the app root).
+ */
+function ff_cursor_pipeline_runtime_base(): string {
+    static $cached = null;
+    if ($cached !== null) {
+        return $cached;
+    }
+    $root = __DIR__;
+    $rootReal = realpath($root);
+    $rootPrefix = ($rootReal !== false) ? $rootReal : $root;
+    $candidates = [];
+    $envRun = getenv('CURSOR_PIPELINE_RUNTIME_DIR');
+    if (is_string($envRun) && trim($envRun) !== '') {
+        $norm = trim($envRun);
+        if ($norm[0] !== '/' && strpos($norm, ':\\') === false) {
+            $norm = $root . DIRECTORY_SEPARATOR . str_replace(['/', '\\'], DIRECTORY_SEPARATOR, trim($norm, '/\\'));
+        }
+        $ancestor = $norm;
+        while ($ancestor !== $root && $ancestor !== dirname($ancestor) && !is_dir($ancestor)) {
+            $ancestor = dirname($ancestor);
+        }
+        $ar = realpath($ancestor);
+        if ($ar !== false && str_starts_with($ar, $rootPrefix)) {
+            $candidates[] = $norm;
+        }
+    }
+    $candidates[] = $root . DIRECTORY_SEPARATOR . '.cursor-pipeline';
+    $candidates[] = $root . DIRECTORY_SEPARATOR . 'storage' . DIRECTORY_SEPARATOR . 'cursor-pipeline';
+
+    foreach ($candidates as $base) {
+        if (!is_dir($base)) {
+            @mkdir($base, 0775, true);
+        }
+        $tr = $base . DIRECTORY_SEPARATOR . 'triggers';
+        $pr = $base . DIRECTORY_SEPARATOR . 'prompts';
+        if (!is_dir($tr)) {
+            @mkdir($tr, 0775, true);
+        }
+        if (!is_dir($pr)) {
+            @mkdir($pr, 0775, true);
+        }
+        if (is_dir($tr) && is_writable($tr) && is_dir($pr) && is_writable($pr)) {
+            $cached = $base;
+            return $cached;
+        }
+    }
+    $cached = $candidates[0];
+    return $cached;
+}
+
+/** Repo-local Cursor automation dir (triggers, prompts, agent log) — same tree as runtime base. */
 function ff_cursor_pipeline_dir(): string {
-    return __DIR__ . DIRECTORY_SEPARATOR . '.cursor-pipeline';
+    return ff_cursor_pipeline_runtime_base();
 }
 
 /** Absolute path prefix for prompt `.md` files (must stay under ff_cursor_pipeline_dir()). */
 function ff_cursor_pipeline_prompts_dir(): string {
     return ff_cursor_pipeline_dir() . DIRECTORY_SEPARATOR . 'prompts';
+}
+
+/** Append-only JSONL for pipeline / Cursor agent decisions (readable from Pipelines tab). */
+function ff_pipeline_trace_path(): string {
+    return ff_cursor_pipeline_dir() . DIRECTORY_SEPARATOR . 'pipeline-trace.jsonl';
+}
+
+function ff_pipeline_trace_log(string $event, array $context = []): void {
+    $path = ff_pipeline_trace_path();
+    $dir = dirname($path);
+    if (!is_dir($dir) && !@mkdir($dir, 0755, true)) {
+        return;
+    }
+    $line = json_encode([
+        'ts' => date('c'),
+        'event' => $event,
+        'context' => ff_debug_sanitize($context),
+    ], JSON_UNESCAPED_SLASHES) . "\n";
+    @file_put_contents($path, $line, FILE_APPEND | LOCK_EX);
+    $sz = @filesize($path);
+    if ($sz !== false && $sz > 600000) {
+        $data = @file_get_contents($path);
+        if ($data !== false && strlen($data) > 400000) {
+            @file_put_contents($path, substr($data, -400000), LOCK_EX);
+        }
+    }
+}
+
+function ff_read_tail_bytes(string $path, int $maxBytes): string {
+    if (!is_readable($path)) {
+        return '';
+    }
+    $sz = @filesize($path);
+    if ($sz === false || $sz <= $maxBytes) {
+        return (string) @file_get_contents($path);
+    }
+    $fp = @fopen($path, 'rb');
+    if (!$fp) {
+        return '';
+    }
+    fseek($fp, -$maxBytes, SEEK_END);
+    $out = fread($fp, $maxBytes);
+    fclose($fp);
+    return is_string($out) ? $out : '';
+}
+
+/** Recent files in a directory (newest mtime first). */
+function ff_list_dir_files_recent(string $dir, int $limit = 25): array {
+    if (!is_dir($dir) || !is_readable($dir)) {
+        return [];
+    }
+    $pairs = [];
+    foreach (glob($dir . '/*') ?: [] as $f) {
+        if (!is_file($f)) {
+            continue;
+        }
+        $pairs[] = ['name' => basename($f), 'mtime' => @filemtime($f) ?: 0, 'size' => @filesize($f) ?: 0];
+    }
+    usort($pairs, fn ($a, $b) => ($b['mtime'] <=> $a['mtime']));
+    return array_slice($pairs, 0, $limit);
+}
+
+/** Trigger JSON files only (excludes README.md etc.). */
+function ff_list_trigger_json_files_recent(string $dir, int $limit = 30): array {
+    if (!is_dir($dir) || !is_readable($dir)) {
+        return [];
+    }
+    $pairs = [];
+    foreach (glob($dir . '/trigger_*.json') ?: [] as $f) {
+        if (!is_file($f)) {
+            continue;
+        }
+        $pairs[] = ['name' => basename($f), 'mtime' => @filemtime($f) ?: 0, 'size' => @filesize($f) ?: 0];
+    }
+    usort($pairs, fn ($a, $b) => ($b['mtime'] <=> $a['mtime']));
+    return array_slice($pairs, 0, $limit);
+}
+
+function ff_php_effective_user(): string {
+    if (function_exists('posix_geteuid') && function_exists('posix_getpwuid')) {
+        $u = @posix_getpwuid(posix_geteuid());
+        if (is_array($u) && !empty($u['name'])) {
+            return (string) $u['name'];
+        }
+    }
+    $u = getenv('USER') ?: getenv('LOGNAME');
+    return is_string($u) && $u !== '' ? $u : '(unknown)';
+}
+
+/**
+ * Path to the PHP CLI binary for subprocesses (nohup cursor-agent-run). Under PHP-FPM, PHP_BINARY
+ * is often php-fpm; invoking that with script args prints FPM help instead of running index.php.
+ */
+function ff_php_cli_binary(): string {
+    static $cached = null;
+    if ($cached !== null) {
+        return $cached;
+    }
+    foreach (['PHP_CLI_BINARY', 'FORMATFORGE_PHP_CLI'] as $envKey) {
+        $v = getenv($envKey);
+        if (is_string($v) && $v !== '') {
+            $v = trim($v);
+            if ($v !== '' && is_executable($v)) {
+                $cached = $v;
+                return $cached;
+            }
+        }
+    }
+    $pb = (string) PHP_BINARY;
+    if ($pb !== '' && is_executable($pb) && stripos(basename($pb), 'fpm') === false) {
+        $cached = $pb;
+        return $cached;
+    }
+    foreach (['/usr/bin/php', '/usr/local/bin/php', '/bin/php'] as $try) {
+        if (is_executable($try)) {
+            $cached = $try;
+            return $cached;
+        }
+    }
+    $cached = 'php';
+    return $cached;
+}
+
+/**
+ * Try to create .cursor-pipeline layout (no-op if already present). Does not fix ownership.
+ */
+function ff_ensure_cursor_pipeline_dirs(): void {
+    $cd = ff_cursor_pipeline_dir();
+    foreach ([$cd, $cd . '/triggers', ff_cursor_pipeline_prompts_dir()] as $d) {
+        if (!is_dir($d)) {
+            @mkdir($d, 0775, true);
+        }
+    }
+}
+
+function ff_cursor_pipeline_permissions_hint(string $triggerDir, bool $triggerWritable): ?string {
+    if ($triggerWritable) {
+        return null;
+    }
+    $user = ff_php_effective_user();
+    return "trigger_dir_not_writable: PHP-FPM runs as `{$user}` but cannot write trigger JSON under `{$triggerDir}`. "
+        . 'Run from repo root: `sudo ./scripts/ensure-cursor-pipeline-perms.sh` (or `sudo chown -R www-data:www-data .cursor-pipeline storage/cursor-pipeline` if your pool user is www-data). '
+        . 'If `.cursor-pipeline/` cannot be made writable, FormatForge falls back to `storage/cursor-pipeline/` (created automatically when writable). '
+        . 'Then reload php-fpm. See DEPLOYMENT.md §4.';
+}
+
+function ff_pipeline_trace_tail(int $maxLines = 120): array {
+    $path = ff_pipeline_trace_path();
+    if (!is_readable($path)) {
+        return [];
+    }
+    $raw = ff_read_tail_bytes($path, 512000);
+    if ($raw === '') {
+        return [];
+    }
+    $lines = preg_split("/\r\n|\n|\r/", $raw) ?: [];
+    $lines = array_values(array_filter($lines, fn ($l) => trim((string) $l) !== ''));
+    $out = [];
+    foreach (array_slice($lines, -$maxLines) as $ln) {
+        $dec = json_decode((string) $ln, true);
+        $out[] = is_array($dec) ? $dec : ['ts' => null, 'event' => 'trace_line_parse_error', 'raw' => substr((string) $ln, 0, 240)];
+    }
+    return $out;
+}
+
+/**
+ * Server-side snapshot for the Pipelines tab: env flags, trace tail, cursor-agent.log tail, trigger/prompt files.
+ */
+function ff_pipeline_diagnostics_bundle(?string $authHeader): array {
+    ff_ensure_cursor_pipeline_dirs();
+    $cfg = $GLOBALS['CONFIG'] ?? [];
+    $triggerDir = (string) ($cfg['cursor_pipeline_trigger_dir'] ?? '');
+    $cdir = ff_cursor_pipeline_dir();
+    $promptsDir = ff_cursor_pipeline_prompts_dir();
+    $agentLog = $cdir . '/cursor-agent.log';
+    $tracePath = ff_pipeline_trace_path();
+    $antflyUrl = trim((string) ($cfg['antfly_url'] ?? ''));
+    $triggerWritable = $triggerDir !== '' && is_dir($triggerDir) && is_writable($triggerDir);
+    $promptsExist = is_dir($promptsDir);
+    $promptsWritable = $promptsExist && is_writable($promptsDir);
+    $cdWritable = is_dir($cdir) && is_writable($cdir);
+    $runtimeBase = ff_cursor_pipeline_runtime_base();
+    $usingStorageFallback = str_replace('\\', '/', $runtimeBase) === str_replace('\\', '/', __DIR__ . DIRECTORY_SEPARATOR . 'storage' . DIRECTORY_SEPARATOR . 'cursor-pipeline');
+    $out = [
+        'env' => [
+            'php_effective_user' => ff_php_effective_user(),
+            'antfly_url_configured' => $antflyUrl !== '',
+            'cursor_agent_enabled' => !empty($cfg['cursor_agent_enabled']),
+            'novel_threshold' => (float) ($cfg['novel_threshold'] ?? 0.35),
+            'cursor_pipeline_runtime_base' => $runtimeBase,
+            'cursor_pipeline_using_storage_fallback' => $usingStorageFallback,
+            'cursor_pipeline_trigger_dir' => $triggerDir,
+            'trigger_dir_exists' => $triggerDir !== '' && is_dir($triggerDir),
+            'trigger_dir_writable' => $triggerWritable,
+            'cursor_pipeline_dir' => $cdir,
+            'cursor_pipeline_dir_writable' => $cdWritable,
+            'prompts_dir_exists' => $promptsExist,
+            'prompts_dir_writable' => $promptsWritable,
+        ],
+        'permissions_hint' => ff_cursor_pipeline_permissions_hint($triggerDir, $triggerWritable),
+        'cursor_agent_log_path' => $agentLog,
+        'cursor_agent_log_bytes' => is_readable($agentLog) ? (@filesize($agentLog) ?: 0) : null,
+        'cursor_agent_log_tail' => ff_read_tail_bytes($agentLog, 96000),
+        'pipeline_trace_path' => $tracePath,
+        'pipeline_trace_tail' => ff_pipeline_trace_tail(140),
+        'recent_triggers' => $triggerDir !== '' ? ff_list_trigger_json_files_recent($triggerDir, 30) : [],
+        'recent_prompts' => is_dir($promptsDir) ? ff_list_dir_files_recent($promptsDir, 30) : [],
+    ];
+    if ($authHeader) {
+        $out['env']['active_pipeline_count'] = fetch_active_pipeline_row_count($authHeader);
+    } else {
+        $out['env']['active_pipeline_count'] = null;
+    }
+    return $out;
 }
 
 $pbUrl = null;
@@ -148,10 +452,46 @@ if (!is_string($cursorPipelineTriggerDir) || trim($cursorPipelineTriggerDir) ===
     $legacyPiTrigger = getenv('PI_TRIGGER_DIR');
     $cursorPipelineTriggerDir = (is_string($legacyPiTrigger) && trim($legacyPiTrigger) !== '')
         ? trim($legacyPiTrigger)
-        : (__DIR__ . '/.cursor-pipeline/triggers');
+        : (ff_cursor_pipeline_runtime_base() . '/triggers');
 } else {
     $cursorPipelineTriggerDir = trim($cursorPipelineTriggerDir);
 }
+
+$caeEnv = getenv('CURSOR_AGENT_ENABLED');
+if ($caeEnv === false || trim((string) $caeEnv) === '') {
+    $caeEnv = '1';
+}
+$cursorAgentEnabled = !in_array(strtolower(trim((string) $caeEnv)), ['0', 'false', 'no', 'off'], true);
+
+/**
+ * Browser-facing Garage base URL. Prefer GARAGE_PUBLIC_URL; else build virtual-hosted
+ * {scheme}://{GARAGE_BUCKET}.web.{GARAGE_PUBLIC_ROOT_DOMAIN} when root domain is set.
+ */
+function ff_resolve_garage_public_url(): string {
+    $explicit = trim((string) (getenv('GARAGE_PUBLIC_URL') ?: ''));
+    if ($explicit !== '') {
+        $out = rtrim($explicit, '/');
+        return ff_upgrade_http_media_url_if_app_https($out);
+    }
+    $root = trim((string) (getenv('GARAGE_PUBLIC_ROOT_DOMAIN') ?: getenv('GARAGE_WEB_HOST') ?: ''));
+    if ($root === '') {
+        return '';
+    }
+    $root = trim($root, '/');
+    $bucket = trim((string) (getenv('GARAGE_BUCKET') ?: 'formatforge'));
+    $scheme = 'https';
+    $schemeEnv = strtolower(trim((string) (getenv('GARAGE_PUBLIC_SCHEME') ?: '')));
+    if ($schemeEnv === 'http' || $schemeEnv === 'https') {
+        $scheme = $schemeEnv;
+    } elseif (getenv('APP_URL')) {
+        $u = parse_url((string) getenv('APP_URL'));
+        if (!empty($u['scheme']) && $u['scheme'] === 'http') {
+            $scheme = 'http';
+        }
+    }
+    return "{$scheme}://{$bucket}.web.{$root}";
+}
+
 $CONFIG = [
     'pocketbase_url'   => $pbUrl,
     'pocketbase_public_url' => $pbPublicUrl,
@@ -159,13 +499,15 @@ $CONFIG = [
     'pocketbase_admin_url' => rtrim($pbPublicUrl, '/') . '/_/',
     'site_url'         => $siteUrl,
     'site_name'        => getenv('SITE_NAME') ?: 'FormatForge',
-    'app_version'      => getenv('APP_VERSION') ?: 'v1.0.78',
+    'app_version'      => getenv('APP_VERSION') ?: 'v1.1.19',
     'users_collection' => 'users',
     'garage_endpoint'  => getenv('GARAGE_ENDPOINT') ?: 'http://127.0.0.1:3900',
     'garage_key'       => getenv('GARAGE_ACCESS_KEY') ?: '',
     'garage_secret'    => getenv('GARAGE_SECRET_KEY') ?: '',
     'garage_bucket'    => getenv('GARAGE_BUCKET') ?: 'formatforge',
     'garage_region'    => getenv('GARAGE_REGION') ?: 'garage',
+    /** Browser / Instagram: set GARAGE_PUBLIC_URL or GARAGE_PUBLIC_ROOT_DOMAIN (+ GARAGE_BUCKET); S3 API stays on GARAGE_ENDPOINT */
+    'garage_public_url' => ff_resolve_garage_public_url(),
     'replicate_token' => getenv('REPLICATE_API_TOKEN') ?: '',
     'fal_key'         => getenv('FAL_KEY') ?: '',
     'video_provider'   => getenv('VIDEO_PROVIDER') ?: '',  // replicate|fal; auto if empty
@@ -199,7 +541,8 @@ $CONFIG = [
         $h = getenv('CURSOR_AGENT_HOME');
         return (is_string($h) && trim($h) !== '') ? trim($h) : '';
     })(),
-    'cursor_agent_enabled' => !in_array(strtolower((string)(getenv('CURSOR_AGENT_ENABLED') ?: '1')), ['0', 'false', 'no', 'off'], true),
+    /** Pipeline triggers always invoke the Cursor CLI when possible; set CURSOR_AGENT_ENABLED=0 only for emergency debugging. */
+    'cursor_agent_enabled' => $cursorAgentEnabled,
 ];
 if (file_exists(__DIR__ . '/config.php')) {
     $CONFIG = array_merge($CONFIG, require __DIR__ . '/config.php');
@@ -451,20 +794,204 @@ function is_internal_network(): bool {
 
 function pb_request(string $method, string $path, $data = null, ?string $token = null): array {
     $ch = curl_init($GLOBALS['CONFIG']['pocketbase_url'] . $path);
-    $headers = ['Content-Type: application/json'];
-    if ($token) $headers[] = 'Authorization: ' . $token;
+    $headers = ['Accept: application/json'];
+    $methodUpper = strtoupper($method);
+    $sendsBody = $data !== null && in_array($methodUpper, ['POST', 'PATCH', 'PUT'], true);
+    if ($sendsBody) {
+        $headers[] = 'Content-Type: application/json';
+    }
+    if ($token) {
+        $headers[] = 'Authorization: ' . $token;
+    }
     curl_setopt_array($ch, [
         CURLOPT_RETURNTRANSFER => true,
         CURLOPT_CUSTOMREQUEST  => $method,
         CURLOPT_HTTPHEADER     => $headers,
     ]);
-    if ($data !== null) curl_setopt($ch, CURLOPT_POSTFIELDS, is_array($data) ? json_encode($data) : $data);
+    if ($data !== null) {
+        curl_setopt($ch, CURLOPT_POSTFIELDS, is_array($data) ? json_encode($data) : $data);
+    }
     $res = curl_exec($ch);
     $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
     $errNo = curl_errno($ch);
     curl_close($ch);
     $body = json_decode($res ?: '{}', true) ?? [];
     return ['code' => $code, 'body' => $body, 'raw' => $res ?: '', 'curl_errno' => $errNo];
+}
+
+/** Multipart create/update for PocketBase file fields (multipart/form-data, not JSON). */
+function pb_request_multipart(string $method, string $path, array $postData, ?string $token): array {
+    $url = $GLOBALS['CONFIG']['pocketbase_url'] . $path;
+    $headers = ['Accept: application/json'];
+    if ($token) {
+        $headers[] = 'Authorization: ' . $token;
+    }
+    $ch = curl_init($url);
+    curl_setopt_array($ch, [
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_CUSTOMREQUEST => strtoupper($method),
+        CURLOPT_HTTPHEADER => $headers,
+        CURLOPT_POSTFIELDS => $postData,
+    ]);
+    $res = curl_exec($ch);
+    $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $errNo = curl_errno($ch);
+    curl_close($ch);
+    $body = json_decode($res ?: '{}', true) ?? [];
+    return ['code' => $code, 'body' => $body, 'raw' => $res ?: '', 'curl_errno' => $errNo];
+}
+
+function ff_curl_file(string $path, string $mime, string $postname): CURLFile {
+    if (function_exists('curl_file_create')) {
+        return curl_file_create($path, $mime, $postname);
+    }
+    return new CURLFile($path, $mime, $postname);
+}
+
+/** Public URL for a PocketBase file field (uses site-facing proxy /api/files/...). */
+function ff_pb_public_file_url(string $collectionId, string $recordId, string $filename): string {
+    $collectionId = trim($collectionId);
+    $recordId = trim($recordId);
+    $filename = trim($filename);
+    if ($collectionId === '' || $recordId === '' || $filename === '') {
+        return '';
+    }
+    $base = rtrim((string) ($GLOBALS['CONFIG']['pocketbase_public_url'] ?? ''), '/');
+    if ($base === '') {
+        return '';
+    }
+    return $base . '/api/files/' . rawurlencode($collectionId) . '/' . rawurlencode($recordId) . '/' . rawurlencode($filename);
+}
+
+/**
+ * PocketBase internal id for the content_items collection. List responses often omit `collectionId` per row;
+ * set POCKETBASE_CONTENT_ITEMS_COLLECTION_ID in .env to avoid a superuser lookup on first request.
+ */
+function ff_content_items_collection_id(): string {
+    static $cached = null;
+    if ($cached !== null) {
+        return $cached;
+    }
+    $env = trim((string) (getenv('POCKETBASE_CONTENT_ITEMS_COLLECTION_ID') ?: ''));
+    if ($env !== '') {
+        $cached = $env;
+        return $cached;
+    }
+    $auth = pb_superuser_auth_token();
+    if (!$auth['ok']) {
+        $cached = '';
+        return $cached;
+    }
+    $f = pb_fetch_collection('content_items', $auth['token']);
+    $cached = ($f['ok'] ?? false) ? trim((string) ($f['collection']['id'] ?? '')) : '';
+    return $cached;
+}
+
+/** Prefer media_file on PocketBase; else garage_url / thumbnail. */
+function ff_content_item_effective_media_url(array $item): string {
+    $fn = trim((string) ($item['media_file'] ?? ''));
+    $cid = trim((string) ($item['collectionId'] ?? ''));
+    $rid = trim((string) ($item['id'] ?? ''));
+    if ($cid === '') {
+        $cid = ff_content_items_collection_id();
+    }
+    if ($fn !== '' && $cid !== '' && $rid !== '') {
+        $u = ff_pb_public_file_url($cid, $rid, $fn);
+        if ($u !== '') {
+            return $u;
+        }
+    }
+    $g = trim((string) ($item['garage_url'] ?? ''));
+    if ($g !== '') {
+        return ff_upgrade_http_media_url_if_app_https($g);
+    }
+    return ff_upgrade_http_media_url_if_app_https(trim((string) ($item['thumbnail_url'] ?? '')));
+}
+
+/**
+ * Injects collectionId when missing and ff_display_media_url (PocketBase /api/files/… first) for dashboard clients.
+ */
+function ff_pb_enrich_content_items_response(array $body): array {
+    if (isset($body['items']) && is_array($body['items'])) {
+        $collId = ff_content_items_collection_id();
+        foreach ($body['items'] as $i => $it) {
+            if (!is_array($it)) {
+                continue;
+            }
+            if ($collId !== '' && empty($it['collectionId'])) {
+                $it['collectionId'] = $collId;
+            }
+            $url = ff_content_item_effective_media_url($it);
+            if ($url !== '') {
+                $it['ff_display_media_url'] = $url;
+            }
+            $body['items'][$i] = $it;
+        }
+        return $body;
+    }
+    if (isset($body['id'])) {
+        $collId = ff_content_items_collection_id();
+        if ($collId !== '' && empty($body['collectionId'])) {
+            $body['collectionId'] = $collId;
+        }
+        $url = ff_content_item_effective_media_url($body);
+        if ($url !== '') {
+            $body['ff_display_media_url'] = $url;
+        }
+    }
+    return $body;
+}
+
+function repair_content_items_media_schema(): array {
+    $auth = pb_superuser_auth_token();
+    if (!$auth['ok']) {
+        return ['ok' => false, 'error' => $auth['error'] ?? 'Superuser auth failed'];
+    }
+    $token = $auth['token'];
+    $fetched = pb_fetch_collection('content_items', $token);
+    if (!$fetched['ok']) {
+        return ['ok' => false, 'error' => $fetched['error'] ?? 'Collection fetch failed'];
+    }
+    $collection = $fetched['collection'];
+    $fields = is_array($collection['fields'] ?? null) ? $collection['fields'] : [];
+    $has = false;
+    foreach ($fields as $f) {
+        if (($f['name'] ?? '') === 'media_file') {
+            $has = true;
+            break;
+        }
+    }
+    if ($has) {
+        return ['ok' => true, 'changed' => false, 'message' => 'media_file already present'];
+    }
+    $fields[] = [
+        'name' => 'media_file',
+        'type' => 'file',
+        'maxSelect' => 1,
+        'maxSize' => 1073741824,
+        'mimeTypes' => [],
+        'required' => false,
+        'hidden' => false,
+    ];
+    $payload = [
+        'name' => $collection['name'] ?? 'content_items',
+        'type' => $collection['type'] ?? 'base',
+        'listRule' => $collection['listRule'] ?? '@request.auth.id != ""',
+        'viewRule' => $collection['viewRule'] ?? '@request.auth.id != ""',
+        'createRule' => $collection['createRule'] ?? '@request.auth.id != ""',
+        'updateRule' => $collection['updateRule'] ?? '@request.auth.id != ""',
+        'deleteRule' => $collection['deleteRule'] ?? '@request.auth.id != ""',
+        'fields' => $fields,
+    ];
+    if (isset($collection['indexes'])) {
+        $payload['indexes'] = $collection['indexes'];
+    }
+    $collectionId = $collection['id'] ?? 'content_items';
+    $up = pb_request('PATCH', '/api/collections/' . rawurlencode($collectionId), $payload, $token);
+    if ($up['code'] >= 200 && $up['code'] < 300) {
+        return ['ok' => true, 'changed' => true, 'collection_id' => $collectionId];
+    }
+    return ['ok' => false, 'error' => $up['body']['message'] ?? ('HTTP ' . $up['code']), 'details' => $up['body'] ?? []];
 }
 
 /** PocketBase API: map field name -> validation message from `data` (no secrets). */
@@ -750,6 +1277,102 @@ function formatforge_sync_content_metrics_insights(?string $authHeader, int $max
     return $out;
 }
 
+function garage_encode_object_key(string $key): string {
+    $key = trim(str_replace('\\', '/', $key), '/');
+    if ($key === '') {
+        return '';
+    }
+    return implode('/', array_map('rawurlencode', explode('/', $key)));
+}
+
+/**
+ * URL for clients (browser, Meta video_url). Uses GARAGE_PUBLIC_URL when set; otherwise path-style on GARAGE_ENDPOINT.
+ * Virtual-hosted Garage: set GARAGE_PUBLIC_URL to http(s)://{GARAGE_BUCKET}.web.{node-host}/ (host must start with "{bucket}.web.").
+ */
+function garage_public_url_for_key(string $key): string {
+    $cfg = $GLOBALS['CONFIG'];
+    $keyPart = garage_encode_object_key($key);
+    $ep = rtrim((string) $cfg['garage_endpoint'], '/');
+    $bucket = (string) $cfg['garage_bucket'];
+    $public = trim((string) ($cfg['garage_public_url'] ?? ''));
+    if ($public === '') {
+        return $keyPart === '' ? "{$ep}/{$bucket}" : "{$ep}/{$bucket}/{$keyPart}";
+    }
+    $public = rtrim($public, '/');
+    $host = strtolower((string) (parse_url($public, PHP_URL_HOST) ?? ''));
+    $vhPrefix = strtolower($bucket) . '.web.';
+    if ($host !== '' && str_starts_with($host, $vhPrefix)) {
+        return $keyPart === '' ? $public : "{$public}/{$keyPart}";
+    }
+    return $keyPart === '' ? "{$public}/{$bucket}" : "{$public}/{$bucket}/{$keyPart}";
+}
+
+/**
+ * When the app is served over HTTPS, rewrite http:// media URLs to https:// so browsers load images (mixed content).
+ * Set GARAGE_PUBLIC_SCHEME=http to keep http:// explicitly (e.g. dev-only HTTP Garage).
+ */
+function ff_upgrade_http_media_url_if_app_https(string $url): string {
+    $url = trim($url);
+    if ($url === '' || !str_starts_with($url, 'http://')) {
+        return $url;
+    }
+    $app = getenv('APP_URL');
+    if (!is_string($app) || !str_starts_with(trim($app), 'https://')) {
+        return $url;
+    }
+    $forceHttp = strtolower(trim((string) (getenv('GARAGE_PUBLIC_SCHEME') ?: '')));
+    if ($forceHttp === 'http') {
+        return $url;
+    }
+    return 'https://' . substr($url, 7);
+}
+
+/** True when garage_url is http(s) with host 127.0.0.1, localhost, or ::1 (bad for browsers / Meta). */
+function ff_garage_url_uses_loopback_host(string $url): bool {
+    $url = trim($url);
+    if ($url === '' || !preg_match('~^https?://~i', $url)) {
+        return false;
+    }
+    $h = strtolower((string) (parse_url($url, PHP_URL_HOST) ?? ''));
+    return $h === '127.0.0.1' || $h === 'localhost' || $h === '[::1]' || $h === '::1';
+}
+
+/**
+ * All content_items ids with the given source_link_id (paginated). False on list failure.
+ *
+ * @return list<string>|false
+ */
+function ff_pb_content_item_ids_for_source_link(string $authHeader, string $sourceLinkId): array|false {
+    $esc = str_replace(['\\', '"'], ['\\\\', '\\"'], $sourceLinkId);
+    $ids = [];
+    $page = 1;
+    $perPage = 100;
+    while (true) {
+        $qs = http_build_query([
+            'filter' => 'source_link_id = "' . $esc . '"',
+            'perPage' => $perPage,
+            'page' => $page,
+            'sort' => '-@rowid',
+        ]);
+        $r = pb_request('GET', '/api/collections/content_items/records?' . $qs, null, $authHeader);
+        if ($r['code'] !== 200) {
+            return false;
+        }
+        $items = $r['body']['items'] ?? [];
+        foreach ($items as $it) {
+            $id = (string) ($it['id'] ?? '');
+            if ($id !== '') {
+                $ids[] = $id;
+            }
+        }
+        if (count($items) < $perPage) {
+            break;
+        }
+        $page++;
+    }
+    return $ids;
+}
+
 function s3_upload(string $key, string $content, string $contentType = 'video/mp4'): ?string {
     $cfg = $GLOBALS['CONFIG'];
     if (empty($cfg['garage_key']) || empty($cfg['garage_secret'])) return null;
@@ -786,7 +1409,7 @@ function s3_upload(string $key, string $content, string $contentType = 'video/mp
     $res = curl_exec($ch);
     $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
     curl_close($ch);
-    return ($code >= 200 && $code < 300) ? ($cfg['garage_endpoint'] . '/' . $cfg['garage_bucket'] . '/' . $key) : null;
+    return ($code >= 200 && $code < 300) ? garage_public_url_for_key($key) : null;
 }
 
 function replicate_run(string $model, array $input, int $waitSec = 60): ?array {
@@ -1402,7 +2025,7 @@ function formatforge_sync_pipeline_refs_to_antfly(?string $authHeader): void {
     if (!formatforge_antfly_novelty_configured() || !$authHeader) {
         return;
     }
-    $r = pb_request('GET', '/api/collections/pipelines/records?perPage=200&sort=-updated', null, $authHeader);
+    $r = pb_request('GET', '/api/collections/pipelines/records?perPage=200&sort=-%40rowid', null, $authHeader);
     if ($r['code'] !== 200) {
         return;
     }
@@ -1526,7 +2149,7 @@ function pipeline_record_is_active_for_feed(array $p): bool {
  * Count active pipeline rows (Instagram-bound). Novelty vs templates is done in Antfly after syncing `pipeline_refs`.
  */
 function fetch_active_pipeline_row_count(?string $authHeader): int {
-    $r = pb_request('GET', '/api/collections/pipelines/records?perPage=200&sort=-updated', null, $authHeader);
+    $r = pb_request('GET', '/api/collections/pipelines/records?perPage=200&sort=-%40rowid', null, $authHeader);
     if ($r['code'] !== 200) {
         return 0;
     }
@@ -1644,7 +2267,7 @@ function ff_cursor_agent_operating_context(?string $authHeader): array {
     }
     $out['active_pipelines_count'] = fetch_active_pipeline_row_count($authHeader);
 
-    $pr = pb_request('GET', '/api/collections/pipelines/records?perPage=5&sort=-updated', null, $authHeader);
+    $pr = pb_request('GET', '/api/collections/pipelines/records?perPage=5&sort=-%40rowid', null, $authHeader);
     $pipelines = [];
     if ($pr['code'] === 200) {
         foreach ($pr['body']['items'] ?? [] as $p) {
@@ -1712,7 +2335,7 @@ function ff_cursor_agent_operating_context(?string $authHeader): array {
     }
     $out['content_metrics_by_item_id'] = $metricsById;
 
-    $qAll = http_build_query(['sort' => '-created', 'perPage' => 48]);
+    $qAll = http_build_query(['sort' => '-@rowid', 'perPage' => 48]);
     $all = pb_request('GET', '/api/collections/content_items/records?' . $qAll, null, $authHeader);
     $fetched = [];
     $generated = [];
@@ -1746,11 +2369,11 @@ function count_consecutive_rejects_for_pipeline(string $pipelineId, ?string $aut
     if ($pipelineId === '' || !$authHeader) return 0;
     $escaped = str_replace(['\\', '"'], ['\\\\', '\\"'], $pipelineId);
     $filter = 'metadata.pipeline_id = "' . $escaped . '"';
-    $qs = http_build_query(['filter' => $filter, 'sort' => '-updated', 'perPage' => 60]);
+    $qs = http_build_query(['filter' => $filter, 'sort' => '-@rowid', 'perPage' => 60]);
     $r = pb_request('GET', '/api/collections/content_items/records?' . $qs, null, $authHeader);
     $items = ($r['code'] === 200) ? ($r['body']['items'] ?? []) : [];
     if ($items === []) {
-        $qs2 = http_build_query(['sort' => '-updated', 'perPage' => 200]);
+        $qs2 = http_build_query(['sort' => '-@rowid', 'perPage' => 200]);
         $r2 = pb_request('GET', '/api/collections/content_items/records?' . $qs2, null, $authHeader);
         if ($r2['code'] !== 200) return 0;
         foreach ($r2['body']['items'] ?? [] as $it) {
@@ -1779,10 +2402,27 @@ function count_consecutive_rejects_for_pipeline(string $pipelineId, ?string $aut
  */
 function maybe_trigger_cursor_create_pipeline_after_fetch(array $novelIndexPrompts, ?string $authHeader): void {
     $cfg = $GLOBALS['CONFIG'];
-    if (empty($cfg['cursor_pipeline_trigger_dir']) || $novelIndexPrompts === []) return;
-    if (!formatforge_antfly_novelty_configured()) return;
+    if (empty($cfg['cursor_pipeline_trigger_dir'])) {
+        ff_pipeline_trace_log('create_pipeline_after_fetch_skip', ['reason' => 'empty_trigger_dir_config']);
+        return;
+    }
+    if ($novelIndexPrompts === []) {
+        ff_pipeline_trace_log('create_pipeline_after_fetch_skip', ['reason' => 'no_novel_semantic_blobs']);
+        return;
+    }
+    if (!formatforge_antfly_novelty_configured()) {
+        ff_pipeline_trace_log('create_pipeline_after_fetch_skip', ['reason' => 'antfly_url_not_configured']);
+        return;
+    }
     $novelIndexPrompts = array_values(array_unique(array_filter(array_map('trim', $novelIndexPrompts))));
-    if ($novelIndexPrompts === []) return;
+    if ($novelIndexPrompts === []) {
+        ff_pipeline_trace_log('create_pipeline_after_fetch_skip', ['reason' => 'novel_prompts_empty_after_dedupe']);
+        return;
+    }
+    ff_pipeline_trace_log('create_pipeline_after_fetch_trigger', [
+        'prompt_count' => count($novelIndexPrompts),
+        'first_excerpt' => substr($novelIndexPrompts[0] ?? '', 0, 280),
+    ]);
     trigger_pipeline_cursor_agent('novel_fetched_content', [
         'intent' => 'create_pipeline',
         'fetched_index_prompts' => $novelIndexPrompts,
@@ -1795,16 +2435,42 @@ function maybe_trigger_cursor_create_pipeline_after_fetch(array $novelIndexPromp
  */
 function maybe_trigger_cursor_edit_pipeline_after_reject(array $itemBody, string $contentItemId, string $reason, ?string $authHeader): void {
     $cfg = $GLOBALS['CONFIG'];
-    if (empty($cfg['cursor_pipeline_trigger_dir']) || !$authHeader) return;
+    if (empty($cfg['cursor_pipeline_trigger_dir'])) {
+        ff_pipeline_trace_log('edit_pipeline_after_reject_skip', ['reason' => 'empty_trigger_dir_config', 'content_item_id' => $contentItemId]);
+        return;
+    }
+    if (!$authHeader) {
+        ff_pipeline_trace_log('edit_pipeline_after_reject_skip', ['reason' => 'no_auth', 'content_item_id' => $contentItemId]);
+        return;
+    }
     $meta = $itemBody['metadata'] ?? [];
-    if (!is_array($meta)) return;
+    if (!is_array($meta)) {
+        ff_pipeline_trace_log('edit_pipeline_after_reject_skip', ['reason' => 'bad_metadata', 'content_item_id' => $contentItemId]);
+        return;
+    }
     $pipelineId = trim((string)($meta['pipeline_id'] ?? ''));
-    if ($pipelineId === '') return;
+    if ($pipelineId === '') {
+        ff_pipeline_trace_log('edit_pipeline_after_reject_skip', ['reason' => 'no_pipeline_id_on_item', 'content_item_id' => $contentItemId]);
+        return;
+    }
     $need = (int)($cfg['pipeline_reject_streak'] ?? 3);
     $streak = count_consecutive_rejects_for_pipeline($pipelineId, $authHeader);
-    if ($streak < $need) return;
+    if ($streak < $need) {
+        ff_pipeline_trace_log('edit_pipeline_after_reject_skip', [
+            'reason' => 'streak_below_threshold',
+            'pipeline_id' => $pipelineId,
+            'consecutive_rejects' => $streak,
+            'need' => $need,
+        ]);
+        return;
+    }
     $pRes = pb_request('GET', '/api/collections/pipelines/records/' . rawurlencode($pipelineId), null, $authHeader);
     $pipeline = ($pRes['code'] === 200) ? ($pRes['body'] ?? []) : [];
+    ff_pipeline_trace_log('edit_pipeline_after_reject_trigger', [
+        'pipeline_id' => $pipelineId,
+        'consecutive_rejects' => $streak,
+        'content_item_id' => $contentItemId,
+    ]);
     trigger_pipeline_cursor_agent('pipeline_edit_streak', [
         'intent' => 'edit_pipeline',
         'content_item_id' => $contentItemId,
@@ -1917,19 +2583,23 @@ function ff_shell_env_prefix_for_cursor_agent(): string {
 function spawn_cursor_agent_background(string $promptFile): void {
     $cfg = $GLOBALS['CONFIG'];
     if (empty($cfg['cursor_agent_enabled'])) {
+        ff_pipeline_trace_log('cursor_agent_spawn_skip', ['reason' => 'cursor_agent_disabled']);
         return;
     }
     if (!function_exists('exec')) {
         ff_debug_log('cursor_agent_spawn_failed', ['reason' => 'exec_unavailable']);
+        ff_pipeline_trace_log('cursor_agent_spawn_skip', ['reason' => 'exec_unavailable']);
         return;
     }
     $root = __DIR__;
     $promptReal = realpath($promptFile);
     if (!$promptReal || !is_file($promptReal) || strncmp($promptReal, $root, strlen($root)) !== 0) {
+        ff_pipeline_trace_log('cursor_agent_spawn_skip', ['reason' => 'bad_prompt_path', 'given' => $promptFile]);
         return;
     }
     $prefix = ff_cursor_pipeline_prompts_dir() . DIRECTORY_SEPARATOR;
     if (strncmp($promptReal, $prefix, strlen($prefix)) !== 0) {
+        ff_pipeline_trace_log('cursor_agent_spawn_skip', ['reason' => 'prompt_not_under_prompts_dir', 'basename' => basename($promptReal)]);
         return;
     }
     $logDir = ff_cursor_pipeline_dir();
@@ -1937,7 +2607,7 @@ function spawn_cursor_agent_background(string $promptFile): void {
         $logDir = sys_get_temp_dir();
     }
     $log = $logDir . '/cursor-agent.log';
-    $php = PHP_BINARY && is_executable(PHP_BINARY) ? PHP_BINARY : 'php';
+    $php = ff_php_cli_binary();
     $self = __FILE__;
     $cmd = implode(' ', array_map('escapeshellarg', [$php, $self, 'cursor-agent-run', $promptReal]));
     $envP = ff_shell_env_prefix_for_cursor_agent();
@@ -1946,7 +2616,8 @@ function spawn_cursor_agent_background(string $promptFile): void {
     } else {
         @exec($envP . 'nohup ' . $cmd . ' >> ' . escapeshellarg($log) . ' 2>&1 &');
     }
-    ff_debug_log('cursor_agent_spawn', ['prompt' => basename($promptReal), 'log' => $log]);
+    ff_debug_log('cursor_agent_spawn', ['prompt' => basename($promptReal), 'log' => $log, 'php_cli' => $php]);
+    ff_pipeline_trace_log('cursor_agent_spawn', ['prompt' => basename($promptReal), 'log' => $log, 'php_cli' => $php]);
 }
 
 function trigger_pipeline_cursor_agent(string $reason, array $context, ?string $authHeader = null): void {
@@ -1974,9 +2645,18 @@ function trigger_pipeline_cursor_agent(string $reason, array $context, ?string $
         }
     }
     $dir = $cfg['cursor_pipeline_trigger_dir'] ?? '';
-    if (!$dir) return;
-    if (!is_dir($dir) && !@mkdir($dir, 0755, true)) return;
-    if (!is_writable($dir)) return;
+    if (!$dir) {
+        ff_pipeline_trace_log('trigger_agent_skip', ['reason' => 'no_trigger_dir', 'agent_reason' => $reason]);
+        return;
+    }
+    if (!is_dir($dir) && !@mkdir($dir, 0755, true)) {
+        ff_pipeline_trace_log('trigger_agent_skip', ['reason' => 'mkdir_trigger_dir_failed', 'dir' => $dir, 'agent_reason' => $reason]);
+        return;
+    }
+    if (!is_writable($dir)) {
+        ff_pipeline_trace_log('trigger_agent_skip', ['reason' => 'trigger_dir_not_writable', 'dir' => $dir, 'agent_reason' => $reason]);
+        return;
+    }
     $file = $dir . '/trigger_' . date('YmdHis') . '_' . bin2hex(random_bytes(4)) . '.json';
     $payload = [
         'reason' => $reason,
@@ -1985,19 +2665,25 @@ function trigger_pipeline_cursor_agent(string $reason, array $context, ?string $
         'template_path' => __DIR__ . '/pipelines/template',
     ];
     if (@file_put_contents($file, json_encode($payload, JSON_PRETTY_PRINT))) {
+        ff_pipeline_trace_log('trigger_agent_written', ['trigger_file' => basename($file), 'agent_reason' => $reason]);
         setup_pipeline_from_trigger($file, true);
+    } else {
+        ff_pipeline_trace_log('trigger_agent_skip', ['reason' => 'trigger_file_write_failed', 'dir' => $dir, 'agent_reason' => $reason]);
     }
 }
 
 function setup_pipeline_from_trigger(string $triggerFile, bool $spawnCursorAgent = true): void {
     $projectRoot = __DIR__;
     $cfg = $GLOBALS['CONFIG'];
-    $trigger = json_decode(file_get_contents($triggerFile), true) ?: [];
+    $trigger = json_decode((string) file_get_contents($triggerFile), true) ?: [];
     $reason = $trigger['reason'] ?? 'unknown';
     $context = $trigger['context'] ?? [];
     $templatePath = $trigger['template_path'] ?? $projectRoot . '/pipelines/template';
     $created = $trigger['created'] ?? date('c');
-    if (!is_dir($templatePath)) return;
+    if (!is_dir($templatePath)) {
+        ff_pipeline_trace_log('setup_pipeline_from_trigger_skip', ['reason' => 'template_dir_missing', 'template_path' => $templatePath, 'trigger' => basename($triggerFile)]);
+        return;
+    }
     $triggerBase = basename($triggerFile, '.json');
     $pipelineId = str_replace('trigger_', '', $triggerBase);
     $pipelineDir = $projectRoot . '/pipelines/pipeline-' . $pipelineId;
@@ -2006,7 +2692,7 @@ function setup_pipeline_from_trigger(string $triggerFile, bool $spawnCursorAgent
         if (is_file($f)) copy($f, $pipelineDir . '/' . basename($f));
     }
     if (is_file($templatePath . '/.env.example')) copy($templatePath . '/.env.example', $pipelineDir . '/.env.example');
-    $envVars = ['REPLICATE_API_TOKEN', 'FAL_KEY', 'FAL_VIDEO_MODEL', 'VIDEO_PROVIDER', 'POCKETBASE_URL', 'GARAGE_ENDPOINT', 'GARAGE_ACCESS_KEY', 'GARAGE_SECRET_KEY', 'GARAGE_BUCKET', 'GARAGE_REGION'];
+    $envVars = ['REPLICATE_API_TOKEN', 'FAL_KEY', 'FAL_VIDEO_MODEL', 'VIDEO_PROVIDER', 'POCKETBASE_URL', 'GARAGE_ENDPOINT', 'GARAGE_PUBLIC_URL', 'GARAGE_PUBLIC_ROOT_DOMAIN', 'GARAGE_PUBLIC_SCHEME', 'GARAGE_ACCESS_KEY', 'GARAGE_SECRET_KEY', 'GARAGE_BUCKET', 'GARAGE_REGION'];
     $projectEnv = $projectRoot . '/.env';
     $pipelineEnvLines = [];
     if (is_file($projectEnv)) {
@@ -2020,10 +2706,14 @@ function setup_pipeline_from_trigger(string $triggerFile, bool $spawnCursorAgent
         }
     }
     file_put_contents($pipelineDir . '/.env', implode("\n", array_unique($pipelineEnvLines)) . "\n");
-    $cursorBase = $projectRoot . DIRECTORY_SEPARATOR . '.cursor-pipeline';
-    if (!is_dir($cursorBase)) mkdir($cursorBase, 0755, true);
-    $promptsDir = $cursorBase . DIRECTORY_SEPARATOR . 'prompts';
-    if (!is_dir($promptsDir)) mkdir($promptsDir, 0755, true);
+    $cursorBase = ff_cursor_pipeline_dir();
+    if (!is_dir($cursorBase)) {
+        mkdir($cursorBase, 0755, true);
+    }
+    $promptsDir = ff_cursor_pipeline_prompts_dir();
+    if (!is_dir($promptsDir)) {
+        mkdir($promptsDir, 0755, true);
+    }
     $promptFile = $promptsDir . DIRECTORY_SEPARATOR . 'pipeline-' . $pipelineId . '.md';
     $contextJson = json_encode($context, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES);
     if ($reason === 'pipeline_edit_streak') {
@@ -2053,7 +2743,14 @@ function setup_pipeline_from_trigger(string $triggerFile, bool $spawnCursorAgent
     $promptContent = "# FormatForge pipeline setup\n\n**Project tree:** Triggers, this prompt, and the agent log live under **`.cursor-pipeline/`** next to `index.php` (same FormatForge repo). Cursor is started with **`--workspace \"$projectRoot\"`**, so treat **`.cursor-pipeline/`** as part of the app — open and edit files there like any other project path.\n\n**Trigger:** $reason\n**Created:** $created\n\n## Context\n\n```json\n$contextJson\n```\n\n## Task\n\n$task\n\n## Cursor Agent (headless)\n\nFormatForge spawns the [Cursor CLI](https://cursor.com/cli) **`agent`** with **`-p`** (print), **`--trust`**, **`-f`** (force), **`--model $agentModel`** ([Composer 2 Fast](https://cursor.com/blog/2-0)), **`--workspace`** = **`$projectRoot`** (repo root).\n\nManual re-run:\n\n```bash\nagent -p --trust -f --model $agentModel --workspace \"$projectRoot\" \"Execute every step in: $promptFile\"\n```\n\nAuth: usually **`agent login`** as the PHP-FPM user (no API key). Optional **`CURSOR_API_KEY`** in `.env`. Logs: **`.cursor-pipeline/cursor-agent.log`**.\n";
     file_put_contents($promptFile, $promptContent);
     if ($spawnCursorAgent) {
+        ff_pipeline_trace_log('setup_pipeline_from_trigger_prompt_ready', [
+            'prompt_basename' => basename($promptFile),
+            'pipeline_subdir' => basename($pipelineDir),
+            'trigger_reason' => $reason,
+        ]);
         spawn_cursor_agent_background($promptFile);
+    } else {
+        ff_pipeline_trace_log('setup_pipeline_from_trigger_no_spawn', ['prompt_basename' => basename($promptFile), 'trigger_reason' => $reason]);
     }
 }
 
@@ -2101,6 +2798,13 @@ if (PHP_SAPI === 'cli' && ($argv[1] ?? '') === 'repair-source-links-schema') {
     exit(($r['ok'] ?? false) ? 0 : 1);
 }
 
+// CLI: php index.php repair-content-items-media-schema — add media_file (file) to content_items for /api/files/… URLs
+if (PHP_SAPI === 'cli' && ($argv[1] ?? '') === 'repair-content-items-media-schema') {
+    $r = repair_content_items_media_schema();
+    echo json_encode($r, JSON_PRETTY_PRINT) . "\n";
+    exit(($r['ok'] ?? false) ? 0 : 1);
+}
+
 // CLI: php index.php probe-garage — signed PUT using GARAGE_* from .env (same code path as uploads)
 if (PHP_SAPI === 'cli' && ($argv[1] ?? '') === 'probe-garage') {
     $cfg = $GLOBALS['CONFIG'];
@@ -2111,11 +2815,332 @@ if (PHP_SAPI === 'cli' && ($argv[1] ?? '') === 'probe-garage') {
     $key = '_formatforge_probe_' . gmdate('Ymd\THis\Z') . '.txt';
     $url = s3_upload($key, "garage probe " . gmdate('c'), 'text/plain');
     if ($url) {
-        echo "OK signed PUT\nendpoint: {$cfg['garage_endpoint']}\nbucket: {$cfg['garage_bucket']}\nkey: $key\nurl: $url\n";
+        $pubHint = trim((string) ($cfg['garage_public_url'] ?? ''));
+        echo "OK signed PUT\nendpoint: {$cfg['garage_endpoint']}\nbucket: {$cfg['garage_bucket']}\nkey: $key\npublic_url: $url\n";
+        if ($pubHint === '') {
+            echo "(Tip: set GARAGE_PUBLIC_URL or GARAGE_PUBLIC_ROOT_DOMAIN — e.g. GARAGE_PUBLIC_ROOT_DOMAIN=100.x.x.sslip.io builds https://{$cfg['garage_bucket']}.web.100.x.x.sslip.io)\n";
+        }
         exit(0);
     }
     fwrite(STDERR, "FAIL: s3_upload() returned null. PHP cannot complete SigV4 PUT to GARAGE_ENDPOINT — check GARAGE_ENDPOINT is reachable from this host (e.g. http://127.0.0.1:3900), keys/bucket, and firewall.\n");
     exit(1);
+}
+
+// CLI: php index.php rewrite-garage-urls [--dry-run] — PATCH content_items.garage_url from garage_key using current GARAGE_PUBLIC_* config
+if (PHP_SAPI === 'cli' && ($argv[1] ?? '') === 'rewrite-garage-urls') {
+    $dry = in_array('--dry-run', $argv, true);
+    $token = ff_pb_cli_token();
+    if (!$token) {
+        fwrite(STDERR, "Need ADMIN_EMAIL / ADMIN_PASSWORD (or FORMATFORGE_*)\n");
+        exit(1);
+    }
+    $cfg = $GLOBALS['CONFIG'];
+    if (trim((string) ($cfg['garage_public_url'] ?? '')) === '') {
+        fwrite(STDERR, "Set GARAGE_PUBLIC_URL or GARAGE_PUBLIC_ROOT_DOMAIN (and GARAGE_BUCKET) in .env so public URLs can be computed.\n");
+        exit(1);
+    }
+    $auth = 'Bearer ' . $token;
+    $page = 1;
+    $perPage = 100;
+    $changed = 0;
+    $unchanged = 0;
+    $noKey = 0;
+    while (true) {
+        $qs = http_build_query(['perPage' => $perPage, 'page' => $page, 'sort' => '-@rowid']);
+        $r = pb_request('GET', '/api/collections/content_items/records?' . $qs, null, $auth);
+        if ($r['code'] !== 200) {
+            fwrite(STDERR, "List failed: " . ($r['body']['message'] ?? 'HTTP ' . $r['code']) . "\n");
+            exit(1);
+        }
+        $items = $r['body']['items'] ?? [];
+        foreach ($items as $it) {
+            $id = (string) ($it['id'] ?? '');
+            $gk = trim((string) ($it['garage_key'] ?? ''));
+            $old = trim((string) ($it['garage_url'] ?? ''));
+            if ($id === '') {
+                continue;
+            }
+            if (trim((string) ($it['media_file'] ?? '')) !== '') {
+                continue;
+            }
+            if ($gk === '') {
+                $noKey++;
+                continue;
+            }
+            $new = garage_public_url_for_key($gk);
+            if ($new === $old) {
+                $unchanged++;
+                continue;
+            }
+            echo ($dry ? '[dry-run] ' : '') . "id={$id}\n  old: {$old}\n  new: {$new}\n";
+            if (!$dry) {
+                $patch = pb_request('PATCH', '/api/collections/content_items/records/' . rawurlencode($id), ['garage_url' => $new], $auth);
+                if ($patch['code'] < 200 || $patch['code'] >= 300) {
+                    fwrite(STDERR, "PATCH failed: " . ($patch['body']['message'] ?? json_encode($patch['body'])) . "\n");
+                    exit(1);
+                }
+            }
+            $changed++;
+        }
+        if (count($items) < $perPage) {
+            break;
+        }
+        $page++;
+    }
+    echo 'done: ' . ($dry ? 'would update ' : 'updated ') . "{$changed}, unchanged {$unchanged}, no garage_key {$noKey}\n";
+    exit(0);
+}
+
+// CLI: php index.php sync-pb-garage-urls [--dry-run] — PATCH garage_url to PocketBase /api/files/… when media_file is set (fixes sslip.io Garage URLs in DB)
+if (PHP_SAPI === 'cli' && ($argv[1] ?? '') === 'sync-pb-garage-urls') {
+    $dry = in_array('--dry-run', $argv, true);
+    $token = ff_pb_cli_token();
+    if (!$token) {
+        fwrite(STDERR, "Need ADMIN_EMAIL / ADMIN_PASSWORD (or FORMATFORGE_*)\n");
+        exit(1);
+    }
+    $auth = 'Bearer ' . $token;
+    $collId = ff_content_items_collection_id();
+    if ($collId === '') {
+        fwrite(STDERR, "Could not resolve content_items collection id. Set POCKETBASE_CONTENT_ITEMS_COLLECTION_ID in .env (see PocketBase Admin → Collections → content_items → collection id).\n");
+        exit(1);
+    }
+    $page = 1;
+    $perPage = 100;
+    $changed = 0;
+    $skipped = 0;
+    while (true) {
+        $qs = http_build_query(['perPage' => $perPage, 'page' => $page, 'sort' => '-@rowid']);
+        $r = pb_request('GET', '/api/collections/content_items/records?' . $qs, null, $auth);
+        if ($r['code'] !== 200) {
+            fwrite(STDERR, "List failed: " . ($r['body']['message'] ?? 'HTTP ' . $r['code']) . "\n");
+            exit(1);
+        }
+        $items = $r['body']['items'] ?? [];
+        foreach ($items as $it) {
+            $id = (string) ($it['id'] ?? '');
+            $fn = trim((string) ($it['media_file'] ?? ''));
+            if ($id === '' || $fn === '') {
+                $skipped++;
+                continue;
+            }
+            $new = ff_pb_public_file_url($collId, $id, $fn);
+            if ($new === '') {
+                $skipped++;
+                continue;
+            }
+            $old = trim((string) ($it['garage_url'] ?? ''));
+            if ($old === $new) {
+                $skipped++;
+                continue;
+            }
+            echo ($dry ? '[dry-run] ' : '') . "id={$id}\n  old: {$old}\n  new: {$new}\n";
+            if (!$dry) {
+                $patch = pb_request('PATCH', '/api/collections/content_items/records/' . rawurlencode($id), ['garage_url' => $new], $auth);
+                if ($patch['code'] < 200 || $patch['code'] >= 300) {
+                    fwrite(STDERR, "PATCH failed: " . ($patch['body']['message'] ?? json_encode($patch['body'])) . "\n");
+                    exit(1);
+                }
+            }
+            $changed++;
+        }
+        if (count($items) < $perPage) {
+            break;
+        }
+        $page++;
+    }
+    echo 'done: ' . ($dry ? 'would update ' : 'updated ') . "{$changed} garage_url(s) (skipped {$skipped} rows without media_file or already matching).\n";
+    exit(0);
+}
+
+// CLI: php index.php delete-bad-garage-urls [--apply] — DELETE content_items whose garage_url uses loopback; also source_links when no sibling content_items remain
+if (PHP_SAPI === 'cli' && ($argv[1] ?? '') === 'delete-bad-garage-urls') {
+    $apply = in_array('--apply', $argv, true);
+    $token = ff_pb_cli_token();
+    if (!$token) {
+        fwrite(STDERR, "Need ADMIN_EMAIL / ADMIN_PASSWORD (or FORMATFORGE_*)\n");
+        exit(1);
+    }
+    $auth = 'Bearer ' . $token;
+    $page = 1;
+    $perPage = 100;
+    $bad = [];
+    while (true) {
+        $qs = http_build_query(['perPage' => $perPage, 'page' => $page, 'sort' => '-@rowid']);
+        $r = pb_request('GET', '/api/collections/content_items/records?' . $qs, null, $auth);
+        if ($r['code'] !== 200) {
+            fwrite(STDERR, "List failed: " . ($r['body']['message'] ?? 'HTTP ' . $r['code']) . "\n");
+            exit(1);
+        }
+        $items = $r['body']['items'] ?? [];
+        foreach ($items as $it) {
+            $id = (string) ($it['id'] ?? '');
+            $u = trim((string) ($it['garage_url'] ?? ''));
+            if ($id === '' || !ff_garage_url_uses_loopback_host($u)) {
+                continue;
+            }
+            $bad[] = [
+                'id' => $id,
+                'garage_url' => $u,
+                'source_link_id' => trim((string) ($it['source_link_id'] ?? '')),
+            ];
+        }
+        if (count($items) < $perPage) {
+            break;
+        }
+        $page++;
+    }
+    $badIds = [];
+    foreach ($bad as $b) {
+        $badIds[$b['id']] = true;
+    }
+    $sourceLinkIdsToRemove = [];
+    $seenSl = [];
+    foreach ($bad as $b) {
+        $slid = $b['source_link_id'];
+        if ($slid === '' || isset($seenSl[$slid])) {
+            continue;
+        }
+        $seenSl[$slid] = true;
+        $allForLink = ff_pb_content_item_ids_for_source_link($auth, $slid);
+        if ($allForLink === false) {
+            fwrite(STDERR, "List content_items by source_link_id failed: {$slid}\n");
+            exit(1);
+        }
+        if ($allForLink === []) {
+            continue;
+        }
+        $allBad = true;
+        foreach ($allForLink as $cid) {
+            if (!isset($badIds[$cid])) {
+                $allBad = false;
+                break;
+            }
+        }
+        if ($allBad) {
+            $sourceLinkIdsToRemove[] = $slid;
+        }
+    }
+    if ($apply) {
+        foreach ($bad as $row) {
+            $id = $row['id'];
+            $del = pb_request('DELETE', '/api/collections/content_items/records/' . rawurlencode($id), null, $auth);
+            if ($del['code'] < 200 || $del['code'] >= 300) {
+                fwrite(STDERR, "DELETE content_items failed id={$id}: " . ($del['body']['message'] ?? json_encode($del['body'])) . "\n");
+                exit(1);
+            }
+        }
+        foreach ($sourceLinkIdsToRemove as $lid) {
+            $delL = pb_request('DELETE', '/api/collections/source_links/records/' . rawurlencode($lid), null, $auth);
+            if ($delL['code'] < 200 || $delL['code'] >= 300) {
+                fwrite(STDERR, "DELETE source_links failed id={$lid}: " . ($delL['body']['message'] ?? json_encode($delL['body'])) . "\n");
+                exit(1);
+            }
+        }
+    }
+    $n = count($bad);
+    foreach ($bad as $row) {
+        $sl = $row['source_link_id'] !== '' ? "  source_link_id={$row['source_link_id']}\n" : '';
+        echo ($apply ? 'deleted ' : 'would delete ') . "content_items id={$row['id']}\n  garage_url={$row['garage_url']}\n{$sl}";
+    }
+    $nl = count($sourceLinkIdsToRemove);
+    foreach ($sourceLinkIdsToRemove as $lid) {
+        echo ($apply ? 'deleted ' : 'would delete ') . "source_links id={$lid}\n";
+    }
+    echo 'done: ' . ($apply ? 'deleted ' : 'would delete ') . "{$n} content_item(s)";
+    if ($nl > 0) {
+        echo ', ' . ($apply ? 'deleted ' : 'would delete ') . "{$nl} source_link(s)";
+    }
+    echo '.';
+    echo (!$apply && ($n > 0 || $nl > 0) ? " Use --apply to delete.\n" : "\n");
+    exit(0);
+}
+
+// CLI: php index.php delete-orphan-source-links [--apply] — DELETE source_links with no content_items (skips status=pending queued URLs)
+if (PHP_SAPI === 'cli' && ($argv[1] ?? '') === 'delete-orphan-source-links') {
+    $apply = in_array('--apply', $argv, true);
+    $token = ff_pb_cli_token();
+    if (!$token) {
+        fwrite(STDERR, "Need ADMIN_EMAIL / ADMIN_PASSWORD (or FORMATFORGE_*)\n");
+        exit(1);
+    }
+    $auth = 'Bearer ' . $token;
+    $page = 1;
+    $perPage = 100;
+    $orphans = [];
+    while (true) {
+        $qs = http_build_query(['perPage' => $perPage, 'page' => $page, 'sort' => '-@rowid']);
+        $r = pb_request('GET', '/api/collections/source_links/records?' . $qs, null, $auth);
+        if ($r['code'] !== 200) {
+            fwrite(STDERR, "List failed: " . ($r['body']['message'] ?? 'HTTP ' . $r['code']) . "\n");
+            exit(1);
+        }
+        $items = $r['body']['items'] ?? [];
+        foreach ($items as $it) {
+            $id = (string) ($it['id'] ?? '');
+            if ($id === '') {
+                continue;
+            }
+            if (trim((string) ($it['status'] ?? '')) === 'pending') {
+                continue;
+            }
+            $cids = ff_pb_content_item_ids_for_source_link($auth, $id);
+            if ($cids === false) {
+                fwrite(STDERR, "List content_items by source_link_id failed: {$id}\n");
+                exit(1);
+            }
+            if ($cids === []) {
+                $orphans[] = $id;
+            }
+        }
+        if (count($items) < $perPage) {
+            break;
+        }
+        $page++;
+    }
+    if ($apply) {
+        foreach ($orphans as $oid) {
+            $del = pb_request('DELETE', '/api/collections/source_links/records/' . rawurlencode($oid), null, $auth);
+            if ($del['code'] < 200 || $del['code'] >= 300) {
+                fwrite(STDERR, "DELETE source_links failed id={$oid}: " . ($del['body']['message'] ?? json_encode($del['body'])) . "\n");
+                exit(1);
+            }
+        }
+    }
+    foreach ($orphans as $oid) {
+        echo ($apply ? 'deleted ' : 'would delete ') . "source_links id={$oid} (no content_items, not pending)\n";
+    }
+    $no = count($orphans);
+    echo 'done: ' . ($apply ? 'deleted ' : 'would delete ') . "{$no} orphan source_link(s).";
+    echo (!$apply && $no > 0 ? " Use --apply to delete.\n" : "\n");
+    exit(0);
+}
+
+// CLI: php index.php ensure-cursor-pipeline-dirs — create dirs and report writability (fix perms on server if needed)
+if (PHP_SAPI === 'cli' && ($argv[1] ?? '') === 'ensure-cursor-pipeline-dirs') {
+    ff_ensure_cursor_pipeline_dirs();
+    $cfg = $GLOBALS['CONFIG'] ?? [];
+    $triggerDir = (string) ($cfg['cursor_pipeline_trigger_dir'] ?? '');
+    $cdir = ff_cursor_pipeline_dir();
+    $promptsDir = ff_cursor_pipeline_prompts_dir();
+    echo 'PHP effective user: ' . ff_php_effective_user() . "\n";
+    foreach ([
+        'cursor_pipeline' => $cdir,
+        'triggers' => $triggerDir,
+        'prompts' => $promptsDir,
+    ] as $label => $d) {
+        $ex = is_dir($d);
+        $w = $ex && is_writable($d);
+        echo "{$label}: {$d}\n  exists=" . ($ex ? 'yes' : 'no') . ' writable=' . ($w ? 'yes' : 'no') . "\n";
+    }
+    $tw = $triggerDir !== '' && is_dir($triggerDir) && is_writable($triggerDir);
+    $hint = ff_cursor_pipeline_permissions_hint($triggerDir, $tw);
+    if ($hint) {
+        fwrite(STDERR, "\n{$hint}\n\nRun on the host: sudo ./scripts/ensure-cursor-pipeline-perms.sh\n");
+        exit(1);
+    }
+    echo "OK: trigger directory is writable.\n";
+    exit(0);
 }
 
 // CLI: php index.php setup-pipeline [trigger_file]
@@ -2205,7 +3230,7 @@ if (PHP_SAPI === 'cli' && ($argv[1] ?? '') === 'delete-source-link') {
         exit(1);
     }
     $wantId = trim($argv[2] ?? '');
-    $list = pb_request('GET', '/api/collections/source_links/records?perPage=500&sort=-created', null, $token);
+    $list = pb_request('GET', '/api/collections/source_links/records?perPage=500&sort=-%40rowid', null, $token);
     if ($list['code'] < 200 || $list['code'] >= 300) {
         fwrite(STDERR, 'List failed: ' . ($list['body']['message'] ?? json_encode($list['body'])) . "\n");
         exit(1);
@@ -2264,7 +3289,7 @@ function cleanup_bad_content_items(string $token, bool $apply): array {
     $perPage = 100;
     $authHeader = 'Bearer ' . $token;
     while (true) {
-        $qs = http_build_query(['perPage' => $perPage, 'page' => $page, 'sort' => '-created']);
+        $qs = http_build_query(['perPage' => $perPage, 'page' => $page, 'sort' => '-@rowid']);
         $r = pb_request('GET', '/api/collections/content_items/records?' . $qs, null, $authHeader);
         if ($r['code'] !== 200) {
             $out['ok'] = false;
@@ -2326,7 +3351,7 @@ function delete_all_source_links(string $token, bool $apply): array {
     $perPage = 100;
     $authHeader = 'Bearer ' . $token;
     while (true) {
-        $qs = http_build_query(['perPage' => $perPage, 'page' => $page, 'sort' => '-created']);
+        $qs = http_build_query(['perPage' => $perPage, 'page' => $page, 'sort' => '-@rowid']);
         $r = pb_request('GET', '/api/collections/source_links/records?' . $qs, null, $authHeader);
         if ($r['code'] !== 200) {
             $out['ok'] = false;
@@ -2357,6 +3382,47 @@ function delete_all_source_links(string $token, bool $apply): array {
     return $out;
 }
 
+/**
+ * Delete all content_items records (Curate media + pipeline-generated rows).
+ * @return array{ok: bool, dry_run: bool, deleted: string[], error?: string}
+ */
+function delete_all_content_items(string $token, bool $apply): array {
+    $out = ['ok' => true, 'dry_run' => !$apply, 'deleted' => []];
+    $page = 1;
+    $perPage = 100;
+    $authHeader = 'Bearer ' . $token;
+    while (true) {
+        $qs = http_build_query(['perPage' => $perPage, 'page' => $page, 'sort' => '-@rowid']);
+        $r = pb_request('GET', '/api/collections/content_items/records?' . $qs, null, $authHeader);
+        if ($r['code'] !== 200) {
+            $out['ok'] = false;
+            $out['error'] = $r['body']['message'] ?? 'List content_items failed';
+            return $out;
+        }
+        $items = $r['body']['items'] ?? [];
+        foreach ($items as $it) {
+            $id = (string) ($it['id'] ?? '');
+            if ($id === '') {
+                continue;
+            }
+            if ($apply) {
+                $del = pb_request('DELETE', '/api/collections/content_items/records/' . rawurlencode($id), null, $authHeader);
+                if ($del['code'] < 200 || $del['code'] >= 300) {
+                    $out['ok'] = false;
+                    $out['error'] = $del['body']['message'] ?? "Delete failed for {$id}";
+                    return $out;
+                }
+            }
+            $out['deleted'][] = $id;
+        }
+        if (count($items) < $perPage) {
+            break;
+        }
+        $page++;
+    }
+    return $out;
+}
+
 // CLI: php index.php delete-all-source-links  [--apply]
 if (PHP_SAPI === 'cli' && ($argv[1] ?? '') === 'delete-all-source-links') {
     $apply = in_array('--apply', $argv, true);
@@ -2368,6 +3434,33 @@ if (PHP_SAPI === 'cli' && ($argv[1] ?? '') === 'delete-all-source-links') {
     $r = delete_all_source_links($token, $apply);
     echo json_encode($r, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES) . "\n";
     exit(($r['ok'] ?? false) ? 0 : 1);
+}
+
+// CLI: php index.php delete-all-content-items  [--apply]
+if (PHP_SAPI === 'cli' && ($argv[1] ?? '') === 'delete-all-content-items') {
+    $apply = in_array('--apply', $argv, true);
+    $token = ff_pb_cli_token();
+    if (!$token) {
+        fwrite(STDERR, "Auth failed or missing ADMIN_EMAIL/ADMIN_PASSWORD (or FORMATFORGE_*)\n");
+        exit(1);
+    }
+    $r = delete_all_content_items($token, $apply);
+    echo json_encode($r, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES) . "\n";
+    exit(($r['ok'] ?? false) ? 0 : 1);
+}
+
+// CLI: php index.php clear-curate-data  [--apply] — all source_links + all content_items
+if (PHP_SAPI === 'cli' && ($argv[1] ?? '') === 'clear-curate-data') {
+    $apply = in_array('--apply', $argv, true);
+    $token = ff_pb_cli_token();
+    if (!$token) {
+        fwrite(STDERR, "Auth failed or missing ADMIN_EMAIL/ADMIN_PASSWORD (or FORMATFORGE_*)\n");
+        exit(1);
+    }
+    $links = delete_all_source_links($token, $apply);
+    $content = delete_all_content_items($token, $apply);
+    echo json_encode(['source_links' => $links, 'content_items' => $content], JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES) . "\n";
+    exit((($links['ok'] ?? false) && ($content['ok'] ?? false)) ? 0 : 1);
 }
 
 // CLI: php index.php test-embed  ["optional phrase"]
@@ -2867,8 +3960,8 @@ if ($isInstagramCallback && isset($_GET['code']) && $user) {
     exit;
 }
 
-// API: add link, generate, approve, reject, publish
-if ($_SERVER['REQUEST_METHOD'] === 'POST' && $user && $authHeader) {
+// API: add link, generate, approve, reject, publish (require PB token only — empty `pb_user` [] is falsy in PHP and must not skip this block)
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && $authHeader) {
     header('Content-Type: application/json');
     $action = $_POST['action'] ?? '';
 
@@ -2880,6 +3973,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && $user && $authHeader) {
     if ($action === 'clear_debug_logs') {
         ff_debug_logs_clear();
         echo json_encode(['ok' => true]);
+        exit;
+    }
+
+    if ($action === 'pipeline_diagnostics') {
+        echo json_encode(['ok' => true] + ff_pipeline_diagnostics_bundle($authHeader), JSON_UNESCAPED_SLASHES);
         exit;
     }
 
@@ -2896,6 +3994,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && $user && $authHeader) {
                 'query' => ff_debug_sanitize($_GET),
             ],
             'logs' => ff_debug_logs_get(),
+            'pipeline' => ff_pipeline_diagnostics_bundle($authHeader),
         ], JSON_UNESCAPED_SLASHES);
         exit;
     }
@@ -2904,25 +4003,30 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && $user && $authHeader) {
         $cols = ff_pb_proxy_collections();
         $coll = (string) ($_POST['collection'] ?? '');
         if (!in_array($coll, $cols, true)) {
+            http_response_code(400);
             echo json_encode(['ok' => false, 'error' => 'Invalid collection', 'pb_http_status' => 0]);
             exit;
         }
         $method = strtoupper(trim((string) ($_POST['http_method'] ?? 'GET')));
         if (!in_array($method, ['GET', 'PATCH', 'DELETE'], true)) {
+            http_response_code(400);
             echo json_encode(['ok' => false, 'error' => 'Invalid method', 'pb_http_status' => 0]);
             exit;
         }
         $recordId = trim((string) ($_POST['record_id'] ?? ''));
         $query = (string) ($_POST['query'] ?? '');
         if (strlen($query) > 900) {
+            http_response_code(400);
             echo json_encode(['ok' => false, 'error' => 'Query too long', 'pb_http_status' => 0]);
             exit;
         }
         if (preg_match('/[\x00-\x08\x0b\x0c\x0e-\x1f\\\\]/', $query)) {
+            http_response_code(400);
             echo json_encode(['ok' => false, 'error' => 'Invalid query', 'pb_http_status' => 0]);
             exit;
         }
         if ($recordId !== '' && !preg_match('/^[a-z0-9]+$/', $recordId)) {
+            http_response_code(400);
             echo json_encode(['ok' => false, 'error' => 'Invalid record id', 'pb_http_status' => 0]);
             exit;
         }
@@ -2930,6 +4034,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && $user && $authHeader) {
         if ($recordId !== '') {
             $path .= '/' . rawurlencode($recordId);
         } elseif ($method !== 'GET') {
+            http_response_code(400);
             echo json_encode(['ok' => false, 'error' => 'record_id required', 'pb_http_status' => 0]);
             exit;
         }
@@ -2940,6 +4045,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && $user && $authHeader) {
         if ($method === 'PATCH') {
             $raw = (string) ($_POST['json_body'] ?? '');
             if (strlen($raw) > 120000) {
+                http_response_code(400);
                 echo json_encode(['ok' => false, 'error' => 'Body too large', 'pb_http_status' => 0]);
                 exit;
             }
@@ -2948,6 +4054,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && $user && $authHeader) {
             } else {
                 $decoded = json_decode($raw, true);
                 if (!is_array($decoded)) {
+                    http_response_code(400);
                     echo json_encode(['ok' => false, 'error' => 'Invalid json_body', 'pb_http_status' => 0]);
                     exit;
                 }
@@ -2956,6 +4063,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && $user && $authHeader) {
         }
         $res = pb_request($method, $path, $body, $authHeader);
         $code = (int) ($res['code'] ?? 0);
+        if ($method === 'GET' && $coll === 'content_items' && $code >= 200 && $code < 300 && !empty($res['body']) && is_array($res['body'])) {
+            $res['body'] = ff_pb_enrich_content_items_response($res['body']);
+        }
+        if ($code >= 400) {
+            http_response_code($code > 0 ? $code : 502);
+        }
         echo json_encode([
             'ok' => $code >= 200 && $code < 300,
             'pb_http_status' => $code,
@@ -2965,7 +4078,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && $user && $authHeader) {
     }
 
     if ($action === 'debug_account_snapshot') {
-        $list = pb_request('GET', '/api/collections/instagram_accounts/records?sort=-created&perPage=50', null, $authHeader);
+        $list = pb_request('GET', '/api/collections/instagram_accounts/records?sort=-%40rowid&perPage=50', null, $authHeader);
         if ($list['code'] !== 200) {
             echo json_encode(['ok' => false, 'error' => $list['body']['message'] ?? ('HTTP ' . $list['code'])]);
             exit;
@@ -3030,6 +4143,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && $user && $authHeader) {
     if ($action === 'repair_source_links_schema') {
         $repair = repair_source_links_schema();
         ff_debug_log('repair_source_links_schema', $repair);
+        echo json_encode($repair);
+        exit;
+    }
+
+    if ($action === 'repair_content_items_media_schema') {
+        $repair = repair_content_items_media_schema();
+        ff_debug_log('repair_content_items_media_schema', $repair);
         echo json_encode($repair);
         exit;
     }
@@ -3158,6 +4278,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && $user && $authHeader) {
         }
         // If sizes are unavailable, fall back to path count so singleton images still become `image`.
         $imageKindSlots = $fetchAssetCount > 0 ? $fetchAssetCount : count($fetchPaths);
+        $mediaRepairAttempted = false;
         foreach ($fetchPaths as $fileIndex => $path) {
             $ext = strtolower(pathinfo($path, PATHINFO_EXTENSION));
             $mime = match ($ext) {
@@ -3184,7 +4305,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && $user && $authHeader) {
             }
             $key = 'content/' . $itemId . '/' . $baseName;
             $garageUrl = s3_upload($key, $content, $mime);
-            if (!$garageUrl && $content) $garageUrl = $cfg['garage_endpoint'] . '/' . $cfg['garage_bucket'] . '/' . $key;
+            if (!$garageUrl && $content) $garageUrl = garage_public_url_for_key($key);
             if (str_starts_with($mime, 'video/')) {
                 $type = 'video';
             } elseif (str_starts_with($mime, 'image/')) {
@@ -3193,29 +4314,73 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && $user && $authHeader) {
             } else {
                 $type = 'reel';
             }
-            $rec = pb_request('POST', '/api/collections/content_items/records', [
+            $metaArr = [
+                'origin' => 'fetch',
+                'fetched_via' => $viaUsed,
+                'source_url' => $url,
+            ];
+            $postFields = [
                 'type' => $type,
                 'title' => $displayTitle,
                 'prompt' => $url,
                 'source_link_id' => $linkId,
                 'status' => 'pending',
                 'garage_key' => $key,
-                'garage_url' => $garageUrl ?: '',
-                'instagram_account_id' => $linkAccountId,
-                'metadata' => [
-                    'origin' => 'fetch',
-                    'fetched_via' => $viaUsed,
-                    'source_url' => $url,
-                ],
-            ], $authHeader);
+                'garage_url' => '',
+                'metadata' => json_encode($metaArr, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE),
+            ];
+            if ($linkAccountId !== null && trim((string) $linkAccountId) !== '') {
+                $postFields['instagram_account_id'] = trim((string) $linkAccountId);
+            }
+            $postFields['media_file'] = ff_curl_file($path, $mime, $baseName);
+            $rec = pb_request_multipart('POST', '/api/collections/content_items/records', $postFields, $authHeader);
+            if ($rec['code'] < 200 || $rec['code'] >= 300) {
+                if (!$mediaRepairAttempted) {
+                    $mediaRepairAttempted = true;
+                    repair_content_items_media_schema();
+                    $rec = pb_request_multipart('POST', '/api/collections/content_items/records', $postFields, $authHeader);
+                }
+            }
+            if ($rec['code'] < 200 || $rec['code'] >= 300) {
+                $rec = pb_request('POST', '/api/collections/content_items/records', [
+                    'type' => $type,
+                    'title' => $displayTitle,
+                    'prompt' => $url,
+                    'source_link_id' => $linkId,
+                    'status' => 'pending',
+                    'garage_key' => $key,
+                    'garage_url' => $garageUrl ?: '',
+                    'instagram_account_id' => $linkAccountId,
+                    'metadata' => $metaArr,
+                ], $authHeader);
+            }
             if ($rec['code'] >= 200 && $rec['code'] < 300) {
                 $created++;
-                $pbRowId = (string)($rec['body']['id'] ?? '');
+                $pbRowId = (string) ($rec['body']['id'] ?? '');
                 if ($pbRowId !== '') {
+                    $collId = trim((string) ($rec['body']['collectionId'] ?? ''));
+                    $mediaName = trim((string) ($rec['body']['media_file'] ?? ''));
+                    if ($collId === '' || $mediaName === '') {
+                        $gr = pb_request('GET', '/api/collections/content_items/records/' . rawurlencode($pbRowId), null, $authHeader);
+                        if ($gr['code'] === 200) {
+                            $collId = trim((string) ($gr['body']['collectionId'] ?? $collId));
+                            $mediaName = trim((string) ($gr['body']['media_file'] ?? $mediaName));
+                        }
+                    }
+                    $displayUrl = '';
+                    if ($collId !== '' && $mediaName !== '') {
+                        $pbUrl = ff_pb_public_file_url($collId, $pbRowId, $mediaName);
+                        if ($pbUrl !== '') {
+                            pb_request('PATCH', '/api/collections/content_items/records/' . rawurlencode($pbRowId), ['garage_url' => $pbUrl], $authHeader);
+                            $displayUrl = $pbUrl;
+                        }
+                    }
+                    if ($displayUrl === '') {
+                        $displayUrl = $garageUrl ?: '';
+                    }
                     $caption = trim($displayTitle . "\n" . $url);
                     $semanticBlob = formatforge_antfly_content_semantic_text($displayTitle, $url, $caption);
-                    $garage = $garageUrl ?: '';
-                    formatforge_index_content_in_antfly($pbRowId, $semanticBlob, $type, 'pending', $garage !== '' ? $garage : null, $mime, $url, $displayTitle);
+                    formatforge_index_content_in_antfly($pbRowId, $semanticBlob, $type, 'pending', $displayUrl !== '' ? $displayUrl : null, $mime, $url, $displayTitle);
                     if (fetched_text_is_novel_vs_pipelines($semanticBlob, $activePipelineRows)) {
                         $novelFetchedPrompts[] = $semanticBlob;
                     }
@@ -3223,6 +4388,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && $user && $authHeader) {
             }
         }
         maybe_trigger_cursor_create_pipeline_after_fetch($novelFetchedPrompts, $authHeader);
+        ff_pipeline_trace_log('fetch_link_pipeline_summary', [
+            'link_id' => $linkId,
+            'created_content_items' => $created,
+            'active_pipeline_rows' => $activePipelineRows,
+            'antfly_configured' => formatforge_antfly_novelty_configured(),
+            'novel_semantic_blob_count' => count($novelFetchedPrompts),
+        ]);
         foreach ($files as $path) @unlink($path);
         if ($tmpDir && is_dir($tmpDir)) {
             $iter = new RecursiveIteratorIterator(new RecursiveDirectoryIterator($tmpDir, RecursiveDirectoryIterator::SKIP_DOTS), RecursiveIteratorIterator::CHILD_FIRST);
@@ -3240,11 +4412,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && $user && $authHeader) {
                 'hint' => ff_fetch_failure_hint($url),
                 'gallery_dl_path' => $GLOBALS['CONFIG']['gallery_dl_path'] ?? '',
                 'yt_dlp_path' => $GLOBALS['CONFIG']['yt_dlp_path'] ?? '',
+                'fetch_auth_file_status' => ff_fetch_auth_file_status(),
             ];
             if ($all127) {
                 $report['exit_127_note'] = 'gallery-dl and yt-dlp both exited 127 (command not found). On the host: `pip install --user gallery-dl yt-dlp` (or apt install), set GALLERY_DL_PATH / YT_DLP_PATH in .env to absolute paths, and ensure php-fpm sees a PATH that includes those dirs (see DEPLOYMENT.md §2).';
             }
             ff_debug_log('fetch_link_zero_files', $report);
+            ff_pipeline_trace_log('fetch_link_zero_files', $report);
             $copyPayload = ff_debug_sanitize($report);
             $errExtra = $all127 ? ' Install gallery-dl / yt-dlp on the server (pip or apt), set GALLERY_DL_PATH / YT_DLP_PATH if needed, reload php-fpm.' : '';
             echo json_encode([
@@ -3342,6 +4516,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && $user && $authHeader) {
 
         if (!$videoUrl) {
             pb_request('PATCH', "/api/collections/content_items/records/{$itemId}", ['status' => 'failed'], $authHeader);
+            ff_pipeline_trace_log('generate_content_failed', [
+                'content_item_id' => $itemId,
+                'pipeline_id' => $pipelineId !== '' ? $pipelineId : null,
+                'provider' => $provider,
+                'error' => $errMsg,
+            ]);
             echo json_encode(['ok' => false, 'error' => $errMsg]);
             exit;
         }
@@ -3354,28 +4534,100 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && $user && $authHeader) {
         }
         $key = 'content/' . $itemId . '/' . date('YmdHis') . '.mp4';
         $garageUrl = s3_upload($key, $videoData ?: '', 'video/mp4');
-        if (!$garageUrl && $videoData) $garageUrl = $GLOBALS['CONFIG']['garage_endpoint'] . '/' . $GLOBALS['CONFIG']['garage_bucket'] . '/' . $key;
-        pb_request('PATCH', "/api/collections/content_items/records/{$itemId}", [
-            'status' => 'pending',
-            'garage_key' => $key,
-            'garage_url' => $garageUrl ?: $videoUrl,
-        ], $authHeader);
-        $gUrl = $garageUrl ?: $videoUrl;
+        if (!$garageUrl && $videoData) $garageUrl = garage_public_url_for_key($key);
+        $fallbackGarage = $garageUrl ?: $videoUrl;
+        $tmp = tempnam(sys_get_temp_dir(), 'ffgen_');
+        if ($tmp === false) {
+            pb_request('PATCH', "/api/collections/content_items/records/{$itemId}", [
+                'status' => 'pending',
+                'garage_key' => $key,
+                'garage_url' => $fallbackGarage,
+            ], $authHeader);
+            $gUrl = $fallbackGarage;
+        } else {
+            file_put_contents($tmp, $videoData ?: '');
+            $patchData = [
+                'status' => 'pending',
+                'garage_key' => $key,
+                'garage_url' => '',
+                'media_file' => ff_curl_file($tmp, 'video/mp4', 'video.mp4'),
+            ];
+            $mg = pb_request_multipart('PATCH', '/api/collections/content_items/records/' . rawurlencode((string) $itemId), $patchData, $authHeader);
+            @unlink($tmp);
+            if ($mg['code'] < 200 || $mg['code'] >= 300) {
+                repair_content_items_media_schema();
+                $tmp2 = tempnam(sys_get_temp_dir(), 'ffgen_');
+                if ($tmp2 !== false) {
+                    file_put_contents($tmp2, $videoData ?: '');
+                    $patchData['media_file'] = ff_curl_file($tmp2, 'video/mp4', 'video.mp4');
+                    $mg = pb_request_multipart('PATCH', '/api/collections/content_items/records/' . rawurlencode((string) $itemId), $patchData, $authHeader);
+                    @unlink($tmp2);
+                }
+            }
+            if ($mg['code'] >= 200 && $mg['code'] < 300) {
+                $body = $mg['body'];
+                $collId = trim((string) ($body['collectionId'] ?? ''));
+                $mediaName = trim((string) ($body['media_file'] ?? ''));
+                if ($collId === '' || $mediaName === '') {
+                    $gr = pb_request('GET', '/api/collections/content_items/records/' . rawurlencode((string) $itemId), null, $authHeader);
+                    if ($gr['code'] === 200) {
+                        $collId = trim((string) ($gr['body']['collectionId'] ?? $collId));
+                        $mediaName = trim((string) ($gr['body']['media_file'] ?? $mediaName));
+                    }
+                }
+                $pbUrl = ($collId !== '' && $mediaName !== '') ? ff_pb_public_file_url($collId, (string) $itemId, $mediaName) : '';
+                if ($pbUrl !== '') {
+                    pb_request('PATCH', '/api/collections/content_items/records/' . rawurlencode((string) $itemId), ['garage_url' => $pbUrl], $authHeader);
+                    $gUrl = $pbUrl;
+                } else {
+                    pb_request('PATCH', '/api/collections/content_items/records/' . rawurlencode((string) $itemId), ['garage_url' => $fallbackGarage], $authHeader);
+                    $gUrl = $fallbackGarage;
+                }
+            } else {
+                pb_request('PATCH', "/api/collections/content_items/records/{$itemId}", [
+                    'status' => 'pending',
+                    'garage_key' => $key,
+                    'garage_url' => $fallbackGarage,
+                ], $authHeader);
+                $gUrl = $fallbackGarage;
+            }
+        }
         $semanticBlob = formatforge_antfly_content_semantic_text('(pipeline)', '', trim($prompt));
-        formatforge_index_content_in_antfly((string)$itemId, $semanticBlob, 'reel', 'pending', $gUrl ?: null, 'video/mp4', '', '(pipeline)');
-        echo json_encode(['ok' => true, 'id' => $itemId, 'url' => $garageUrl ?: $videoUrl]);
+        formatforge_index_content_in_antfly((string) $itemId, $semanticBlob, 'reel', 'pending', $gUrl ?: null, 'video/mp4', '', '(pipeline)');
+        ff_pipeline_trace_log('generate_content_ok', [
+            'content_item_id' => $itemId,
+            'pipeline_id' => $pipelineId !== '' ? $pipelineId : null,
+            'provider' => $provider,
+        ]);
+        echo json_encode(['ok' => true, 'id' => $itemId, 'url' => $gUrl]);
         exit;
     }
 
     if ($action === 'approve_content') {
         $id = $_POST['id'] ?? '';
-        $accountId = $_POST['account_id'] ?? '';
-        if (!$id || !$accountId) { echo json_encode(['ok' => false, 'error' => 'Missing id or account_id']); exit; }
+        $accountId = trim((string) ($_POST['account_id'] ?? ''));
+        if (!$id) { echo json_encode(['ok' => false, 'error' => 'Missing id']); exit; }
         $item = pb_request('GET', "/api/collections/content_items/records/{$id}", null, $authHeader);
-        $up = pb_request('PATCH', "/api/collections/content_items/records/{$id}", [
-            'status' => 'approved',
-            'instagram_account_id' => $accountId,
-        ], $authHeader);
+        if ($item['code'] !== 200) {
+            echo json_encode(['ok' => false, 'error' => 'Not found']);
+            exit;
+        }
+        $isFetched = ff_content_item_is_fetched_for_snapshot($item['body']);
+        if ($isFetched) {
+            $up = pb_request('PATCH', "/api/collections/content_items/records/{$id}", [
+                'status' => 'approved',
+                'rejected_reason' => '',
+            ], $authHeader);
+        } else {
+            if ($accountId === '') {
+                echo json_encode(['ok' => false, 'error' => 'Missing account_id']);
+                exit;
+            }
+            $up = pb_request('PATCH', "/api/collections/content_items/records/{$id}", [
+                'status' => 'approved',
+                'instagram_account_id' => $accountId,
+            ], $authHeader);
+        }
         // Cursor agent for pipelines is driven by fetch novelty + reject streak (see maybe_trigger_cursor_*).
         echo json_encode(['ok' => $up['code'] >= 200 && $up['code'] < 300]);
         exit;
@@ -3414,8 +4666,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && $user && $authHeader) {
             exit;
         }
         $item = $item['body'];
+        if (ff_content_item_is_fetched_for_snapshot($item)) {
+            echo json_encode(['ok' => false, 'error' => 'Fetched reference media cannot be published. Publish from pipeline-generated content (Generated content section).']);
+            exit;
+        }
         $acc = $acc['body'];
-        $mediaUrl = $item['garage_url'] ?? '';
+        $mediaUrl = ff_content_item_effective_media_url($item);
         if (!$mediaUrl) { echo json_encode(['ok' => false, 'error' => 'No media URL']); exit; }
         $igToken = $acc['access_token'] ?? '';
         $igUserId = $acc['instagram_user_id'] ?? '';
@@ -3466,6 +4722,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && $user && $authHeader) {
         echo json_encode(['ok' => true, 'media_id' => $mediaId]);
         exit;
     }
+
+    http_response_code(400);
+    echo json_encode(['ok' => false, 'error' => 'Unknown or missing action']);
+    exit;
 }
 // Privacy policy page (standalone, no auth required)
 $reqUri = $_SERVER['REQUEST_URI'] ?? '';
@@ -3613,6 +4873,28 @@ if (!empty($_GET['privacy']) || strpos($reqUri, '/privacy') !== false) {
         @media (max-width: 768px) { .mobile-only { display: inline !important; } }
         .modal-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,0.65); z-index: 200; display: flex; align-items: center; justify-content: center; padding: 1rem; }
         .modal-panel { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; max-width: 560px; width: 100%; max-height: 90vh; overflow-y: auto; padding: 1.25rem; box-shadow: 0 20px 50px rgba(0,0,0,0.4); }
+        .modal-panel.modal-panel-wide { max-width: 720px; }
+        .modal-panel.modal-panel-xl { max-width: min(92vw, 960px); }
+        .ff-fetched-summary-card { cursor: pointer; transition: border-color 0.15s ease, box-shadow 0.15s ease; }
+        .ff-fetched-summary-card:hover { border-color: rgba(139,92,246,0.35); box-shadow: 0 8px 28px rgba(0,0,0,0.2); }
+        .ff-fetched-summary-thumbs { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; margin-top: 0.85rem; }
+        .ff-fetched-summary-thumb-wrap { width: 56px; height: 56px; border-radius: 8px; overflow: hidden; border: 1px solid var(--border); flex-shrink: 0; background: #000; }
+        .ff-fetched-summary-thumb-wrap video, .ff-fetched-summary-thumb-wrap img { width: 100%; height: 100%; object-fit: cover; display: block; }
+        .ff-fetched-gallery-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(132px, 1fr)); gap: 0.75rem; margin-top: 1rem; max-height: min(68vh, 620px); overflow-y: auto; padding: 2px 4px 4px 2px; }
+        .ff-fetched-gallery-cell { border-radius: 10px; overflow: hidden; border: 1px solid var(--border); background: var(--surface2); cursor: pointer; transition: transform 0.12s ease, box-shadow 0.12s ease; }
+        .ff-fetched-gallery-cell:hover { transform: translateY(-2px); box-shadow: 0 10px 28px rgba(0,0,0,0.28); }
+        .ff-fetched-gallery-cell video, .ff-fetched-gallery-cell img { width: 100%; aspect-ratio: 9/16; object-fit: cover; display: block; }
+        .ff-fetched-gallery-caption { padding: 0.4rem 0.45rem; font-size: 0.7rem; color: var(--muted); line-height: 1.3; max-height: 2.6em; overflow: hidden; }
+        .content-card.ff-curate-card-click { cursor: pointer; }
+        .ff-curate-modal-media { border-radius: 10px; overflow: hidden; background: #000; max-height: min(52vh, 420px); display: flex; align-items: center; justify-content: center; margin-bottom: 1rem; }
+        .ff-curate-modal-media video, .ff-curate-modal-media img { max-width: 100%; max-height: min(52vh, 420px); width: auto; height: auto; display: block; object-fit: contain; }
+        .ff-curate-icon-row { display: flex; justify-content: center; align-items: center; gap: 1.25rem; flex-wrap: wrap; margin-top: 1rem; }
+        .ff-curate-icon-btn { width: 3.5rem; height: 3.5rem; border-radius: 50%; border: 2px solid var(--border); display: inline-flex; align-items: center; justify-content: center; font-size: 1.5rem; line-height: 1; cursor: pointer; transition: transform 0.12s ease, background 0.12s ease, border-color 0.12s ease; background: var(--surface2); color: var(--text); }
+        .ff-curate-icon-btn:hover:not(:disabled) { transform: scale(1.06); }
+        .ff-curate-icon-btn:disabled { opacity: 0.45; cursor: not-allowed; }
+        .ff-curate-icon-btn.ff-approve { border-color: rgba(34,197,94,0.55); color: var(--success); background: rgba(34,197,94,0.12); }
+        .ff-curate-icon-btn.ff-reject { border-color: rgba(239,68,68,0.55); color: var(--danger); background: rgba(239,68,68,0.12); }
+        .ff-curate-icon-btn.ff-publish { border-color: rgba(139,92,246,0.55); color: var(--accent); background: rgba(139,92,246,0.12); font-size: 1rem; font-weight: 600; }
         .modal-panel h3 { margin-bottom: 0.75rem; font-size: 1.1rem; }
         .modal-actions { display: flex; gap: 0.5rem; justify-content: flex-end; flex-wrap: wrap; margin-top: 1.25rem; }
         .form-group textarea { width: 100%; padding: 0.6rem; border-radius: 8px; background: var(--surface2); border: 1px solid var(--border); color: var(--text); font-family: inherit; font-size: 0.9rem; min-height: 120px; resize: vertical; }
@@ -3709,6 +4991,10 @@ if (!empty($_GET['privacy']) || strpos($reqUri, '/privacy') !== false) {
 
         <div x-show="msg" x-transition class="msg" :class="msgError ? 'error' : 'success'" x-text="msg"></div>
 
+        <div x-show="garageUrlLocalhostWarning" x-cloak class="msg error" style="font-size: 0.88rem;">
+            Some <code>garage_url</code> values point at <strong>127.0.0.1</strong> or <strong>localhost</strong> (internal Garage S3). That only works from the server — browsers will not load media. Set <code>GARAGE_PUBLIC_URL</code> to your public Garage web base (e.g. <code>https://your-bucket.web.your-node.example/</code>), reload php-fpm, then re-fetch or PATCH records so <code>garage_url</code> is publicly reachable.
+        </div>
+
         <div x-show="tab === 'curate' && fetchDebugText" x-transition class="card" style="margin-top: 0.75rem;">
             <p style="font-size: 0.85rem; color: var(--muted); margin: 0 0 0.5rem 0;">Fetch debug — copy the JSON below if you need to share what the server saw:</p>
             <div style="display: flex; gap: 0.5rem; flex-wrap: wrap; margin-bottom: 0.5rem;">
@@ -3752,37 +5038,44 @@ if (!empty($_GET['privacy']) || strpos($reqUri, '/privacy') !== false) {
 
             <div style="margin-top: 1.5rem;">
                 <h3 style="margin-bottom: 0.75rem;">Media from your links</h3>
-                <p style="font-size: 0.875rem; color: var(--muted); margin-bottom: 1rem;">These items are created when you <strong style="color: var(--text); font-weight: 600;">Fetch</strong> a queued URL (gallery-dl / yt-dlp). They are <em>not</em> pipeline-generated videos.</p>
+                <p style="font-size: 0.875rem; color: var(--muted); margin-bottom: 1rem;">Reference material from <strong style="color: var(--text); font-weight: 600;">Fetch</strong> (gallery-dl / yt-dlp). Use it to inspire new pipelines — do <strong style="color: var(--text);">not</strong> post these clips directly. Instagram posts come from <strong style="color: var(--text);">Generated content</strong> (pipeline output). <?php
+$c = $GLOBALS['CONFIG'] ?? [];
+$agentOn = !empty($c['cursor_agent_enabled']);
+$antfly = formatforge_antfly_novelty_configured();
+if ($agentOn && $antfly) {
+    echo 'When a fetch is <strong>semantically novel</strong> vs your active pipelines (Antfly), the app writes a trigger under <code style="font-size:0.85em;">.cursor-pipeline/triggers/</code> and spawns the Cursor CLI — see <code style="font-size:0.85em;">.cursor-pipeline/cursor-agent.log</code>.';
+} elseif (!$antfly) {
+    echo '<strong style="color:var(--warning);">Agent novelty:</strong> set <code style="font-size:0.85em;">ANTFLY_URL</code> (Antfly running) so fetched copy can be compared to pipeline templates; otherwise the create-pipeline agent will not run.';
+} else {
+    echo '<strong style="color:var(--warning);">Cursor agent disabled</strong> (<code style="font-size:0.85em;">CURSOR_AGENT_ENABLED=0</code>).';
+}
+?></p>
                 <template x-if="contentLoading">
                     <p class="msg">Loading...</p>
                 </template>
-                <div class="content-grid" x-show="!contentLoading && fetchedFromLinksList.length">
-                    <template x-for="c in fetchedFromLinksList" :key="c.id">
-                        <div class="content-card">
-                            <template x-if="c.type === 'reel' || c.type === 'video'">
-                                <video :src="c.garage_url || ''" controls muted loop></video>
-                            </template>
-                            <template x-if="c.type === 'carousel' || c.type === 'image'">
-                                <img :src="c.thumbnail_url || c.garage_url || ''" alt="">
-                            </template>
-                            <div class="body">
-                                <h4 x-text="contentItemTitle(c)"></h4>
-                                <p x-text="c.prompt?.slice(0,80) || ''"></p>
-                                <div style="display: flex; gap: 0.5rem; flex-wrap: wrap; margin-bottom: 0.25rem; align-items: center;">
-                                    <span class="badge" :class="'badge-' + (c.status || 'pending')" x-text="c.status"></span>
-                                    <span style="font-size: 0.75rem; color: var(--muted);" x-text="(c.type === 'video' || c.type === 'reel') ? 'Video' : (c.type === 'carousel' ? 'Carousel' : (c.type === 'image' ? 'Image' : (c.type || '')))"></span>
-                                    <span style="font-size: 0.72rem; color: var(--muted);">Fetched</span>
+                <div class="content-grid" x-show="!contentLoading && fetchedLinkGroups.length">
+                    <template x-for="g in fetchedLinkGroups" :key="g.key">
+                        <div class="content-card ff-fetched-summary-card" @click="openFetchedGalleryModal(g)">
+                            <div style="padding: 1rem;">
+                                <div style="display: flex; justify-content: space-between; align-items: flex-start; gap: 0.75rem;">
+                                    <div style="min-width: 0;">
+                                        <h4 style="margin: 0 0 0.35rem 0; font-size: 0.95rem; word-break: break-all; line-height: 1.35;" x-text="fetchedGroupLabel(g)"></h4>
+                                        <p style="margin: 0; font-size: 0.85rem; color: var(--muted);"><strong style="color: var(--text); font-weight: 600;" x-text="g.items.length"></strong> <span x-text="g.items.length === 1 ? 'file' : 'files'"></span> — open gallery to review (✓ / ✕ per file).</p>
+                                    </div>
+                                    <span class="badge" style="flex-shrink: 0;" :class="fetchedGroupBadgeClass(g)" x-text="fetchedGroupBadge(g)"></span>
                                 </div>
-                                <div class="actions" x-show="c.status === 'pending' || c.status === 'approved'">
-                                    <select x-model="c.selectedAccount" x-show="accounts.filter(a => a.is_active).length" style="padding: 0.35rem; font-size: 0.8rem; background: var(--surface2); border: 1px solid var(--border); color: var(--text); border-radius: 6px;">
-                                        <option value="">Select account</option>
-                                        <template x-for="a in accounts.filter(a => a.is_active && hasInstagramIdentity(a))" :key="a.id">
-                                            <option :value="a.id" x-text="accountHandle(a)"></option>
-                                        </template>
-                                    </select>
-                                    <button class="btn btn-success" x-show="c.status === 'pending'" @click="approveContent(c)" :disabled="!c.selectedAccount">Approve</button>
-                                    <button class="btn btn-primary" x-show="c.status === 'approved'" @click="publishContent(c)" :disabled="!c.selectedAccount || publishing">Publish</button>
-                                    <button class="btn btn-danger" @click="openRejectContent(c)">Reject</button>
+                                <div class="ff-fetched-summary-thumbs">
+                                    <template x-for="c in fetchedGroupPreviewThumbs(g)" :key="'p-' + c.id">
+                                        <div class="ff-fetched-summary-thumb-wrap">
+                                            <template x-if="c.type === 'reel' || c.type === 'video'">
+                                                <video :src="effectiveMediaUrl(c)" muted loop playsinline preload="metadata"></video>
+                                            </template>
+                                            <template x-if="c.type === 'carousel' || c.type === 'image'">
+                                                <img :src="c.thumbnail_url || effectiveMediaUrl(c) || ''" :alt="contentItemTitle(c)" decoding="async">
+                                            </template>
+                                        </div>
+                                    </template>
+                                    <span class="badge badge-pending" style="align-self: center;" x-show="fetchedGroupExtraCount(g) > 0" x-text="'+' + fetchedGroupExtraCount(g)"></span>
                                 </div>
                             </div>
                         </div>
@@ -3793,15 +5086,15 @@ if (!empty($_GET['privacy']) || strpos($reqUri, '/privacy') !== false) {
 
             <div style="margin-top: 1.5rem;">
                 <h3 style="margin-bottom: 0.75rem;">Generated content</h3>
-                <p style="font-size: 0.875rem; color: var(--muted); margin-bottom: 1rem;">Text-to-video and other output from the <a href="#" @click.prevent="tab = 'pipelines'; loadPipelines()" style="color: var(--accent);">Pipelines</a> tab. If you have no pipelines yet, this list stays empty until you run one.</p>
+                <p style="font-size: 0.875rem; color: var(--muted); margin-bottom: 1rem;">Text-to-video and other output from the <a href="#" @click.prevent="tab = 'pipelines'; loadPipelines()" style="color: var(--accent);">Pipelines</a> tab — this is what you <strong style="color: var(--text);">approve</strong> and <strong style="color: var(--text);">publish</strong> to Instagram. If you have no pipelines yet, this list stays empty until you run one.</p>
                 <div class="content-grid" x-show="!contentLoading && pipelineGeneratedList.length">
                     <template x-for="c in pipelineGeneratedList" :key="c.id">
-                        <div class="content-card">
+                        <div class="content-card ff-curate-card-click" @click="openCurateModal(c)">
                             <template x-if="c.type === 'reel' || c.type === 'video'">
-                                <video :src="c.garage_url || ''" controls muted loop></video>
+                                <video :src="effectiveMediaUrl(c)" controls muted loop @click.stop></video>
                             </template>
                             <template x-if="c.type === 'carousel' || c.type === 'image'">
-                                <img :src="c.thumbnail_url || c.garage_url || ''" alt="">
+                                <img :src="c.thumbnail_url || effectiveMediaUrl(c) || ''" alt="" @click.stop>
                             </template>
                             <div class="body">
                                 <h4 x-text="contentItemTitle(c)"></h4>
@@ -3811,7 +5104,7 @@ if (!empty($_GET['privacy']) || strpos($reqUri, '/privacy') !== false) {
                                     <span style="font-size: 0.75rem; color: var(--muted);" x-text="(c.type === 'video' || c.type === 'reel') ? 'Video' : (c.type === 'carousel' ? 'Carousel' : (c.type === 'image' ? 'Image' : (c.type || '')))"></span>
                                     <span x-show="c.metadata && c.metadata.pipeline_name" style="font-size: 0.72rem; color: var(--accent);" x-text="'Pipeline: ' + c.metadata.pipeline_name"></span>
                                 </div>
-                                <div class="actions" x-show="c.status === 'pending' || c.status === 'approved'">
+                                <div class="actions" x-show="c.status === 'pending' || c.status === 'approved'" @click.stop>
                                     <select x-model="c.selectedAccount" x-show="accounts.filter(a => a.is_active).length" style="padding: 0.35rem; font-size: 0.8rem; background: var(--surface2); border: 1px solid var(--border); color: var(--text); border-radius: 6px;">
                                         <option value="">Select account</option>
                                         <template x-for="a in accounts.filter(a => a.is_active && hasInstagramIdentity(a))" :key="a.id">
@@ -3834,12 +5127,12 @@ if (!empty($_GET['privacy']) || strpos($reqUri, '/privacy') !== false) {
                 <p style="font-size: 0.875rem; color: var(--muted); margin-bottom: 1rem;">These items are not classified as fetched media or pipeline output (often legacy data). You can reject them or clean them up in PocketBase Admin.</p>
                 <div class="content-grid">
                     <template x-for="c in curateOrphanList" :key="c.id">
-                        <div class="content-card">
+                        <div class="content-card ff-curate-card-click" @click="openCurateModal(c)">
                             <template x-if="c.type === 'reel' || c.type === 'video'">
-                                <video :src="c.garage_url || ''" controls muted loop></video>
+                                <video :src="effectiveMediaUrl(c)" controls muted loop @click.stop></video>
                             </template>
                             <template x-if="c.type === 'carousel' || c.type === 'image'">
-                                <img :src="c.thumbnail_url || c.garage_url || ''" alt="">
+                                <img :src="c.thumbnail_url || effectiveMediaUrl(c) || ''" alt="" @click.stop>
                             </template>
                             <div class="body">
                                 <h4 x-text="contentItemTitle(c)"></h4>
@@ -3847,7 +5140,7 @@ if (!empty($_GET['privacy']) || strpos($reqUri, '/privacy') !== false) {
                                 <div style="display: flex; gap: 0.5rem; flex-wrap: wrap; margin-bottom: 0.25rem; align-items: center;">
                                     <span class="badge" :class="'badge-' + (c.status || 'pending')" x-text="c.status"></span>
                                 </div>
-                                <div class="actions" x-show="c.status === 'pending' || c.status === 'approved'">
+                                <div class="actions" x-show="c.status === 'pending' || c.status === 'approved'" @click.stop>
                                     <select x-model="c.selectedAccount" x-show="accounts.filter(a => a.is_active).length" style="padding: 0.35rem; font-size: 0.8rem; background: var(--surface2); border: 1px solid var(--border); color: var(--text); border-radius: 6px;">
                                         <option value="">Select account</option>
                                         <template x-for="a in accounts.filter(a => a.is_active && hasInstagramIdentity(a))" :key="a.id">
@@ -3907,6 +5200,18 @@ if (!empty($_GET['privacy']) || strpos($reqUri, '/privacy') !== false) {
             </div>
             <p x-show="!pipelinesLoading && !pipelines.length" class="msg">No pipelines yet. When the Cursor <code style="font-size:0.85em;">agent</code> run finishes it should create <code style="font-size:0.85em;">pipelines</code> records (PocketBase admin API). You can also add rows in PocketBase Admin as superuser.</p>
 
+            <div class="card" style="margin-top: 1.75rem;">
+                <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 0.5rem;">
+                    <h3 style="margin: 0; font-size: 0.95rem; color: var(--accent);">Pipeline &amp; Cursor agent (server)</h3>
+                    <div style="display: flex; gap: 0.5rem; flex-wrap: wrap; align-items: center;">
+                        <span x-show="pipelineDiagnosticsLoading" style="font-size: 0.72rem; color: var(--muted);">Loading…</span>
+                        <button type="button" class="btn btn-secondary" style="font-size: 0.72rem; padding: 0.3rem 0.55rem;" @click="loadPipelineDiagnostics()" :disabled="pipelineDiagnosticsLoading">Refresh diagnostics</button>
+                    </div>
+                </div>
+                <p style="font-size: 0.72rem; color: var(--muted); margin: 0.5rem 0 0.75rem 0;">Live snapshot: Antfly / agent env flags, active pipeline count, recent trigger &amp; prompt files under <code style="font-size:0.85em;">.cursor-pipeline/</code>, JSONL decision trace (<code style="font-size:0.85em;">pipeline-trace.jsonl</code>), and tail of <code style="font-size:0.85em;">cursor-agent.log</code>. After a Curate <strong style="color: var(--text);">Fetch</strong>, switch here and refresh to see why the create-pipeline agent ran or skipped.</p>
+                <textarea readonly rows="22" style="width: 100%; font-family: ui-monospace, monospace; font-size: 0.72rem; line-height: 1.35;" :value="tab === 'pipelines' ? pipelineDiagnosticsDisplay() : ''" @focus="$el.select()" spellcheck="false"></textarea>
+            </div>
+
             <div class="card ff-debug-panel" style="margin-top: 1.75rem;">
                 <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 0.5rem;">
                     <h3 style="margin: 0; font-size: 0.95rem; color: var(--warning);">Debug · Pipelines</h3>
@@ -3916,7 +5221,7 @@ if (!empty($_GET['privacy']) || strpos($reqUri, '/privacy') !== false) {
                         <button type="button" class="btn btn-primary" style="font-size: 0.72rem; padding: 0.3rem 0.55rem;" @click="copyTabDebugReport('pipelines')">Copy JSON</button>
                     </div>
                 </div>
-                <p style="font-size: 0.72rem; color: var(--muted); margin: 0.5rem 0 0.5rem 0;">Run pipeline / generation requests and PocketBase traffic are logged here when this tab is active.</p>
+                <p style="font-size: 0.72rem; color: var(--muted); margin: 0.5rem 0 0.5rem 0;">Browser-side trace (same tab) plus session PHP logs when you use <strong style="color: var(--text);">Refresh server bundle</strong>. <strong style="color: var(--text);">Copy JSON</strong> here first loads pipeline diagnostics (same as Refresh diagnostics), then copies. The block above is the authoritative server pipeline/agent log.</p>
                 <textarea readonly rows="16" :value="tab === 'pipelines' ? tabDebugText('pipelines') : ''" @focus="$el.select()"></textarea>
             </div>
         </div>
@@ -3985,8 +5290,8 @@ if (!empty($_GET['privacy']) || strpos($reqUri, '/privacy') !== false) {
                                 <td style="padding: 0.5rem 0.75rem;" x-text="c.type || '-'"></td>
                                 <td style="padding: 0.5rem 0.75rem; font-family: monospace; font-size: 0.8rem; word-break: break-all; color: var(--muted);" x-text="c.garage_key || '(none)'"></td>
                                 <td style="padding: 0.5rem 0.75rem;">
-                                    <a x-show="c.garage_url" :href="c.garage_url" target="_blank" rel="noopener" style="color: var(--accent); font-size: 0.8rem;">Open</a>
-                                    <span x-show="!c.garage_url" style="color: var(--muted);">—</span>
+                                    <a x-show="effectiveMediaUrl(c)" :href="effectiveMediaUrl(c)" target="_blank" rel="noopener" style="color: var(--accent); font-size: 0.8rem;">Open</a>
+                                    <span x-show="!effectiveMediaUrl(c)" style="color: var(--muted);">—</span>
                                 </td>
                             </tr>
                         </template>
@@ -4027,8 +5332,83 @@ if (!empty($_GET['privacy']) || strpos($reqUri, '/privacy') !== false) {
             </div>
         </div>
 
+        <!-- Fetched media: one gallery per source link (click a tile to approve/reject) -->
+        <div class="modal-backdrop" x-show="fetchedGalleryModal.open && fetchedGalleryModal.group" x-cloak x-transition @click.self="closeFetchedGalleryModal()" role="presentation" style="z-index: 205;">
+            <div class="modal-panel modal-panel-xl" role="dialog" aria-modal="true" aria-labelledby="fetched-gallery-title" @click.stop>
+                <div style="display: flex; justify-content: space-between; align-items: flex-start; gap: 0.75rem; margin-bottom: 0.5rem;">
+                    <div style="min-width: 0;">
+                        <h3 id="fetched-gallery-title" style="margin: 0 0 0.35rem 0; font-size: 1.05rem; word-break: break-all; line-height: 1.35;" x-text="fetchedGalleryModal.group ? fetchedGroupLabel(fetchedGalleryModal.group) : ''"></h3>
+                        <p style="margin: 0; font-size: 0.82rem; color: var(--muted);">Click a tile to open review (✓ approve / ✕ reject). Not for Instagram posting.</p>
+                    </div>
+                    <button type="button" class="btn btn-secondary" style="padding: 0.35rem 0.65rem; font-size: 0.8rem; flex-shrink: 0;" @click="closeFetchedGalleryModal()">Close</button>
+                </div>
+                <template x-if="fetchedGalleryModal.group">
+                    <div class="ff-fetched-gallery-grid">
+                        <template x-for="c in fetchedGalleryModal.group.items" :key="c.id">
+                            <div class="ff-fetched-gallery-cell" @click="openCurateModal(c)">
+                                <template x-if="c.type === 'reel' || c.type === 'video'">
+                                    <video :src="effectiveMediaUrl(c)" muted loop playsinline preload="metadata"></video>
+                                </template>
+                                <template x-if="c.type === 'carousel' || c.type === 'image'">
+                                    <img :src="c.thumbnail_url || effectiveMediaUrl(c) || ''" :alt="contentItemTitle(c)" decoding="async">
+                                </template>
+                                <div class="ff-fetched-gallery-caption" x-text="contentItemTitle(c)"></div>
+                                <div style="display: flex; gap: 0.35rem; flex-wrap: wrap; padding: 0 0.45rem 0.45rem 0.45rem;">
+                                    <span class="badge" style="font-size: 0.65rem; padding: 0.1rem 0.35rem;" :class="'badge-' + (c.status || 'pending')" x-text="c.status"></span>
+                                </div>
+                            </div>
+                        </template>
+                    </div>
+                </template>
+            </div>
+        </div>
+
+        <!-- Curate: click card to review — approve (✓) / reject (✕) -->
+        <div class="modal-backdrop" x-show="curateModal.open" x-cloak x-transition @click.self="closeCurateModal()" role="presentation" style="z-index: 210;">
+            <div class="modal-panel modal-panel-wide" role="dialog" aria-modal="true" aria-labelledby="curate-modal-title" @click.stop>
+                <div style="display: flex; justify-content: space-between; align-items: flex-start; gap: 0.75rem; margin-bottom: 0.75rem;">
+                    <h3 id="curate-modal-title" style="margin: 0; font-size: 1.05rem; line-height: 1.35;" x-text="curateModal.item ? contentItemTitle(curateModal.item) : 'Review'"></h3>
+                    <button type="button" class="btn btn-secondary" style="padding: 0.35rem 0.65rem; font-size: 0.8rem; flex-shrink: 0;" @click="closeCurateModal()">Close</button>
+                </div>
+                <template x-if="curateModal.item">
+                    <div>
+                        <div style="display: flex; gap: 0.5rem; flex-wrap: wrap; align-items: center; margin-bottom: 0.5rem;">
+                            <span class="badge" :class="'badge-' + (curateModal.item.status || 'pending')" x-text="curateModal.item.status"></span>
+                            <span x-show="isFetchedMedia(curateModal.item)" style="font-size: 0.78rem; color: var(--muted);">Fetched reference</span>
+                            <span x-show="isPipelineGenerated(curateModal.item)" style="font-size: 0.78rem; color: var(--accent);" x-text="curateModal.item.metadata?.pipeline_name ? ('Pipeline: ' + curateModal.item.metadata.pipeline_name) : 'Pipeline output'"></span>
+                        </div>
+                        <p x-show="isFetchedMedia(curateModal.item) && curateModal.item.status === 'pending'" style="font-size: 0.8rem; color: var(--muted); margin: 0 0 0.75rem 0;">Approve marks this clip as reviewed (not an Instagram post).</p>
+                        <div class="ff-curate-modal-media">
+                            <template x-if="curateModal.item.type === 'reel' || curateModal.item.type === 'video'">
+                                <video :src="effectiveMediaUrl(curateModal.item)" controls playsinline></video>
+                            </template>
+                            <template x-if="curateModal.item.type === 'carousel' || curateModal.item.type === 'image'">
+                                <img :src="curateModal.item.thumbnail_url || effectiveMediaUrl(curateModal.item) || ''" :alt="contentItemTitle(curateModal.item)" decoding="async">
+                            </template>
+                        </div>
+                        <p style="font-size: 0.85rem; color: var(--muted); margin: 0 0 0.75rem 0; max-height: 4.5rem; overflow-y: auto;" x-text="(curateModal.item.prompt || '').trim() || '—'"></p>
+                        <div class="form-group" x-show="!isFetchedMedia(curateModal.item) && (curateModal.item.status === 'pending' || curateModal.item.status === 'approved') && accounts.filter(a => a.is_active && hasInstagramIdentity(a)).length">
+                            <label for="curate-modal-account">Instagram account</label>
+                            <select id="curate-modal-account" class="w-full" x-model="curateModal.item.selectedAccount" style="padding: 0.6rem; border-radius: 8px; background: var(--surface2); border: 1px solid var(--border); color: var(--text); width: 100%;">
+                                <option value="">Select account</option>
+                                <template x-for="a in accounts.filter(a => a.is_active && hasInstagramIdentity(a))" :key="a.id">
+                                    <option :value="a.id" x-text="accountHandle(a)"></option>
+                                </template>
+                            </select>
+                        </div>
+                        <div class="ff-curate-icon-row" x-show="curateModalShowIconActions()">
+                            <button type="button" class="ff-curate-icon-btn ff-approve" x-show="curateModal.item && curateModal.item.status === 'pending'" @click="approveFromCurateModal()" :disabled="!canCurateModalApprove() || curating || publishing" title="Approve" aria-label="Approve">✓</button>
+                            <button type="button" class="ff-curate-icon-btn ff-publish" x-show="curateModalShowPublishBtn()" @click="publishFromCurateModal()" :disabled="!canCurateModalPublish() || publishing" title="Publish to Instagram" aria-label="Publish to Instagram">▶</button>
+                            <button type="button" class="ff-curate-icon-btn ff-reject" x-show="canCurateModalReject()" @click="rejectFromCurateModal()" :disabled="!canCurateModalReject() || curating || publishing" title="Reject" aria-label="Reject">✕</button>
+                        </div>
+                        <p x-show="!curateModalShowIconActions()" style="font-size: 0.85rem; color: var(--muted); text-align: center; margin: 1rem 0 0 0;">No approve/reject actions for this state. Use Close or manage in PocketBase Admin.</p>
+                    </div>
+                </template>
+            </div>
+        </div>
+
         <!-- Reject content -->
-        <div class="modal-backdrop" x-show="rejectModal.open" x-cloak x-transition @click.self="rejectModal.open = false" role="presentation">
+        <div class="modal-backdrop" x-show="rejectModal.open" x-cloak x-transition @click.self="rejectModal.open = false" role="presentation" style="z-index: 220;">
             <div class="modal-panel" role="dialog" aria-modal="true" aria-labelledby="reject-title" @click.stop>
                 <h3 id="reject-title">Reject content</h3>
                 <p style="font-size: 0.85rem; color: var(--muted); margin-bottom: 0.75rem;">Optional note (stored with the item).</p>
@@ -4048,6 +5428,10 @@ if (!empty($_GET['privacy']) || strpos($reqUri, '/privacy') !== false) {
         document.addEventListener('alpine:init', () => {
             Alpine.data('pipelineApp', () => ({
                 PB_URL: '<?= addslashes($CONFIG['pocketbase_public_url']) ?>',
+                /** Same as GARAGE_PUBLIC_URL / built virtual-host base — used when garage_url is missing but garage_key is set. */
+                garagePublicBase: '<?= addslashes(rtrim((string) ($CONFIG['garage_public_url'] ?? ''), '/')) ?>',
+                garageBucket: '<?= addslashes((string) ($CONFIG['garage_bucket'] ?? 'formatforge')) ?>',
+                contentItemsCollectionId: '<?= htmlspecialchars(ff_content_items_collection_id(), ENT_QUOTES | ENT_HTML5, 'UTF-8') ?>',
                 token: '<?= addslashes($token ?? '') ?>',
                 userEmail: '<?= addslashes($user['email'] ?? '') ?>',
                 tab: '<?= htmlspecialchars($_GET['tab'] ?? 'curate') ?>',
@@ -4068,10 +5452,16 @@ if (!empty($_GET['privacy']) || strpos($reqUri, '/privacy') !== false) {
                 pipelines: [],
                 pipelinesLoading: false,
                 runModal: { open: false, pipeline: null, extraPrompt: '' },
+                curateModal: { open: false, item: null },
+                fetchedGalleryModal: { open: false, group: null },
                 rejectModal: { open: false, target: null, reason: '' },
+                curating: false,
                 fetchDebugText: '',
                 uiDebugLog: [],
                 serverDebugBundle: null,
+                pipelineDiagnostics: null,
+                pipelineDiagnosticsLoading: false,
+                garageUrlLocalhostWarning: false,
 
                 isFetchedMedia(c) {
                     if (!c) return false;
@@ -4088,6 +5478,89 @@ if (!empty($_GET['privacy']) || strpos($reqUri, '/privacy') !== false) {
 
                 get fetchedFromLinksList() {
                     return this.content.filter(c => this.isFetchedMedia(c));
+                },
+
+                get fetchedLinkGroups() {
+                    const fetched = this.fetchedFromLinksList;
+                    const byLink = new Map();
+                    for (const c of fetched) {
+                        const lid = String(c.source_link_id ?? '').trim();
+                        if (!byLink.has(lid)) byLink.set(lid, []);
+                        byLink.get(lid).push(c);
+                    }
+                    const groups = [];
+                    const consumed = new Set();
+                    for (const l of this.links) {
+                        const items = byLink.get(l.id);
+                        if (items && items.length) {
+                            groups.push({
+                                key: 'l-' + l.id,
+                                linkId: l.id,
+                                url: (l.url || '').trim(),
+                                linkStatus: l.status || '',
+                                items,
+                            });
+                            consumed.add(l.id);
+                        }
+                    }
+                    for (const [lid, items] of byLink) {
+                        if (!items.length) continue;
+                        if (lid === '') {
+                            groups.push({
+                                key: 'nolink',
+                                linkId: null,
+                                url: '',
+                                linkStatus: '',
+                                items,
+                                noLink: true,
+                            });
+                            continue;
+                        }
+                        if (!consumed.has(lid)) {
+                            const first = items[0];
+                            const metaUrl = String(first?.metadata?.source_url || '').trim();
+                            groups.push({
+                                key: 'o-' + lid,
+                                linkId: lid,
+                                url: metaUrl,
+                                linkStatus: '',
+                                items,
+                                orphaned: true,
+                            });
+                        }
+                    }
+                    return groups;
+                },
+
+                fetchedGroupLabel(g) {
+                    if (!g) return '';
+                    if (g.noLink) return 'Media (no source link)';
+                    const u = (g.url || '').trim();
+                    if (u) return u.length > 88 ? u.slice(0, 88) + '…' : u;
+                    return 'Fetched media';
+                },
+
+                fetchedGroupPreviewThumbs(g) {
+                    return (g && g.items) ? g.items.slice(0, 4) : [];
+                },
+
+                fetchedGroupExtraCount(g) {
+                    if (!g || !g.items) return 0;
+                    const n = g.items.length;
+                    return n > 4 ? n - 4 : 0;
+                },
+
+                fetchedGroupBadge(g) {
+                    if (!g) return '';
+                    if (g.noLink) return 'Unlinked';
+                    if (g.orphaned) return 'Orphan link';
+                    return g.linkStatus || 'pending';
+                },
+
+                fetchedGroupBadgeClass(g) {
+                    if (!g) return 'badge-pending';
+                    if (g.noLink || g.orphaned) return 'badge-pending';
+                    return g.linkStatus === 'fetched' ? 'badge-approved' : 'badge-pending';
                 },
 
                 get pipelineGeneratedList() {
@@ -4124,6 +5597,49 @@ if (!empty($_GET['privacy']) || strpos($reqUri, '/privacy') !== false) {
                     if (this.isFetchedMedia(c)) return 'Fetched media';
                     const id = String(c?.id || '');
                     return id ? ('Item · ' + id.slice(0, 8)) : 'Untitled';
+                },
+
+                /** On HTTPS pages, upgrade http:// media URLs to https:// (mixed content). */
+                maybeHttpsMediaUrl(u) {
+                    if (!u || typeof u !== 'string') return u;
+                    if (typeof location === 'undefined' || location.protocol !== 'https:') return u;
+                    if (u.startsWith('http://')) return 'https://' + u.slice(7);
+                    return u;
+                },
+
+                encodeGarageKeyPath(key) {
+                    if (!key) return '';
+                    return String(key).replace(/^\/+/, '').split('/').filter(Boolean).map((s) => encodeURIComponent(s)).join('/');
+                },
+
+                /** Prefer server-injected ff_display_media_url (PocketBase /api/files/… when media_file exists), then PB URL, then Garage. */
+                effectiveMediaUrl(c) {
+                    if (!c) return '';
+                    const pbDirect = (c.ff_display_media_url || '').trim();
+                    if (pbDirect) return this.maybeHttpsMediaUrl(pbDirect);
+                    const fn = c.media_file;
+                    const base = (this.PB_URL || '').replace(/\/$/, '');
+                    const cid = c.collectionId || this.contentItemsCollectionId;
+                    if (fn && cid && c.id && base) {
+                        return this.maybeHttpsMediaUrl(`${base}/api/files/${encodeURIComponent(cid)}/${encodeURIComponent(c.id)}/${encodeURIComponent(fn)}`);
+                    }
+                    let u = (c.garage_url || '') || (c.thumbnail_url || '');
+                    if (!u && this.garagePublicBase && c.garage_key) {
+                        const path = this.encodeGarageKeyPath(c.garage_key);
+                        if (path) {
+                            const pb = this.garagePublicBase.replace(/\/$/, '');
+                            try {
+                                const loc = new URL(pb.startsWith('http') ? pb : `https://${pb}`);
+                                const host = loc.hostname.toLowerCase();
+                                const b = String(this.garageBucket || 'formatforge').toLowerCase();
+                                const vh = b !== '' && host.startsWith(`${b}.web.`);
+                                u = vh ? `${pb}/${path}` : `${pb}/${encodeURIComponent(this.garageBucket || 'formatforge')}/${path}`;
+                            } catch (e) {
+                                u = `${pb}/${path}`;
+                            }
+                        }
+                    }
+                    return this.maybeHttpsMediaUrl(u);
                 },
 
                 _now() {
@@ -4205,13 +5721,17 @@ if (!empty($_GET['privacy']) || strpos($reqUri, '/privacy') !== false) {
                         } catch (e) {
                             json = { _parseError: String(e), _rawPreview: text.slice(0, 5000), _rawLen: text.length };
                         }
-                        this.pushDebug('app_post_done', {
+                        const doneDetail = {
                             action,
                             httpStatus: r.status,
                             ok: r.ok,
                             ms: Math.round(this._now() - t0),
                             response: this.cloneForDebug(json),
-                        });
+                        };
+                        if (typeof json.pb_http_status === 'number') {
+                            doneDetail.pocketbaseHttp = json.pb_http_status;
+                        }
+                        this.pushDebug('app_post_done', doneDetail);
                         return json;
                     } catch (e) {
                         this.pushDebug('app_post_error', { action, error: String(e) });
@@ -4316,7 +5836,13 @@ if (!empty($_GET['privacy']) || strpos($reqUri, '/privacy') !== false) {
                 tabDebugReport(tabId) {
                     const forTab = this.uiDebugLog.filter(e => e.tab === tabId);
                     const tailAll = this.uiDebugLog.slice(-180);
-                    return {
+                    const serverBundle = this.serverDebugBundle
+                        ? this.serverDebugBundle
+                        : {
+                            note: 'Click “Refresh server bundle” on any tab to load PHP session logs + public config.',
+                            loaded: false,
+                        };
+                    const out = {
                         formatforge_ui_debug: '1',
                         reportTab: tabId,
                         exportedAt: new Date().toISOString(),
@@ -4325,9 +5851,25 @@ if (!empty($_GET['privacy']) || strpos($reqUri, '/privacy') !== false) {
                             recentEventsAllTabs: tailAll,
                             totalClientEvents: this.uiDebugLog.length,
                         },
-                        serverBundle: this.serverDebugBundle || { note: 'Click “Refresh server bundle” on any tab to load PHP session logs + public config.' },
+                        serverBundle,
                         uiSnapshot: this.uiStateSnapshot(),
                     };
+                    if (tabId === 'pipelines') {
+                        out.pipelineDiagnostics = this.pipelineDiagnostics ?? null;
+                    }
+                    return out;
+                },
+
+                pipelineDiagnosticsDisplay() {
+                    const p = this.pipelineDiagnostics;
+                    if (!p) {
+                        return '(Click “Refresh diagnostics” to load Antfly/agent flags, pipeline-trace.jsonl tail, and cursor-agent.log tail.)';
+                    }
+                    try {
+                        return JSON.stringify(p, null, 2);
+                    } catch (e) {
+                        return String(e);
+                    }
                 },
 
                 tabDebugText(tabId) {
@@ -4345,6 +5887,9 @@ if (!empty($_GET['privacy']) || strpos($reqUri, '/privacy') !== false) {
                         const d = await this.postToApp(fd);
                         if (d && d.ok) {
                             this.serverDebugBundle = d;
+                            if (d.pipeline && this.tab === 'pipelines') {
+                                this.pipelineDiagnostics = { ok: true, ...d.pipeline };
+                            }
                             this.msg = 'Server debug bundle refreshed.';
                             this.msgError = false;
                         } else {
@@ -4359,13 +5904,40 @@ if (!empty($_GET['privacy']) || strpos($reqUri, '/privacy') !== false) {
                     }
                 },
 
-                copyTabDebugReport(tabId) {
+                async loadPipelineDiagnostics() {
+                    const fd = new FormData();
+                    fd.append('action', 'pipeline_diagnostics');
+                    this.pipelineDiagnosticsLoading = true;
+                    try {
+                        const d = await this.postToApp(fd);
+                        if (d && d.ok) {
+                            this.pipelineDiagnostics = d;
+                        } else {
+                            this.pipelineDiagnostics = { ok: false, error: (d && d.error) || 'pipeline_diagnostics_failed', detail: this.cloneForDebug(d || {}) };
+                        }
+                    } catch (e) {
+                        this.pipelineDiagnostics = { ok: false, error: String(e) };
+                    } finally {
+                        this.pipelineDiagnosticsLoading = false;
+                    }
+                },
+
+                async copyTabDebugReport(tabId) {
+                    if (tabId === 'pipelines') {
+                        await this.loadPipelineDiagnostics();
+                    }
                     const text = this.tabDebugText(tabId);
                     if (navigator.clipboard && navigator.clipboard.writeText) {
-                        navigator.clipboard.writeText(text).then(() => {
-                            this.msg = 'Debug JSON copied (' + tabId + ').';
+                        try {
+                            await navigator.clipboard.writeText(text);
+                            this.msg = tabId === 'pipelines'
+                                ? 'Debug JSON copied (includes pipeline diagnostics).'
+                                : ('Debug JSON copied (' + tabId + ').');
                             this.msgError = false;
-                        }).catch(() => {});
+                        } catch (e) {
+                            this.msg = 'Clipboard failed.';
+                            this.msgError = true;
+                        }
                     }
                 },
 
@@ -4377,13 +5949,18 @@ if (!empty($_GET['privacy']) || strpos($reqUri, '/privacy') !== false) {
                         userAgent: typeof navigator !== 'undefined' ? navigator.userAgent : '',
                     });
                     if (typeof this.$watch === 'function') {
-                        this.$watch('tab', (v, prev) => this.pushDebug('tab_change', { from: prev, to: v }));
+                        this.$watch('tab', (v, prev) => {
+                            if (v === prev) return;
+                            this.pushDebug('tab_change', { from: prev, to: v });
+                            // pipeline_diagnostics: do not call here — loadPipelines() finally refreshes after list load (avoids duplicate POSTs).
+                        });
                     }
                     if (this.tab === 'curate') { this.loadLinks(); this.loadContent(); this.loadAccounts(); }
                     if (this.tab === 'pipelines') { this.loadPipelines(); this.loadAccounts(); }
                     if (this.tab === 'accounts') this.loadAccounts();
                     if (this.tab === 'activity') this.loadContent();
                     if (this.msg === 'connected') this.msg = 'Instagram account connected.';
+                    this._syncGarageDisplayWarnings();
                 },
 
                 pbToken() {
@@ -4434,9 +6011,23 @@ if (!empty($_GET['privacy']) || strpos($reqUri, '/privacy') !== false) {
                     };
                 },
 
+                pocketBaseErrorHint(r, d) {
+                    const code = r.status || 0;
+                    const msg = (d && d.message) ? String(d.message) : '';
+                    if (code === 401 || code === 403) {
+                        return (msg || 'Not authorized') + ' Try logging out and logging back in to refresh your PocketBase session.';
+                    }
+                    if (code === 0) return 'Could not reach PocketBase.';
+                    return msg || ('HTTP ' + code);
+                },
+
                 async loadLinks() {
                     try {
-                        const { d } = await this.pbGet('/api/collections/source_links/records?sort=-created', 'loadLinks');
+                        const { r, d } = await this.pbGet('/api/collections/source_links/records?sort=-%40rowid', 'loadLinks');
+                        if (r.status !== 200) {
+                            this.links = [];
+                            return;
+                        }
                         this.links = (d.items || []).map(l => ({ ...l, fetching: false }));
                     } catch (e) { this.links = []; }
                 },
@@ -4513,17 +6104,56 @@ if (!empty($_GET['privacy']) || strpos($reqUri, '/privacy') !== false) {
                     this.contentLoading = true;
                     this.pushDebug('load_content_start', {});
                     try {
-                        const { d } = await this.pbGet('/api/collections/content_items/records?sort=-created', 'loadContent');
+                        const { r, d } = await this.pbGet('/api/collections/content_items/records?sort=-%40rowid', 'loadContent');
+                        if (r.status !== 200) {
+                            this.content = [];
+                            this._syncGarageDisplayWarnings();
+                            this.msg = 'Content: ' + this.pocketBaseErrorHint(r, d);
+                            this.msgError = true;
+                            return;
+                        }
                         this.content = (d.items || []).map(c => ({ ...c, selectedAccount: c.instagram_account_id || '' }));
+                        this._syncGarageDisplayWarnings();
                     } catch (e) { this.msg = ''; this.msgError = false; }
                     finally { this.contentLoading = false; }
+                },
+
+                _syncGarageDisplayWarnings() {
+                    let localhost = false;
+                    const items = this.content || [];
+                    for (const c of items) {
+                        const u = String(this.effectiveMediaUrl(c) || '').trim();
+                        if (!u) continue;
+                        try {
+                            const h = new URL(u).hostname.toLowerCase();
+                            if (h === '127.0.0.1' || h === 'localhost' || h === '[::1]' || h === '::1') {
+                                localhost = true;
+                            }
+                        } catch (e) {}
+                    }
+                    this.garageUrlLocalhostWarning = localhost;
                 },
 
                 async loadAccounts() {
                     this.pushDebug('load_accounts_start', {});
                     try {
-                        const { d } = await this.pbGet('/api/collections/instagram_accounts/records?sort=-created', 'loadAccounts');
-                        this.accounts = (d.items || []).map(a => this.normalizeAccount(a));
+                        const { r, d } = await this.pbGet('/api/collections/instagram_accounts/records?sort=-%40rowid', 'loadAccounts');
+                        if (r.status !== 200) {
+                            this.accounts = [];
+                            this.msg = 'Instagram accounts: ' + this.pocketBaseErrorHint(r, d);
+                            this.msgError = true;
+                            return;
+                        }
+                        const items = Array.isArray(d.items) ? d.items : [];
+                        const total = (typeof d.totalItems === 'number') ? d.totalItems : null;
+                        if (items.length === 0 && total !== null && total > 0) {
+                            this.pushDebug('pb_list_rule_mismatch', { collection: 'instagram_accounts', totalItems: total });
+                            this.accounts = [];
+                            this.msg = 'PocketBase reports ' + total + ' Instagram account(s), but this login cannot list them. In PocketBase Admin, open the instagram_accounts collection and set List/View rules so your user can read their rows (or widen rules for testing). Superuser Admin always sees every row.';
+                            this.msgError = true;
+                            return;
+                        }
+                        this.accounts = items.map(a => this.normalizeAccount(a));
                         const stale = this.accounts.find(a => this.shouldShowRefresh(a));
                         if (stale) this.refreshUsername(stale, { silent: true });
                     } catch (e) { this.accounts = []; }
@@ -4649,20 +6279,98 @@ if (!empty($_GET['privacy']) || strpos($reqUri, '/privacy') !== false) {
                     }
                 },
 
+                curateModalShowPublishBtn() {
+                    const c = this.curateModal.item;
+                    if (!c || c.status !== 'approved' || this.isFetchedMedia(c)) return false;
+                    return true;
+                },
+
+                curateModalShowIconActions() {
+                    const c = this.curateModal.item;
+                    if (!c) return false;
+                    if (c.status === 'pending') return true;
+                    if (c.status === 'approved') return true;
+                    return false;
+                },
+
+                canCurateModalApprove() {
+                    const c = this.curateModal.item;
+                    if (!c || c.status !== 'pending') return false;
+                    if (this.isFetchedMedia(c)) return true;
+                    return !!c.selectedAccount;
+                },
+
+                canCurateModalPublish() {
+                    const c = this.curateModal.item;
+                    if (!c || c.status !== 'approved' || this.isFetchedMedia(c)) return false;
+                    return !!c.selectedAccount;
+                },
+
+                canCurateModalReject() {
+                    const c = this.curateModal.item;
+                    if (!c) return false;
+                    return c.status === 'pending' || c.status === 'approved';
+                },
+
+                openFetchedGalleryModal(g) {
+                    if (!g || !g.items || !g.items.length) return;
+                    this.fetchedGalleryModal.group = g;
+                    this.fetchedGalleryModal.open = true;
+                },
+
+                closeFetchedGalleryModal() {
+                    this.fetchedGalleryModal.open = false;
+                    this.fetchedGalleryModal.group = null;
+                },
+
+                openCurateModal(c) {
+                    this.curateModal.item = c;
+                    this.curateModal.open = true;
+                },
+
+                closeCurateModal() {
+                    this.curateModal.open = false;
+                    this.curateModal.item = null;
+                },
+
+                async approveFromCurateModal() {
+                    const c = this.curateModal.item;
+                    if (!c || !this.canCurateModalApprove()) return;
+                    await this.approveContent(c);
+                },
+
+                async publishFromCurateModal() {
+                    const c = this.curateModal.item;
+                    if (!c || !this.canCurateModalPublish()) return;
+                    await this.publishContent(c);
+                    if (!this.msgError) this.closeCurateModal();
+                },
+
+                rejectFromCurateModal() {
+                    const c = this.curateModal.item;
+                    if (!c || !this.canCurateModalReject()) return;
+                    this.curateModal.open = false;
+                    this.curateModal.item = null;
+                    this.openRejectContent(c);
+                },
+
                 async approveContent(c) {
-                    if (!c.selectedAccount) return;
-                    this.pushDebug('approve_content', { content_id: c.id, account_id: c.selectedAccount });
+                    if (!this.isFetchedMedia(c) && !c.selectedAccount) return;
+                    this.curating = true;
+                    this.pushDebug('approve_content', { content_id: c.id, account_id: c.selectedAccount || null, fetched: this.isFetchedMedia(c) });
                     const fd = new FormData();
                     fd.append('action', 'approve_content');
                     fd.append('id', c.id);
-                    fd.append('account_id', c.selectedAccount);
+                    fd.append('account_id', this.isFetchedMedia(c) ? '' : c.selectedAccount);
                     try {
                         const d = await this.postToApp(fd);
-                        if (d.ok) { c.status = 'approved'; this.msg = 'Approved.'; }
+                        if (d.ok) { c.status = 'approved'; this.msg = this.isFetchedMedia(c) ? 'Marked as reviewed.' : 'Approved.'; }
                         else { this.msg = d.error || 'Failed'; this.msgError = true; }
                     } catch (e) {
                         this.msg = 'Request failed';
                         this.msgError = true;
+                    } finally {
+                        this.curating = false;
                     }
                 },
 
@@ -4718,7 +6426,13 @@ if (!empty($_GET['privacy']) || strpos($reqUri, '/privacy') !== false) {
                     this.pipelinesLoading = true;
                     this.pushDebug('load_pipelines_start', {});
                     try {
-                        const { d } = await this.pbGet('/api/collections/pipelines/records?sort=name', 'loadPipelines');
+                        const { r, d } = await this.pbGet('/api/collections/pipelines/records?sort=name', 'loadPipelines');
+                        if (r.status !== 200) {
+                            this.pipelines = [];
+                            this.msg = 'Pipelines: ' + this.pocketBaseErrorHint(r, d);
+                            this.msgError = true;
+                            return;
+                        }
                         this.pipelines = (d.items || []).map(p => ({
                             ...p,
                             is_active: p.is_active !== false,
@@ -4730,6 +6444,9 @@ if (!empty($_GET['privacy']) || strpos($reqUri, '/privacy') !== false) {
                         this.msgError = true;
                     } finally {
                         this.pipelinesLoading = false;
+                        if (this.tab === 'pipelines') {
+                            this.loadPipelineDiagnostics();
+                        }
                     }
                 },
 
@@ -4783,6 +6500,9 @@ if (!empty($_GET['privacy']) || strpos($reqUri, '/privacy') !== false) {
                         return false;
                     } finally {
                         this.generating = false;
+                        if (this.tab === 'pipelines') {
+                            this.loadPipelineDiagnostics();
+                        }
                     }
                 },
 
