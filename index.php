@@ -2674,7 +2674,7 @@ $CONFIG = [
     'pocketbase_admin_url' => rtrim($pbPublicUrl, '/') . '/_/',
     'site_url'         => $siteUrl,
     'site_name'        => getenv('SITE_NAME') ?: 'FormatForge',
-    'app_version'      => getenv('APP_VERSION') ?: 'v1.1.156',
+    'app_version'      => getenv('APP_VERSION') ?: 'v1.1.159',
     'users_collection' => 'users',
     'garage_endpoint'  => getenv('GARAGE_ENDPOINT') ?: 'http://127.0.0.1:3900',
     'garage_key'       => getenv('GARAGE_ACCESS_KEY') ?: '',
@@ -5024,6 +5024,7 @@ function formatforge_generate_content_finish(string $itemId, string $authHeader)
                         $semanticBlob = formatforge_antfly_content_semantic_text('(pipeline)', '', trim($prompt));
                         $antflyType = ff_antfly_type_for_content_row($row, $pipelineRow);
                         formatforge_index_content_in_antfly((string) $itemId, $semanticBlob, $antflyType, 'pending', $pbUrl !== '' ? $pbUrl : null, 'image/jpeg', '', '(pipeline)');
+                        ff_pb_store_output_media_embedding_after_media_ready((string) $itemId, $row, $prompt, $pbUrl !== '' ? $pbUrl : null, $authHeader);
                         ff_verify_shape_bundle_after_item_finish($row, $pipelineRow, $authHeader);
                         ff_pipeline_trace_log('generate_content_ok', [
                             'content_item_id' => $itemId,
@@ -5153,6 +5154,7 @@ function formatforge_generate_content_finish(string $itemId, string $authHeader)
     $semanticBlob = formatforge_antfly_content_semantic_text('(pipeline)', '', trim($prompt));
     $antflyType = ff_antfly_type_for_content_row($row, $pipelineRow);
     formatforge_index_content_in_antfly((string) $itemId, $semanticBlob, $antflyType, 'pending', $gUrl ?: null, $uploadMime, '', '(pipeline)');
+    ff_pb_store_output_media_embedding_after_media_ready((string) $itemId, $row, $prompt, ($gUrl !== null && trim((string)$gUrl) !== '') ? trim((string)$gUrl) : null, $authHeader);
     ff_verify_shape_bundle_after_item_finish($row, $pipelineRow, $authHeader);
     ff_pipeline_trace_log('generate_content_ok', [
         'content_item_id' => $itemId,
@@ -6566,11 +6568,13 @@ function ff_gemini_embed_from_text(string $text): ?array {
 function ff_gemini_mime_for_alignment_url(string $mediaUrl, string $mediaKind): string {
     $u = strtolower($mediaUrl);
     $map = [
+        '.pdf' => 'application/pdf',
         '.png' => 'image/png', '.jpg' => 'image/jpeg', '.jpeg' => 'image/jpeg',
         '.webp' => 'image/webp', '.gif' => 'image/gif',
         '.mp4' => 'video/mp4', '.webm' => 'video/webm', '.mov' => 'video/quicktime',
         '.m4v' => 'video/x-m4v', '.mpeg' => 'video/mpeg', '.mpe' => 'video/mpeg', '.ogv' => 'video/ogg',
         '.mp3' => 'audio/mpeg', '.m4a' => 'audio/mp4', '.wav' => 'audio/wav',
+        '.flac' => 'audio/flac', '.ogg' => 'audio/ogg', '.opus' => 'audio/opus', '.aac' => 'audio/aac',
     ];
     foreach ($map as $ext => $mime) {
         if (str_contains($u, $ext)) {
@@ -6578,6 +6582,9 @@ function ff_gemini_mime_for_alignment_url(string $mediaUrl, string $mediaKind): 
         }
     }
     $mediaKind = strtolower(trim($mediaKind));
+    if ($mediaKind === 'document') {
+        return 'application/pdf';
+    }
     if ($mediaKind === 'video') {
         return 'video/mp4';
     }
@@ -6589,9 +6596,36 @@ function ff_gemini_mime_for_alignment_url(string $mediaUrl, string $mediaKind): 
 }
 
 /**
+ * Refine alignment media kind from URL (Gemini embedding-2 supports image, video, audio, PDF per Google limits).
+ *
+ * @param 'image'|'video' $baseKind when the URL has no recognizable extension
+ * @return 'image'|'video'|'audio'|'document'
+ */
+function ff_gemini_refine_media_kind_from_url(string $url, string $baseKind): string {
+    $u = strtolower($url);
+    if (str_contains($u, '.pdf')) {
+        return 'document';
+    }
+    foreach (['.mp3', '.m4a', '.aac', '.wav', '.flac', '.ogg', '.opus'] as $ext) {
+        if (str_contains($u, $ext)) {
+            return 'audio';
+        }
+    }
+    if (ff_alignment_guess_video_url_from_string($url)) {
+        return 'video';
+    }
+    $bk = strtolower(trim($baseKind));
+    if ($bk === 'video') {
+        return 'video';
+    }
+
+    return 'image';
+}
+
+/**
  * Download media from URL and embed via Gemini (inline_data), matching google.genai multimodal embed_content.
  *
- * @param 'image'|'video'|'audio' $mediaKind
+ * @param 'image'|'video'|'audio'|'document' $mediaKind document = PDF (application/pdf)
  * @return list<float>|null
  */
 function ff_gemini_alignment_multimodal(?string $text, ?string $mediaUrl, string $mediaKind = 'image'): ?array {
@@ -6615,6 +6649,100 @@ function ff_gemini_alignment_multimodal(?string $text, ?string $mediaUrl, string
     }
 
     return ff_gemini_embed_from_logical_parts($parts);
+}
+
+/** When not "0", PATCH `embedding` + `embedding_model` on input_media / output_media after add link, fetch, generate, etc. */
+function ff_pb_embedding_store_enabled(): bool {
+    return strtolower(trim((string)(getenv('POCKETBASE_EMBED_STORE_ENABLED') ?: '1'))) !== '0';
+}
+
+/** Label stored in PocketBase `embedding_model` for the configured provider. */
+function ff_embedding_model_label_for_pb(): string {
+    $cfg = $GLOBALS['CONFIG'];
+    if (trim((string)($cfg['gemini_api_key'] ?? '')) !== '') {
+        return ff_gemini_embed_model_id();
+    }
+    if (!empty($cfg['openrouter_key'])) {
+        $m = trim((string)($cfg['embed_model'] ?? ''));
+
+        return 'openrouter:' . ($m !== '' ? $m : 'google/gemini-embedding-001');
+    }
+    if (!empty($cfg['openai_key'])) {
+        return 'openai:text-embedding-3-small';
+    }
+    if (!empty($cfg['embed_url'])) {
+        return 'ollama:nomic-embed-text';
+    }
+
+    return '';
+}
+
+/**
+ * Vector to store on a row: Gemini multimodal from public media URL + caption when possible; else text embed of caption/URL.
+ *
+ * @param 'image'|'video' $baseKind
+ * @return list<float>|null
+ */
+function ff_compute_embedding_for_pb_storage(?string $captionText, ?string $mediaPublicUrl, string $baseKind = 'image'): ?array {
+    $captionText = trim((string)$captionText);
+    $mediaPublicUrl = $mediaPublicUrl !== null ? trim($mediaPublicUrl) : '';
+    if (trim((string)($GLOBALS['CONFIG']['gemini_api_key'] ?? '')) !== '' && $mediaPublicUrl !== '') {
+        $kind = ff_gemini_refine_media_kind_from_url($mediaPublicUrl, $baseKind === 'video' ? 'video' : 'image');
+        $txt = $captionText !== '' ? $captionText : ' ';
+        $v = ff_gemini_alignment_multimodal($txt, $mediaPublicUrl, $kind);
+        if ($v !== null) {
+            return $v;
+        }
+    }
+    $blob = $captionText;
+    if ($blob === '' && $mediaPublicUrl !== '') {
+        $blob = $mediaPublicUrl;
+    }
+    if ($blob === '') {
+        return null;
+    }
+
+    return embed_text($blob);
+}
+
+/**
+ * @param list<float>|null $vec
+ */
+function ff_pb_patch_record_embedding(string $collection, string $recordId, ?array $vec, string $modelLabel, ?string $authHeader): void {
+    if (!ff_pb_embedding_store_enabled() || $vec === null || $vec === [] || $modelLabel === '' || $recordId === '' || !$authHeader) {
+        return;
+    }
+    $patch = [
+        'embedding' => array_values($vec),
+        'embedding_model' => $modelLabel,
+    ];
+    $tok = pb_normalize_bearer_token($authHeader);
+    $r = pb_request('PATCH', '/api/collections/' . rawurlencode($collection) . '/records/' . rawurlencode($recordId), $patch, $tok);
+    if ($r['code'] < 200 || $r['code'] >= 300) {
+        ff_debug_log('pb_embedding_patch_failed', [
+            'collection' => $collection,
+            'record_id' => $recordId,
+            'code' => $r['code'] ?? 0,
+            'message' => $r['body']['message'] ?? null,
+        ]);
+    }
+}
+
+/** After garage_url / PB file URL is known, persist embedding on output_media (same space as Antfly when keys match). */
+function ff_pb_store_output_media_embedding_after_media_ready(string $itemId, array $row, string $prompt, ?string $publicMediaUrl, ?string $authHeader): void {
+    if (!$authHeader || !ff_pb_embedding_store_enabled()) {
+        return;
+    }
+    $modelL = ff_embedding_model_label_for_pb();
+    if ($modelL === '') {
+        return;
+    }
+    $title = trim((string)($row['title'] ?? ''));
+    $caption = formatforge_antfly_content_semantic_text($title, $prompt, trim($title . "\n" . $prompt));
+    $type = strtolower(trim((string)($row['type'] ?? '')));
+    $baseKind = (in_array($type, ['video', 'reel'], true)) ? 'video' : 'image';
+    $vec = ff_compute_embedding_for_pb_storage($caption, ($publicMediaUrl !== null && trim($publicMediaUrl) !== '') ? trim($publicMediaUrl) : null, $baseKind);
+    ff_pb_patch_record_embedding('output_media', $itemId, $vec, $modelL, $authHeader);
 }
 
 function cosine_distance(array $a, array $b): float {
@@ -6724,6 +6852,9 @@ function ff_alignment_media_kind_from_content_row(?array $row): string {
     if (in_array($t, ['video', 'reel'], true)) {
         return 'video';
     }
+    if (in_array($t, ['audio', 'podcast', 'voice'], true)) {
+        return 'audio';
+    }
 
     return 'image';
 }
@@ -6765,6 +6896,9 @@ function ff_alignment_embed_input_with_provider(array $in, string $provider): ?a
     $text = isset($in['input_text']) ? trim((string)$in['input_text']) : '';
     $url = isset($in['input_media_url']) ? trim((string)$in['input_media_url']) : '';
     $inKind = (($in['input_media_kind'] ?? 'image') === 'video') ? 'video' : 'image';
+    if ($url !== '' && trim((string)($GLOBALS['CONFIG']['gemini_api_key'] ?? '')) !== '' && strtolower($provider) === 'gemini') {
+        $inKind = ff_gemini_refine_media_kind_from_url($url, $inKind);
+    }
 
     if ($provider === 'gemini') {
         if (trim((string)($GLOBALS['CONFIG']['gemini_api_key'] ?? '')) === '') {
@@ -6822,14 +6956,27 @@ function ff_alignment_output_embedding_for_row_provider(array $genRow, string $p
             if ($outMediaKind === 'image' && ff_alignment_guess_video_url_from_string($url)) {
                 $outMediaKind = 'video';
             }
+            if (ff_alignment_media_kind_from_content_row($genRow) === 'audio') {
+                $outMediaKind = 'audio';
+            }
+            $outMediaKind = ff_gemini_refine_media_kind_from_url($url, $outMediaKind);
             $vec = ff_gemini_alignment_multimodal($text, $url, $outMediaKind);
             if ($vec !== null) {
+                $mode = 'gemini_multimodal_image';
+                if ($outMediaKind === 'video') {
+                    $mode = 'gemini_multimodal_video';
+                } elseif ($outMediaKind === 'audio') {
+                    $mode = 'gemini_multimodal_audio';
+                } elseif ($outMediaKind === 'document') {
+                    $mode = 'gemini_multimodal_pdf';
+                }
+
                 return [
-                    'mode' => $outMediaKind === 'video' ? 'gemini_multimodal_video' : 'gemini_multimodal_image',
+                    'mode' => $mode,
                     'vec' => $vec,
                 ];
             }
-            $altKind = $outMediaKind === 'video' ? 'image' : 'video';
+            $altKind = $outMediaKind === 'video' ? 'image' : ($outMediaKind === 'audio' || $outMediaKind === 'document' ? 'image' : 'video');
             $vec = ff_gemini_alignment_multimodal($text, $url, $altKind);
             if ($vec !== null) {
                 return ['mode' => 'gemini_multimodal_' . $altKind . '_fallback', 'vec' => $vec];
@@ -7583,11 +7730,22 @@ function ff_measure_generation_input_alignment(string $itemId, string $authHeade
         ? ff_gemini_embed_model_id()
         : (trim((string)($cfg['embed_model'] ?? '')) ?: 'google/gemini-embedding-001');
     $inputProbeStr = 'text_only';
-    if (trim((string)($in['input_media_url'] ?? '')) !== '') {
-        $isVidIn = (($in['input_media_kind'] ?? 'image') === 'video');
+    $inMediaUrl = trim((string)($in['input_media_url'] ?? ''));
+    if ($inMediaUrl !== '') {
+        $baseIn = (($in['input_media_kind'] ?? 'image') === 'video') ? 'video' : 'image';
         if ($usedProvider === 'gemini') {
-            $inputProbeStr = $isVidIn ? 'text_plus_input_video_inline' : 'text_plus_input_image_inline';
+            $gk = ff_gemini_refine_media_kind_from_url($inMediaUrl, $baseIn);
+            if ($gk === 'video') {
+                $inputProbeStr = 'text_plus_input_video_inline';
+            } elseif ($gk === 'audio') {
+                $inputProbeStr = 'text_plus_input_audio_inline';
+            } elseif ($gk === 'document') {
+                $inputProbeStr = 'text_plus_input_pdf_inline';
+            } else {
+                $inputProbeStr = 'text_plus_input_image_inline';
+            }
         } else {
+            $isVidIn = $baseIn === 'video';
             $inputProbeStr = $isVidIn ? 'text_plus_input_video_url' : 'text_plus_input_image_url';
         }
     }
@@ -11900,6 +12058,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && $authHeader) {
             'metadata' => (object)[],
         ];
         $sv = pb_request('POST', '/api/collections/input_media/records', $payload, $authHeader);
+        if ($sv['code'] >= 200 && $sv['code'] < 300 && !empty($sv['body']['id']) && ff_pb_embedding_store_enabled()) {
+            $modelL = ff_embedding_model_label_for_pb();
+            if ($modelL !== '') {
+                $blob = trim(implode("\n", array_filter([$topic, $titleSeed, $inputUrl, $instruction, 'pipeline_id:' . $pipelineId], static fn ($s) => trim((string)$s) !== '')));
+                $vec = embed_text($blob !== '' ? $blob : $pipelineId);
+                ff_pb_patch_record_embedding('input_media', (string)$sv['body']['id'], $vec, $modelL, $authHeader);
+            }
+        }
         echo json_encode(['ok' => $sv['code'] >= 200 && $sv['code'] < 300, 'record' => $sv['body'] ?? null, 'error' => ($sv['body']['message'] ?? null)]);
         exit;
     }
@@ -12175,7 +12341,15 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && $authHeader) {
                     $body = $patch['body'];
                 }
             }
-            echo json_encode(['ok' => true, 'id' => $body['id'] ?? null]);
+            $newId = $body['id'] ?? null;
+            if ($newId && ff_pb_embedding_store_enabled()) {
+                $modelL = ff_embedding_model_label_for_pb();
+                if ($modelL !== '') {
+                    $vec = ff_compute_embedding_for_pb_storage($url, null, 'image');
+                    ff_pb_patch_record_embedding('input_media', (string)$newId, $vec, $modelL, $authHeader);
+                }
+            }
+            echo json_encode(['ok' => true, 'id' => $newId]);
         } else {
             echo json_encode(['ok' => false, 'error' => $rec['body']['message'] ?? 'Failed']);
         }
@@ -12319,6 +12493,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && $authHeader) {
                         $displayUrl = $garageUrl ?: '';
                     }
                     $caption = trim($displayTitle . "\n" . $url);
+                    ff_pb_store_output_media_embedding_after_media_ready($pbRowId, [
+                        'type' => $type,
+                        'title' => $displayTitle,
+                    ], $url, $displayUrl !== '' ? $displayUrl : null, $authHeader);
                     $semanticBlob = formatforge_antfly_content_semantic_text($displayTitle, $url, $caption);
                     if (formatforge_index_content_in_antfly($pbRowId, $semanticBlob, $type, 'pending', $displayUrl !== '' ? $displayUrl : null, $mime, $url, $displayTitle)) {
                         $antflyContentIndexOk++;
@@ -14834,17 +15012,20 @@ if ($agentOn && $antfly) {
                 },
 
                 applyPersistedScopeAccount() {
-                    const active = this.connectedAccounts();
-                    if (!active.length) {
+                    const connected = this.connectedAccounts();
+                    const all = this.accounts || [];
+                    const pool = connected.length > 0 ? connected : all;
+                    if (!pool.length) {
                         this.selectedScopeAccountId = '';
+                        this.linkAccountId = '';
                         return;
                     }
                     let pick = '';
                     try {
                         pick = String(localStorage.getItem(this.scopeStorageKey()) || '').trim();
                     } catch (e) {}
-                    if (!pick || !active.some(a => a.id === pick)) {
-                        pick = String(active[0].id || '').trim();
+                    if (!pick || !pool.some(a => a.id === pick)) {
+                        pick = String(pool[0].id || '').trim();
                     }
                     this.selectedScopeAccountId = pick;
                     this.linkAccountId = pick;
@@ -14939,18 +15120,32 @@ if ($agentOn && $antfly) {
 
                 async addLink() {
                     if (!this.linkUrl.trim()) return;
-                    if (!this.selectedScopeAccountId) {
-                        this.msg = 'Select an Instagram account in the top-right scope selector first.';
+                    let accountId = String(this.selectedScopeAccountId || '').trim();
+                    const connected = this.connectedAccounts();
+                    const all = this.accounts || [];
+                    const pool = connected.length > 0 ? connected : all;
+                    if (!accountId && pool.length > 0) {
+                        accountId = String(pool[0].id || '').trim();
+                        this.selectedScopeAccountId = accountId;
+                        this.linkAccountId = accountId;
+                        try {
+                            if (accountId) localStorage.setItem(this.scopeStorageKey(), accountId);
+                        } catch (e) {}
+                    }
+                    if (!accountId && pool.length > 0) {
+                        this.msg = 'Select an account in the top-right scope selector first.';
                         this.msgError = true;
                         return;
                     }
                     this.addingLink = true;
                     this.msg = '';
-                    this.pushDebug('add_link_click', { url: this.linkUrl.trim().slice(0, 500), account_id: this.selectedScopeAccountId || null });
+                    this.pushDebug('add_link_click', { url: this.linkUrl.trim().slice(0, 500), account_id: accountId || null });
                     const fd = new FormData();
                     fd.append('action', 'add_link');
                     fd.append('url', this.linkUrl.trim());
-                    fd.append('account_id', this.selectedScopeAccountId);
+                    if (accountId) {
+                        fd.append('account_id', accountId);
+                    }
                     try {
                         const d = await this.postToApp(fd);
                         if (d.ok) {
