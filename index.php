@@ -2674,7 +2674,7 @@ $CONFIG = [
     'pocketbase_admin_url' => rtrim($pbPublicUrl, '/') . '/_/',
     'site_url'         => $siteUrl,
     'site_name'        => getenv('SITE_NAME') ?: 'FormatForge',
-    'app_version'      => getenv('APP_VERSION') ?: 'v1.1.159',
+    'app_version'      => getenv('APP_VERSION') ?: 'v1.1.160',
     'users_collection' => 'users',
     'garage_endpoint'  => getenv('GARAGE_ENDPOINT') ?: 'http://127.0.0.1:3900',
     'garage_key'       => getenv('GARAGE_ACCESS_KEY') ?: '',
@@ -12320,7 +12320,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && $authHeader) {
                 if (!($repair['ok'] ?? false)) {
                     echo json_encode([
                         'ok' => false,
-                        'error' => 'input_media collection is missing required fields (schema never migrated). Configure ADMIN_EMAIL/ADMIN_PASSWORD for PocketBase, then POST action=repair_source_links_schema or run: php index.php repair-source-links-schema',
+                        'error' => 'input_media collection is missing required fields (schema incomplete). On the host: pull latest pb_migrations, then as pb_data owner run ./formatforge-pb migrate up --dir=./pb_data --migrationsDir=./pb_migrations (applies 1774500000_core_four_schema_repair.js), then restart formatforge-pb.',
                         'repair_error' => $repair['error'] ?? null,
                     ]);
                     exit;
