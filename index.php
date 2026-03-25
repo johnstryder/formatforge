@@ -2674,7 +2674,7 @@ $CONFIG = [
     'pocketbase_admin_url' => rtrim($pbPublicUrl, '/') . '/_/',
     'site_url'         => $siteUrl,
     'site_name'        => getenv('SITE_NAME') ?: 'FormatForge',
-    'app_version'      => getenv('APP_VERSION') ?: 'v1.1.154',
+    'app_version'      => getenv('APP_VERSION') ?: 'v1.1.156',
     'users_collection' => 'users',
     'garage_endpoint'  => getenv('GARAGE_ENDPOINT') ?: 'http://127.0.0.1:3900',
     'garage_key'       => getenv('GARAGE_ACCESS_KEY') ?: '',
@@ -11995,7 +11995,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && $authHeader) {
                 $body = $decoded;
             }
         }
-        $res = pb_request($method, $path, $body, $authHeader);
+        $res = pb_request($method, $path, $body, pb_normalize_bearer_token($authHeader));
         $code = (int) ($res['code'] ?? 0);
         if ($method === 'GET' && $coll === 'output_media' && $code >= 200 && $code < 300 && !empty($res['body']) && is_array($res['body'])) {
             $res['body'] = ff_pb_enrich_content_items_response($res['body']);
@@ -14865,8 +14865,16 @@ if ($agentOn && $antfly) {
                 pocketBaseErrorHint(r, d) {
                     const code = r.status || 0;
                     const msg = (d && d.message) ? String(d.message) : '';
-                    if (code === 401 || code === 403) {
-                        return (msg || 'Not authorized') + ' Try logging out and logging back in to refresh your PocketBase session.';
+                    const base = msg || (code === 403 ? 'Access denied' : code === 401 ? 'Not authorized' : '');
+                    // PocketBase uses 403 + "Only superusers…" when API rules block the action (e.g. listRule null), not a stale browser session.
+                    if (/only superusers? can|superusers? only|must be an admin/i.test(msg)) {
+                        return (base ? base + ' ' : '') + 'This comes from PocketBase API rules on that collection (dashboard users are not allowed to list or view those records). After updating FormatForge, restart PocketBase once so pb_migrations run (including 1774400000_core_four_dashboard_api_rules.js). Or in PocketBase Admin set List/View rules to @request.auth.id != "" for output_media, input_media, and social_accounts. Logging out and back in will not fix this message.';
+                    }
+                    if (code === 401) {
+                        return (base || 'Not authorized') + ' Try logging out and logging back in to refresh your PocketBase session.';
+                    }
+                    if (code === 403) {
+                        return (base || 'Access denied') + ' Check PocketBase collection rules for your role. If you recently changed rules or users, try logging out and back in.';
                     }
                     if (code === 0) return 'Could not reach PocketBase.';
                     return msg || ('HTTP ' + code);
@@ -14976,7 +14984,7 @@ if ($agentOn && $antfly) {
                         if (r.status !== 200) {
                             this.content = [];
                             this._syncGarageDisplayWarnings();
-                            this.msg = 'Content: ' + this.pocketBaseErrorHint(r, d);
+                            this.msg = 'Could not load content. ' + this.pocketBaseErrorHint(r, d);
                             this.msgError = true;
                             return;
                         }
