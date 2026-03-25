@@ -2674,7 +2674,7 @@ $CONFIG = [
     'pocketbase_admin_url' => rtrim($pbPublicUrl, '/') . '/_/',
     'site_url'         => $siteUrl,
     'site_name'        => getenv('SITE_NAME') ?: 'FormatForge',
-    'app_version'      => getenv('APP_VERSION') ?: 'v1.1.160',
+    'app_version'      => getenv('APP_VERSION') ?: 'v1.1.162',
     'users_collection' => 'users',
     'garage_endpoint'  => getenv('GARAGE_ENDPOINT') ?: 'http://127.0.0.1:3900',
     'garage_key'       => getenv('GARAGE_ACCESS_KEY') ?: '',
@@ -2706,7 +2706,10 @@ $CONFIG = [
     'gemini_embed_media_max_bytes' => max(1048576, (int)(getenv('GEMINI_EMBED_MEDIA_MAX_BYTES') ?: '26214400')),
     'cursor_pipeline_trigger_dir' => $cursorPipelineTriggerDir,
     'novel_threshold'  => (float)(getenv('NOVEL_DISTANCE_THRESHOLD') ?: '0.35'),  // cosine distance above = novel
-    /** When true and OPENROUTER_API_KEY is set, measure OpenRouter embedding cosine(input_ref, output) on generated rows; compare to previous same-pipeline generation. Set GENERATION_ALIGNMENT_ENABLED=0 to disable. */
+    /**
+     * When enabled, measures embedding distance between backing reference and generated output (Gemini preferred; else OpenRouter). Set GENERATION_ALIGNMENT_ENABLED=0 to disable.
+     * Product framing: the merged **prompt** fed to the generation model is the main **independent variable**; human approve/reject (and metrics) plus embeddings are used to find **clusters** (“pockets”) of high-performing outputs.
+     */
     'generation_alignment_enabled' => strtolower(trim((string)(getenv('GENERATION_ALIGNMENT_ENABLED') ?: '1'))) !== '0',
     'target_posts_per_day' => max(0, (int)(getenv('TARGET_POSTS_PER_DAY') ?: '60')),  // Cursor prompt + operating_context (0 = omit cadence hints)
     'pipeline_reject_streak' => max(0, (int)(getenv('PIPELINE_REJECT_STREAK') ?: '1')),  // 0 = off; N = after N consecutive rejects for same pipeline_id
@@ -6239,6 +6242,7 @@ function antfly_any_pipeline_within_semantic_distance(string $textBlob, float $m
 
 /**
  * Ranked pipeline templates vs a probe (text ± backing image) for agent iteration toward/away from the “mold”.
+ * Same idea as generation alignment: you mainly change the **prompt** going to the model; embeddings + human feedback help map **high-performing pockets** in content space.
  *
  * @return array<string,mixed>|null
  */
@@ -6293,8 +6297,8 @@ function ff_antfly_mold_fit_alignment_report(string $textBlob, ?string $primaryI
         'ok' => true,
         'query_mode' => $queryMode,
         'matches' => $rows,
-        'interpretation' => 'Antfly compares this probe to each synced pipeline row in the **same embedding space** as fetched `content` (multimodal template + google/gemini-embedding-001 via OpenRouter when configured). **Stronger match / lower distance** (see `semantic_score` / `sort` as returned by Antfly) means the pipeline “mold” is closer to this probe. Iterate `prompt_template` + `pipeline_architecture.json` + Go so the next run moves embeddings where you want, then `formatforge_sync_pipeline_refs_to_antfly` (or wait for automatic sync) updates the index.',
-        'agent_loop_hint' => 'Try concrete variants (layout density, color temperature, motion vs static, caption structure) and re-measure; reject feedback + this report together show whether you are converging on the intended cluster.',
+        'interpretation' => 'Antfly compares this probe to each synced pipeline row in the **same embedding space** as fetched `content` (multimodal template + google/gemini-embedding-001 via OpenRouter when configured). **Stronger match / lower distance** (see `semantic_score` / `sort` as returned by Antfly) means the pipeline “mold” is closer to this probe. The **independent variable** you control in production is mainly the **prompt** (`prompt_template` + merged context to the model); use this embedding geometry together with **human approve/reject** (and metrics) to find **clusters** of high-performing “pockets.” Iterate `prompt_template` + `pipeline_architecture.json` + Go so the next run moves where you want, then `formatforge_sync_pipeline_refs_to_antfly` (or wait for automatic sync) updates the index.',
+        'agent_loop_hint' => 'Try concrete prompt variants (layout density, color temperature, motion vs static, caption structure) and re-measure; curator feedback plus this report show whether you are converging on a high-performing cluster.',
     ];
 }
 
@@ -7760,7 +7764,7 @@ function ff_measure_generation_input_alignment(string $itemId, string $authHeade
         'output_probe' => $outPack['mode'],
         'previous_same_pipeline_cosine_distance' => $prev,
         'improving_vs_previous_generation' => $improving,
-        'note' => 'cosine_distance is 1 minus cosine similarity of embedding vectors from a single provider for both sides (lower = closer to input reference). Gemini: Google AI embedContent with inline_data (image/video/audio bytes) per GEMINI_EMBED_MODEL (default gemini-embedding-2-preview). OpenRouter: image_url/video_url multimodal. improving_vs_previous_generation is only meaningful vs prior rows that used the same embedding_provider/model space.',
+        'note' => 'cosine_distance is 1 minus cosine similarity of embedding vectors from a single provider for both sides (lower = closer to input reference). Gemini: Google AI embedContent with inline_data (image/video/audio bytes) per GEMINI_EMBED_MODEL (default gemini-embedding-2-preview). OpenRouter: image_url/video_url multimodal. improving_vs_previous_generation is only meaningful vs prior rows that used the same embedding_provider/model space. Interpret alongside prompt changes (the usual independent variable) and human feedback to locate clusters of strong outputs.',
     ];
     $meta['input_alignment'] = $block;
     pb_request('PATCH', '/api/collections/output_media/records/' . rawurlencode($itemId), ['metadata' => $meta], $authHeader);
@@ -7980,7 +7984,8 @@ function ff_cursor_agent_operating_context(?string $authHeader): array {
         'novel_distance_threshold' => (float) ($cfg['novel_threshold'] ?? 0.35),
         'novelty_meaning' => $noveltyMeaning,
         'metrics_note' => 'Run `php index.php sync-instagram-insights` (cron) or POST action=sync_instagram_insights after publish. Requires Instagram insights permissions on the connected token; metrics can lag up to ~48h per Meta.',
-        'generation_alignment_note' => 'Pipeline-generated `content_items` may include `metadata.input_alignment`: cosine_distance between backing reference and output using one provider for both vectors — **Gemini** (`GEMINI_API_KEY`, `GEMINI_EMBED_MODEL` default gemini-embedding-2-preview) via Google AI `embedContent` + inline_data bytes, or **OpenRouter** (`OPENROUTER_API_KEY` / `EMBED_MODEL`) via image_url/video_url. Lower is closer. improving_vs_previous_generation compares to the prior measured row for the same pipeline_id (and slot index when set). Cron: `php index.php sweep-generation-alignment` or POST action=sweep_generation_alignment.',
+        'prompt_iteration_framing' => 'Treat the **prompt text** that is actually merged and sent to the generation model (`prompt_template` plus any merged Curate/backing context) as the primary **independent variable** you change on purpose. **Human feedback** (approve / reject; optional Instagram metrics after publish) and **embeddings** (input/output alignment in one vector space; Antfly semantic distance for fetches vs pipeline templates) are observables that help reveal **clusters** or pockets of content that perform well—iterate prompts to move generation into those regions.',
+        'generation_alignment_note' => 'Pipeline-generated rows may include `metadata.input_alignment`: cosine_distance between backing reference and output using one provider for both vectors — **Gemini** (`GEMINI_API_KEY`, `GEMINI_EMBED_MODEL` default gemini-embedding-2-preview) via Google AI `embedContent` + inline_data bytes, or **OpenRouter** (`OPENROUTER_API_KEY` / `EMBED_MODEL`) via image_url/video_url. Lower is closer. improving_vs_previous_generation compares to the prior measured row for the same pipeline_id (and slot index when set). Cron: `php index.php sweep-generation-alignment` or POST action=sweep_generation_alignment.',
     ];
     if ($target > 0) {
         $out['target_posts_per_day'] = $target;

@@ -16,4 +16,13 @@ go-highway-src/
 storage/
 # Pipeline Cursor agent: downloaded copies of backing/generated media (recreated each trigger)
 pipelines/**/agent_media/
+# Go pipeline binary (build with `go build -o pipeline-generate .` in each pipeline dir)
+pipelines/**/pipeline-generate
+
+# Cursor pipeline runtime (PHP recreates dirs on demand; only README.md files are tracked)
+.cursor-pipeline/*
+!.cursor-pipeline/README.md
+!.cursor-pipeline/triggers/
+.cursor-pipeline/triggers/*
+!.cursor-pipeline/triggers/README.md
 =*
