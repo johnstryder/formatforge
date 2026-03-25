@@ -4,17 +4,16 @@ configuration.php
 vendor
 composer.lock
 .env
-.env.antfly
 .vscode
 *-pb
 pb_data/
 .pb-port
 .app-port
-.antfly-port
 
 # Local/system symlinks, vendored trees, runtime data
 formatforgeplus
-antfly-src/
 go-highway-src/
 storage/
+# Pipeline Cursor agent: downloaded copies of backing/generated media (recreated each trigger)
+pipelines/**/agent_media/
 =*

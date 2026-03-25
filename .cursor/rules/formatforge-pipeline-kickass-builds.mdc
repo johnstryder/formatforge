@@ -1,0 +1,33 @@
+---
+description: Build standards for high-quality, input-driven pipelines
+globs: pipelines/pipeline-*/**
+alwaysApply: false
+---
+
+# Kickass Pipeline Build Standard
+
+## Pipeline design rules
+
+- Build around the backing input type first (carousel vs single video), then pick tools.
+- Do not default to "Replicate/fal only"; treat video APIs as one component, not the whole system.
+- Keep ordering deterministic (`slide 1..N`) and record source-to-output linkage in metadata.
+- Capture the source **essence** (core message + vibe), not a direct copy of source pixels.
+
+## Implementation rules
+
+- Prefer stepwise generation with explicit intermediate artifacts.
+- Add guardrails for retries, rate limits, and partial failures.
+- Keep run output inspectable (clear logs, per-slide status, final summary).
+
+## Validation rules
+
+- Validation must prove the intended modality, not only that "a video exists."
+- If using composed non-video-api flow, document the exact verification command in the pipeline `README.md`.
+- If a run misses cardinality or fidelity requirements, fail fast and trigger edit iteration.
+- Validation must reject near-duplicate outputs (same backing asset or trivial clone) even if technically valid media is produced.
+
+## Prompt quality rules
+
+- Prompts should encode subject, composition, and pacing constraints from backing content.
+- Ban generic placeholders that can generate unrelated stock output.
+- Include concise rejection lessons so future runs improve, not drift.

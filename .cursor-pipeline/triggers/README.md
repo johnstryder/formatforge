@@ -12,3 +12,5 @@ When FormatForge detects **novel** fetched content or a **reject streak**, it:
 Configure **`CURSOR_AGENT_MODEL`**, **`CURSOR_AGENT_BIN`**. Auth: **`agent login`** as the php-fpm user; **`CURSOR_API_KEY`** in `.env` is optional. Logs: **`.cursor-pipeline/cursor-agent.log`**.
 
 **Manual:** `php index.php setup-pipeline [trigger_file]` — prepares dirs **without** auto-spawning the agent.
+
+Trigger JSON includes **`backing_source_link_id`** (novel fetch) or reject-side **`content_item_source_link_id`** / **`backing_source_link_id_on_pipeline`** so the generated task tells the agent to PATCH **`pipelines.metadata.backing_source_link_id`** when creating or fixing a pipeline.

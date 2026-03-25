@@ -1,0 +1,24 @@
+---
+description: After editing PHP or nginx, deploy to the live host (reload services) without being asked
+alwaysApply: true
+---
+
+# Deploy after PHP / nginx changes
+
+Whenever you **change** **`index.php`**, **`config.php`**, or **any file under `nginx/`** (snippets, vhost, install script inputs), treat the task as **unfinished** until production is updated — the human should not need to remind you.
+
+## What to run (on the Linux host)
+
+1. **Syntax / config check**
+   - PHP: `php -l /home/jhs/formatforge/index.php` (or the path you edited).
+   - nginx: `sudo nginx -t` before reload.
+
+2. **Live tree** — this repo is usually served via **`/var/www/formatforge`** (symlink to the clone). If edits were only in the workspace and the live path differs, **sync or ensure the same files** are what nginx/PHP read (see **`DEPLOYMENT.md`** / **`scripts/install-formatforge-nginx-site.sh`**).
+
+3. **Apply**
+   - After **nginx** changes: `sudo nginx -t && sudo systemctl reload nginx`
+   - After **PHP** changes: reload FPM so opcache picks up changes, e.g. `sudo systemctl reload php8.3-fpm` (use the unit that matches **`scripts/align-php-fpm-socket.sh`** / **`ls /run/php/*.sock`** on that host — `php8.2-fpm` / `php8.4-fpm` if applicable).
+
+4. **Do not** start ad-hoc dev servers or bind **new** public ports; **reload** existing nginx/PHP-FPM only.
+
+If **`sudo`** or service names are unavailable in the agent environment, run what you can and state clearly what still needs running on the server.

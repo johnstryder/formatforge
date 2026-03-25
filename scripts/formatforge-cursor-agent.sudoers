@@ -1,0 +1,16 @@
+# FormatForge: allow PHP-FPM to run the pipeline Cursor CLI worker as the deploy user.
+# Expected behavior: agent changes only pipelines/<subdir>/ (Go, etc.), not index.php.
+#
+# 1. Install wrapper: sudo ./scripts/install-formatforge-cursor-agent-sudo.sh
+# 2. Install this file:
+#    sudo cp scripts/formatforge-cursor-agent.sudoers /etc/sudoers.d/formatforge-cursor-agent
+#    sudo chmod 440 /etc/sudoers.d/formatforge-cursor-agent
+#    sudo visudo -cf /etc/sudoers.d/formatforge-cursor-agent
+#
+# Replace www-data if your php-fpm pool runs as another user.
+# Replace jhs with your deploy UNIX user (must own the repo or be able to write it).
+
+Defaults:www-data !requiretty
+
+# No args listed after the path → sudo allows any single invocation with arguments (standard sudoers).
+www-data ALL=(jhs) NOPASSWD: /usr/local/sbin/formatforge-cursor-agent-run

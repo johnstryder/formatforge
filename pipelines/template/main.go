@@ -1,372 +1,587 @@
-// Content pipeline binary — run on cron to generate content for FormatForge.
+// pipeline-generate — FormatForge pipeline worker (modal + cron).
 //
-// Config via env:
-//   REPLICATE_API_TOKEN    - Replicate API token (use with VIDEO_PROVIDER=replicate)
-//   FAL_KEY                - fal.ai API key (use with VIDEO_PROVIDER=fal)
-//   VIDEO_PROVIDER         - replicate|fal (default: replicate if REPLICATE_API_TOKEN set, else fal if FAL_KEY set)
-//   FAL_VIDEO_MODEL        - fal.ai model (default: fal-ai/kling-video/v2.5-turbo/pro/text-to-video)
-//   POCKETBASE_URL         - PocketBase API URL (e.g. http://localhost:8090)
-//   FORMATFORGE_EMAIL      - Login email
-//   FORMATFORGE_PASSWORD   - Login password
-//   PROMPT                 - Video prompt (or use PROMPT_TEMPLATE with {{.SourceURL}})
+// When PIPELINE_PB_ID or FORMATFORGE_RUN_PIPELINE_ID is set (FormatForge spawns this):
+//   1) Auth to PocketBase (users collection).
+//   2) List content_items with status=generating and metadata.pipeline_id matching.
+//   3) For each row: this **template** uses ffmpeg for a minimal path; real pipelines usually call **Replicate/fal**
+//      (models chosen per README — replicate.com run counts) then optional mux/post in ffmpeg. Garage S3 PUT,
+//      multipart PATCH with media_file + pending.
 //
-// Usage:
-//   ./pipeline-generate
-//   # Cron: 0 */6 * * * /path/to/pipeline-generate
+// Env (pipeline .env + FormatForge merge): POCKETBASE_URL, FORMATFORGE_EMAIL, FORMATFORGE_PASSWORD,
+// OUTPUT_MODE (image|video|reel|carousel), GARAGE_* optional, FONT_PATH optional, FFMPEG_PATH optional.
 package main
 
 import (
 	"bytes"
+	crand "crypto/rand"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
-	"flag"
 	"fmt"
 	"io"
+	"mime/multipart"
 	"net/http"
+	"net/url"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 )
 
-var (
-	replicateToken = os.Getenv("REPLICATE_API_TOKEN")
-	falKey         = os.Getenv("FAL_KEY")
-	videoProvider  = os.Getenv("VIDEO_PROVIDER")
-	falVideoModel  = os.Getenv("FAL_VIDEO_MODEL")
-	pbURL          = strings.TrimSuffix(os.Getenv("POCKETBASE_URL"), "/")
-	email          = os.Getenv("FORMATFORGE_EMAIL")
-	password       = os.Getenv("FORMATFORGE_PASSWORD")
-	prompt         = os.Getenv("PROMPT")
-	promptTemplate = os.Getenv("PROMPT_TEMPLATE") // e.g. "A cinematic shot inspired by {{.SourceURL}}"
-)
-
-const (
-	replicateModel   = "minimax/video-01:5aa835260ff7f40f4069c41185f72036accf99e29957bb4a3b3a911f3b6c1912"
-	defaultFalModel  = "fal-ai/kling-video/v2.5-turbo/pro/text-to-video"
-)
-
-func main() {
-	flag.Parse()
-	provider := videoProvider
-	if provider == "" {
-		if replicateToken != "" {
-			provider = "replicate"
-		} else if falKey != "" {
-			provider = "fal"
-		} else {
-			provider = "replicate"
-		}
+func getenv(k, def string) string {
+	v := strings.TrimSpace(os.Getenv(k))
+	if v == "" {
+		return def
 	}
-	if provider == "replicate" && replicateToken == "" {
-		fmt.Fprintln(os.Stderr, "REPLICATE_API_TOKEN required when VIDEO_PROVIDER=replicate")
-		os.Exit(1)
-	}
-	if provider == "fal" && falKey == "" {
-		fmt.Fprintln(os.Stderr, "FAL_KEY required when VIDEO_PROVIDER=fal")
-		os.Exit(1)
-	}
-	if replicateToken == "" && falKey == "" {
-		fmt.Fprintln(os.Stderr, "Set REPLICATE_API_TOKEN or FAL_KEY (and VIDEO_PROVIDER if both)")
-		os.Exit(1)
-	}
-	if pbURL == "" || email == "" || password == "" {
-		fmt.Fprintln(os.Stderr, "POCKETBASE_URL, FORMATFORGE_EMAIL, FORMATFORGE_PASSWORD required")
-		os.Exit(1)
-	}
-	if prompt == "" && promptTemplate == "" {
-		prompt = "A cinematic shot of a person walking through a modern city at sunset"
-	}
-
-	token, err := login()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Login failed: %v\n", err)
-		os.Exit(1)
-	}
-
-	links, err := fetchSourceLinks(token)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Fetch links failed: %v\n", err)
-		os.Exit(1)
-	}
-	if len(links) == 0 {
-		fmt.Println("No pending source links")
-		return
-	}
-
-	for _, link := range links {
-		p := prompt
-		if promptTemplate != "" && link.URL != "" {
-			p = strings.ReplaceAll(promptTemplate, "{{.SourceURL}}", link.URL)
-			p = strings.ReplaceAll(p, "{{.SourceTitle}}", link.Title)
-		}
-		if err := generateAndSubmit(token, link.ID, p); err != nil {
-			fmt.Fprintf(os.Stderr, "Generate for %s failed: %v\n", link.URL, err)
-			continue
-		}
-		fmt.Printf("Generated content for %s\n", link.URL)
-	}
+	return v
 }
 
-type sourceLink struct {
-	ID     string `json:"id"`
-	URL    string `json:"url"`
-	Title  string `json:"title"`
-	Status string `json:"status"`
+func pipelineID() string {
+	if v := strings.TrimSpace(os.Getenv("PIPELINE_PB_ID")); v != "" {
+		return v
+	}
+	return strings.TrimSpace(os.Getenv("FORMATFORGE_RUN_PIPELINE_ID"))
 }
 
-func login() (string, error) {
+func pbBase() string {
+	return strings.TrimSuffix(getenv("POCKETBASE_URL", ""), "/")
+}
+
+func login(email, password string) (string, error) {
 	body, _ := json.Marshal(map[string]string{
 		"identity": email,
 		"password": password,
 	})
-	req, _ := http.NewRequest("POST", pbURL+"/api/collections/users/auth-with-password", bytes.NewReader(body))
+	req, err := http.NewRequest(http.MethodPost, pbBase()+"/api/collections/users/auth-with-password", bytes.NewReader(body))
+	if err != nil {
+		return "", err
+	}
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return "", err
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
-		b, _ := io.ReadAll(resp.Body)
+	b, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
 		return "", fmt.Errorf("auth %d: %s", resp.StatusCode, string(b))
 	}
 	var out struct {
 		Token string `json:"token"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+	if err := json.Unmarshal(b, &out); err != nil {
 		return "", err
+	}
+	if out.Token == "" {
+		return "", fmt.Errorf("auth: empty token")
 	}
 	return out.Token, nil
 }
 
-func fetchSourceLinks(token string) ([]sourceLink, error) {
-	req, _ := http.NewRequest("GET", pbURL+"/api/collections/source_links/records?filter=status=\"pending\"&perPage=5", nil)
+type contentItem struct {
+	ID             string         `json:"id"`
+	CollectionID   string         `json:"collectionId"`
+	Prompt         string         `json:"prompt"`
+	Type           string         `json:"type"`
+	Status         string         `json:"status"`
+	Title          string         `json:"title"`
+	MediaFile      string         `json:"media_file"`
+	Metadata       map[string]any `json:"metadata"`
+	GarageKey      string         `json:"garage_key"`
+	GarageURL      string         `json:"garage_url"`
+}
+
+func fetchGeneratingItems(token, wantPipeline string) ([]contentItem, error) {
+	// Avoid nested JSON filter quirks: pull recent generating rows and filter in-process.
+	q := url.Values{}
+	q.Set("perPage", "100")
+	q.Set("sort", "-@rowid")
+	q.Set("filter", `status="generating"`)
+	req, err := http.NewRequest(http.MethodGet, pbBase()+"/api/collections/content_items/records?"+q.Encode(), nil)
+	if err != nil {
+		return nil, err
+	}
 	req.Header.Set("Authorization", token)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
-		return nil, fmt.Errorf("fetch links %d", resp.StatusCode)
+	b, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("list content_items %d: %s", resp.StatusCode, string(b))
 	}
 	var out struct {
-		Items []sourceLink `json:"items"`
+		Items []contentItem `json:"items"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+	if err := json.Unmarshal(b, &out); err != nil {
 		return nil, err
 	}
-	return out.Items, nil
-}
-
-func generateAndSubmit(token, sourceID, promptText string) error {
-	provider := videoProvider
-	if provider == "" {
-		if replicateToken != "" {
-			provider = "replicate"
-		} else {
-			provider = "fal"
-		}
-	}
-	var videoURL string
-	var err error
-	if provider == "fal" {
-		videoURL, err = generateViaFal(promptText)
-	} else {
-		videoURL, err = generateViaReplicate(promptText)
-	}
-	if err != nil {
-		return err
-	}
-	return submitToFormatForge(token, sourceID, promptText, videoURL)
-}
-
-func generateViaFal(promptText string) (string, error) {
-	model := falVideoModel
-	if model == "" {
-		model = defaultFalModel
-	}
-	input := map[string]any{"prompt": promptText, "aspect_ratio": "9:16"}
-	body, _ := json.Marshal(input)
-	req, _ := http.NewRequest("POST", "https://queue.fal.run/"+model, bytes.NewReader(body))
-	req.Header.Set("Authorization", "Key "+falKey)
-	req.Header.Set("Content-Type", "application/json")
-	client := &http.Client{Timeout: 120 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-	var out struct {
-		Video struct {
-			URL string `json:"url"`
-		} `json:"video"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return "", err
-	}
-	if out.Video.URL == "" {
-		return "", fmt.Errorf("fal.ai: no video URL in response")
-	}
-	return out.Video.URL, nil
-}
-
-func generateViaReplicate(promptText string) (string, error) {
-	predBody, _ := json.Marshal(map[string]any{
-		"version": replicateModel,
-		"input":   map[string]string{"prompt": promptText},
-	})
-	req, _ := http.NewRequest("POST", "https://api.replicate.com/v1/predictions", bytes.NewReader(predBody))
-	req.Header.Set("Authorization", "Bearer "+replicateToken)
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-	var pred struct {
-		ID     string `json:"id"`
-		Status string `json:"status"`
-		URLs   struct {
-			Get string `json:"get"`
-		} `json:"urls"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&pred); err != nil {
-		return "", err
-	}
-	if pred.ID == "" {
-		return "", fmt.Errorf("no prediction id")
-	}
-
-	for i := 0; i < 90; i++ {
-		time.Sleep(2 * time.Second)
-		getReq, _ := http.NewRequest("GET", pred.URLs.Get, nil)
-		getReq.Header.Set("Authorization", "Bearer "+replicateToken)
-		getResp, err := http.DefaultClient.Do(getReq)
-		if err != nil {
+	var match []contentItem
+	for _, it := range out.Items {
+		meta := it.Metadata
+		if meta == nil {
 			continue
 		}
-		var p struct {
-			Status string `json:"status"`
-			Output any    `json:"output"`
-		}
-		_ = json.NewDecoder(getResp.Body).Decode(&p)
-		getResp.Body.Close()
-		if p.Status == "succeeded" {
-			videoURL := ""
-			switch v := p.Output.(type) {
-			case string:
-				videoURL = v
-			case []any:
-				if len(v) > 0 {
-					if s, ok := v[0].(string); ok {
-						videoURL = s
-					}
-				}
-			case map[string]any:
-				if u, ok := v["url"].(string); ok {
-					videoURL = u
-				}
-			}
-			if videoURL == "" {
-				return "", fmt.Errorf("no video URL in output")
-			}
-			return videoURL, nil
-		}
-		if p.Status == "failed" || p.Status == "canceled" {
-			return "", fmt.Errorf("replicate %s", p.Status)
+		pid, _ := meta["pipeline_id"].(string)
+		if strings.TrimSpace(pid) == wantPipeline {
+			match = append(match, it)
 		}
 	}
-	return "", fmt.Errorf("replicate timeout")
+	return match, nil
 }
 
-func submitToFormatForge(token, sourceID, promptText, videoURL string) error {
-	// Create content item
-	createBody, _ := json.Marshal(map[string]any{
-		"type":           "reel",
-		"prompt":         promptText,
-		"title":          truncate(promptText, 80),
-		"source_link_id": sourceID,
-		"status":         "generating",
-	})
-	req, _ := http.NewRequest("POST", pbURL+"/api/collections/content_items/records", bytes.NewReader(createBody))
-	req.Header.Set("Authorization", token)
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return err
+func parseHeadlineBody(prompt string) (headline, body string) {
+	lines := strings.Split(strings.ReplaceAll(prompt, "\r\n", "\n"), "\n")
+	var nonEmpty []string
+	for _, ln := range lines {
+		s := strings.TrimSpace(ln)
+		if s != "" && !strings.HasPrefix(s, "---") {
+			nonEmpty = append(nonEmpty, s)
+		}
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		b, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("create item %d: %s", resp.StatusCode, string(b))
+	if len(nonEmpty) == 0 {
+		return "FormatForge pipeline", "Original composition aligned to source intent."
 	}
-	var item struct {
-		ID string `json:"id"`
+	headline = nonEmpty[0]
+	if len(nonEmpty) > 1 {
+		body = strings.Join(nonEmpty[1:], "\n")
+	} else {
+		body = "Distilled layout + typography — not a copy of backing media."
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&item); err != nil {
-		return err
+	if len(headline) > 72 {
+		headline = headline[:72] + "…"
 	}
+	return headline, body
+}
 
-	// Download video and upload to Garage (FormatForge does this server-side; we'd need an API)
-	// For now, set garage_url to the Replicate URL so FormatForge can use it
-	// The PHP app normally fetches and uploads to Garage. We need an API endpoint.
-	// Simplest: POST to FormatForge's generate_content with the video URL already known
-	// Actually the PHP flow creates the item, then runs Replicate, then uploads to Garage.
-	// Our binary runs Replicate itself, so we need either:
-	// A) FormatForge API to accept "content with external video URL" (no Garage upload)
-	// B) Our binary to upload to Garage (needs S3 creds)
-	// C) Our binary to call FormatForge's generate_content but pass a pre-generated URL
-	//
-	// The PHP generate_content creates item with status=generating, runs Replicate, uploads to Garage, patches item.
-	// We could add an API: submit_generated_content(id, prompt, video_url) that skips Replicate and just patches.
-	// For the template, we'll add a simple endpoint or use a workaround.
-	//
-	// Simplest template: assume FormatForge has an endpoint we can POST to. If not, we document that
-	// the template needs FormatForge to expose one. Let me add a placeholder and document.
-	//
-	// Actually - re-read the PHP. The generate_content action:
-	// 1. Creates content_items record with status=generating
-	// 2. Calls replicate_run
-	// 3. Downloads video, uploads to Garage
-	// 4. Patches record with garage_key, garage_url, status=pending
-	//
-	// So we need either a new API or we do the Garage upload ourselves. Garage needs AWS-style auth.
-	// The template would need GARAGE_* env vars. Let me add that to the template - it can upload to Garage
-	// and then PATCH the FormatForge record. We need the FormatForge API to allow patching with garage_url.
-	// Looking at the PHP - it uses pb_request to PATCH. So we need to call PocketBase directly, or
-	// FormatForge needs an API that accepts our submission.
-	//
-	// Cleanest: add a FormatForge API action "submit_generated" that accepts (item_id, video_url) and
-	// does the Garage upload + PATCH. Then our binary just needs to create the item and call that.
-	// But creating the item is done by the PHP with status=generating. We could:
-	// 1. Binary creates item via PocketBase API (we have token)
-	// 2. Binary runs Replicate
-	// 3. Binary needs to upload to Garage - requires GARAGE_* in template
-	// 4. Binary PATCHes item with garage_url
-	//
-	// The template would need Garage credentials. Let me add that. We'll need a minimal S3 upload in Go.
-	patchBody, _ := json.Marshal(map[string]any{
-		"status":     "pending",
-		"garage_url": videoURL, // FormatForge may expect Garage; for template we pass Replicate URL as fallback
-	})
-	patchReq, _ := http.NewRequest("PATCH", pbURL+"/api/collections/content_items/records/"+item.ID, bytes.NewReader(patchBody))
-	patchReq.Header.Set("Authorization", token)
-	patchReq.Header.Set("Content-Type", "application/json")
-	patchResp, err := http.DefaultClient.Do(patchReq)
-	if err != nil {
+func fontPath() string {
+	if p := getenv("FONT_PATH", ""); p != "" {
+		return p
+	}
+	candidates := []string{
+		"/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+		"/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+		"/usr/share/fonts/TTF/DejaVuSans.ttf",
+	}
+	for _, c := range candidates {
+		if st, err := os.Stat(c); err == nil && !st.IsDir() {
+			return c
+		}
+	}
+	return ""
+}
+
+func ffmpegBin() string {
+	return getenv("FFMPEG_PATH", "ffmpeg")
+}
+
+func writeTextFile(path, content string) error {
+	return os.WriteFile(path, []byte(content), 0o600)
+}
+
+func renderImage(headline, body, outPath string) error {
+	dir := filepath.Dir(outPath)
+	headF := filepath.Join(dir, "ff_head_"+randHex(6)+".txt")
+	bodyF := filepath.Join(dir, "ff_body_"+randHex(6)+".txt")
+	defer os.Remove(headF)
+	defer os.Remove(bodyF)
+	if err := writeTextFile(headF, headline); err != nil {
 		return err
 	}
-	defer patchResp.Body.Close()
-	if patchResp.StatusCode < 200 || patchResp.StatusCode >= 300 {
-		b, _ := io.ReadAll(patchResp.Body)
-		return fmt.Errorf("patch item %d: %s", patchResp.StatusCode, string(b))
+	if err := writeTextFile(bodyF, body); err != nil {
+		return err
+	}
+	fp := fontPath()
+	if fp == "" {
+		return fmt.Errorf("no font found; set FONT_PATH to a .ttf (e.g. DejaVuSans.ttf)")
+	}
+	// 1080×1350 portrait card; dark plate + two drawtext blocks (no source pixels).
+	vf := fmt.Sprintf(
+		"drawtext=fontfile=%s:textfile=%s:fontsize=52:fontcolor=white:x=(w-text_w)/2:y=120:line_spacing=16,"+
+			"drawtext=fontfile=%s:textfile=%s:fontsize=30:fontcolor=0xcccccc:x=80:y=280:line_spacing=14:box=1:boxcolor=black@0.35:boxborderw=24",
+		escapePathForFilter(fp), escapePathForFilter(headF),
+		escapePathForFilter(fp), escapePathForFilter(bodyF),
+	)
+	args := []string{
+		"-y", "-f", "lavfi", "-i", "color=c=0x16213e:s=1080x1350:d=1",
+		"-vf", vf,
+		"-frames:v", "1", "-q:v", "2",
+		outPath,
+	}
+	cmd := exec.Command(ffmpegBin(), args...)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("ffmpeg image: %w: %s", err, stderr.String())
 	}
 	return nil
 }
 
-func truncate(s string, n int) string {
+func renderVideo(headline, body, outPath string) error {
+	dir := filepath.Dir(outPath)
+	headF := filepath.Join(dir, "ff_vhead_"+randHex(6)+".txt")
+	bodyF := filepath.Join(dir, "ff_vbody_"+randHex(6)+".txt")
+	defer os.Remove(headF)
+	defer os.Remove(bodyF)
+	if err := writeTextFile(headF, headline); err != nil {
+		return err
+	}
+	if err := writeTextFile(bodyF, body); err != nil {
+		return err
+	}
+	fp := fontPath()
+	if fp == "" {
+		return fmt.Errorf("no font found; set FONT_PATH to a .ttf")
+	}
+	vf := fmt.Sprintf(
+		"drawtext=fontfile=%s:textfile=%s:fontsize=48:fontcolor=white:x=(w-text_w)/2:y=160:line_spacing=14,"+
+			"drawtext=fontfile=%s:textfile=%s:fontsize=28:fontcolor=0xdddddd:x=72:y=360:line_spacing=12:box=1:boxcolor=black@0.4:boxborderw=20",
+		escapePathForFilter(fp), escapePathForFilter(headF),
+		escapePathForFilter(fp), escapePathForFilter(bodyF),
+	)
+	// 9:16 style frame; silent AAC for container compatibility.
+	args := []string{
+		"-y",
+		"-f", "lavfi", "-i", "color=c=0x0f0f23:s=1080x1920:r=30",
+		"-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
+		"-vf", vf,
+		"-t", "8",
+		"-c:v", "libx264", "-pix_fmt", "yuv420p", "-profile:v", "high", "-movflags", "+faststart",
+		"-c:a", "aac", "-b:a", "128k",
+		"-shortest",
+		outPath,
+	}
+	cmd := exec.Command(ffmpegBin(), args...)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("ffmpeg video: %w: %s", err, stderr.String())
+	}
+	return nil
+}
+
+// ffmpeg filtergraph path escaping: replace \ and : and '
+func escapePathForFilter(p string) string {
+	p = strings.ReplaceAll(p, `\`, `\\`)
+	p = strings.ReplaceAll(p, `:`, `\:`)
+	p = strings.ReplaceAll(p, `'`, `\'`)
+	return p
+}
+
+func randHex(n int) string {
+	nb := (n + 1) / 2
+	b := make([]byte, nb)
+	if _, err := crand.Read(b); err != nil {
+		return fmt.Sprintf("%x", time.Now().UnixNano())[:n]
+	}
+	s := hex.EncodeToString(b)
+	if len(s) >= n {
+		return s[:n]
+	}
+	return s
+}
+
+func sha256hex(b []byte) string {
+	h := sha256.Sum256(b)
+	return hex.EncodeToString(h[:])
+}
+
+func hmacSHA256(key []byte, data string) []byte {
+	m := hmac.New(sha256.New, key)
+	m.Write([]byte(data))
+	return m.Sum(nil)
+}
+
+func garageSigV4Put(endpoint, bucket, region, accessKey, secretKey, objectKey string, payload []byte, contentType string) error {
+	u, err := url.Parse(endpoint)
+	if err != nil {
+		return err
+	}
+	host := u.Host
+	path := "/" + bucket + "/" + strings.TrimPrefix(objectKey, "/")
+	putURL := strings.TrimSuffix(endpoint, "/") + path
+	now := time.Now().UTC()
+	amzDate := now.Format("20060102T150405Z")
+	dateStamp := now.Format("20060102")
+	payloadHash := sha256hex(payload)
+	canonicalHeaders := fmt.Sprintf("content-type:%s\nhost:%s\nx-amz-content-sha256:%s\nx-amz-date:%s\n",
+		contentType, host, payloadHash, amzDate)
+	signedHeaders := "content-type;host;x-amz-content-sha256;x-amz-date"
+	canonicalRequest := fmt.Sprintf("PUT\n%s\n\n%s\n%s\n%s", path, canonicalHeaders, signedHeaders, payloadHash)
+	credentialScope := fmt.Sprintf("%s/%s/s3/aws4_request", dateStamp, region)
+	stringToSign := fmt.Sprintf("AWS4-HMAC-SHA256\n%s\n%s\n%s", amzDate, credentialScope, sha256hex([]byte(canonicalRequest)))
+	kDate := hmacSHA256([]byte("AWS4"+secretKey), dateStamp)
+	kRegion := hmacSHA256(kDate, region)
+	kService := hmacSHA256(kRegion, "s3")
+	kSigning := hmacSHA256(kService, "aws4_request")
+	signature := hex.EncodeToString(hmacSHA256(kSigning, stringToSign))
+	auth := fmt.Sprintf("AWS4-HMAC-SHA256 Credential=%s/%s, SignedHeaders=%s, Signature=%s",
+		accessKey, credentialScope, signedHeaders, signature)
+
+	req, err := http.NewRequest(http.MethodPut, putURL, bytes.NewReader(payload))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", contentType)
+	req.Header.Set("Host", host)
+	req.Header.Set("x-amz-content-sha256", payloadHash)
+	req.Header.Set("x-amz-date", amzDate)
+	req.Header.Set("Authorization", auth)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	rb, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("garage PUT %d: %s", resp.StatusCode, string(rb))
+	}
+	return nil
+}
+
+func garagePublicObjectURL(bucket, endpoint, publicBase, objectKey string) string {
+	keyPart := url.PathEscape(strings.TrimPrefix(objectKey, "/"))
+	// replicate PHP garage_public_url_for_key virtual-host branch
+	pub := strings.TrimSuffix(strings.TrimSpace(publicBase), "/")
+	if pub == "" {
+		return strings.TrimSuffix(endpoint, "/") + "/" + bucket + "/" + strings.ReplaceAll(objectKey, "%2F", "/")
+	}
+	u, err := url.Parse(pub)
+	if err != nil {
+		return pub + "/" + keyPart
+	}
+	host := strings.ToLower(u.Host)
+	vh := strings.ToLower(bucket) + ".web."
+	if strings.HasPrefix(host, vh) {
+		return pub + "/" + strings.ReplaceAll(objectKey, "%2F", "/")
+	}
+	return pub + "/" + bucket + "/" + strings.ReplaceAll(objectKey, "%2F", "/")
+}
+
+func pbPublicFileURL(collectionID, recordID, filename string) string {
+	base := strings.TrimSuffix(getenv("POCKETBASE_PUBLIC_URL", getenv("POCKETBASE_URL", "")), "/")
+	if base == "" || collectionID == "" || recordID == "" || filename == "" {
+		return ""
+	}
+	// /api/files/{collection}/{record}/{filename}
+	return fmt.Sprintf("%s/api/files/%s/%s/%s",
+		base, url.PathEscape(collectionID), url.PathEscape(recordID), url.PathEscape(filename))
+}
+
+func patchMultipart(token, itemID string, fields map[string]string, fileField, filePath, fileMIME string) (contentItem, error) {
+	var buf bytes.Buffer
+	w := multipart.NewWriter(&buf)
+	for k, v := range fields {
+		_ = w.WriteField(k, v)
+	}
+	fh, err := os.Open(filePath)
+	if err != nil {
+		return contentItem{}, err
+	}
+	defer fh.Close()
+	part, err := w.CreateFormFile(fileField, filepath.Base(filePath))
+	if err != nil {
+		return contentItem{}, err
+	}
+	if _, err := io.Copy(part, fh); err != nil {
+		return contentItem{}, err
+	}
+	if err := w.Close(); err != nil {
+		return contentItem{}, err
+	}
+	req, err := http.NewRequest(http.MethodPatch, pbBase()+"/api/collections/content_items/records/"+url.PathEscape(itemID), &buf)
+	if err != nil {
+		return contentItem{}, err
+	}
+	req.Header.Set("Content-Type", w.FormDataContentType())
+	req.Header.Set("Authorization", token)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return contentItem{}, err
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return contentItem{}, fmt.Errorf("multipart patch %d: %s", resp.StatusCode, string(b))
+	}
+	var out contentItem
+	if err := json.Unmarshal(b, &out); err != nil {
+		return contentItem{}, err
+	}
+	return out, nil
+}
+
+func patchJSON(token, itemID string, payload map[string]any) error {
+	body, _ := json.Marshal(payload)
+	req, err := http.NewRequest(http.MethodPatch, pbBase()+"/api/collections/content_items/records/"+url.PathEscape(itemID), bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", token)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("json patch %d: %s", resp.StatusCode, string(b))
+	}
+	return nil
+}
+
+func failItem(token, itemID, msg string) {
+	_ = patchJSON(token, itemID, map[string]any{
+		"status":           "failed",
+		"rejected_reason":  truncateStr(msg, 500),
+		"garage_key":       "",
+		"garage_url":       "",
+	})
+}
+
+func truncateStr(s string, n int) string {
 	if len(s) <= n {
 		return s
 	}
 	return s[:n]
+}
+
+func outputModeNormalized() string {
+	m := strings.ToLower(strings.TrimSpace(getenv("OUTPUT_MODE", "image")))
+	if m == "carousel" {
+		return "image"
+	}
+	return m
+}
+
+func processItem(token string, it contentItem) error {
+	mode := outputModeNormalized()
+	head, body := parseHeadlineBody(it.Prompt)
+
+	dir, err := os.MkdirTemp("", "ffpipe_*")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(dir)
+
+	var mediaPath, mime, ext string
+	switch mode {
+	case "image":
+		mediaPath = filepath.Join(dir, "out.jpg")
+		mime = "image/jpeg"
+		ext = "jpg"
+		if err := renderImage(head, body, mediaPath); err != nil {
+			return err
+		}
+	case "video", "reel":
+		mediaPath = filepath.Join(dir, "out.mp4")
+		mime = "video/mp4"
+		ext = "mp4"
+		if err := renderVideo(head, body, mediaPath); err != nil {
+			return err
+		}
+	default:
+		return fmt.Errorf("unsupported OUTPUT_MODE %q", mode)
+	}
+
+	bin, err := os.ReadFile(mediaPath)
+	if err != nil {
+		return err
+	}
+
+	garageKey := fmt.Sprintf("content/%s/%s.%s", it.ID, time.Now().UTC().Format("20060102150405"), ext)
+	ak := strings.TrimSpace(os.Getenv("GARAGE_ACCESS_KEY"))
+	sk := strings.TrimSpace(os.Getenv("GARAGE_SECRET_KEY"))
+	ep := strings.TrimSuffix(getenv("GARAGE_ENDPOINT", ""), "/")
+	bucket := getenv("GARAGE_BUCKET", "formatforge")
+	region := getenv("GARAGE_REGION", "garage")
+	pub := getenv("GARAGE_PUBLIC_URL", "")
+
+	fields := map[string]string{
+		"status":     "pending",
+		"garage_url": "",
+	}
+	if ak != "" && sk != "" && ep != "" {
+		if err := garageSigV4Put(ep, bucket, region, ak, sk, garageKey, bin, mime); err != nil {
+			return fmt.Errorf("garage upload: %w", err)
+		}
+		fields["garage_key"] = garageKey
+		gu := garagePublicObjectURL(bucket, ep, pub, garageKey)
+		if gu != "" {
+			fields["garage_url"] = gu
+		}
+	} else {
+		fields["garage_key"] = garageKey
+	}
+
+	updated, err := patchMultipart(token, it.ID, fields, "media_file", mediaPath, mime)
+	if err != nil {
+		return err
+	}
+
+	coll := strings.TrimSpace(updated.CollectionID)
+	fn := strings.TrimSpace(updated.MediaFile)
+	if coll == "" || fn == "" {
+		// Re-fetch record
+		req, _ := http.NewRequest(http.MethodGet, pbBase()+"/api/collections/content_items/records/"+url.PathEscape(it.ID), nil)
+		req.Header.Set("Authorization", token)
+		resp, err := http.DefaultClient.Do(req)
+		if err == nil && resp.StatusCode == http.StatusOK {
+			var full contentItem
+			_ = json.NewDecoder(resp.Body).Decode(&full)
+			resp.Body.Close()
+			coll = strings.TrimSpace(full.CollectionID)
+			fn = strings.TrimSpace(full.MediaFile)
+		}
+	}
+	pubMedia := pbPublicFileURL(coll, it.ID, fn)
+	if pubMedia != "" {
+		_ = patchJSON(token, it.ID, map[string]any{"garage_url": pubMedia})
+	}
+
+	fmt.Printf("Completed pipeline item %s\n", it.ID)
+	return nil
+}
+
+func main() {
+	email := strings.TrimSpace(os.Getenv("FORMATFORGE_EMAIL"))
+	pass := strings.TrimSpace(os.Getenv("FORMATFORGE_PASSWORD"))
+	if pbBase() == "" || email == "" || pass == "" {
+		fmt.Fprintln(os.Stderr, "POCKETBASE_URL, FORMATFORGE_EMAIL, FORMATFORGE_PASSWORD required")
+		os.Exit(1)
+	}
+
+	pid := pipelineID()
+	if pid == "" {
+		fmt.Fprintln(os.Stderr, "PIPELINE_PB_ID (or FORMATFORGE_RUN_PIPELINE_ID) required for FormatForge pipeline runs")
+		os.Exit(1)
+	}
+
+	token, err := login(email, pass)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Login failed: %v\n", err)
+		os.Exit(1)
+	}
+
+	items, err := fetchGeneratingItems(token, pid)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "List items failed: %v\n", err)
+		os.Exit(1)
+	}
+	if len(items) == 0 {
+		fmt.Println("No generating content_items for this pipeline")
+		return
+	}
+
+	for _, it := range items {
+		if err := processItem(token, it); err != nil {
+			fmt.Fprintf(os.Stderr, "Item %s: %v\n", it.ID, err)
+			failItem(token, it.ID, fmt.Sprintf("[pipeline] %v", err))
+		}
+	}
 }

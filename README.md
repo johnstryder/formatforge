@@ -21,30 +21,47 @@ Single-file PHP dashboard for AI content generation, curation, and Instagram pub
 1. **Create admin (PocketBase dashboard login):**  
    `./formatforge-pb migrate up` (first run / new `pb_data`), then  
    `./formatforge-pb admin create your@email.com 'yourpassword'`  
-   (Binary name is `<folder>-pb`, e.g. `formatforge-pb`. Older PB used `superuser upsert`; v0.23+ uses `admin create`.)
+   (The PocketBase binary is named `<folder>-pb`, e.g. `formatforge-pb`.)
 2. **Copy .env:** `cp .env.example .env` and fill in:
    - `ADMIN_EMAIL`, `ADMIN_PASSWORD`, `MIGRATE_SECRET`
    - `APP_VERSION` (e.g. `v1.0.27`)
    - `GARAGE_*` (S3-compatible storage)
    - `REPLICATE_API_TOKEN` (or `FAL_KEY` for fal.ai)
    - `FB_APP_ID`, `FB_APP_SECRET`, `INSTAGRAM_REDIRECT_URI` (for Instagram OAuth)
-   - `ANTFLY_URL`, `ANTFLY_API_KEY` (optional, self-hosted Antfly for search/indexing)
+   - `ANTFLY_URL`, `ANTFLY_API_KEY` (optional, self-hosted Antfly for search/indexing). **`ANTFLY_URL` in `.env` overrides a repo `.antfly-port` file** so PHP hits the same local Termite API you configured (stale port files used to win and break indexing).
    - **Antfly (optional):** The vendored **`antfly-src/`** tree has Docker, Kubernetes operator, and Minikube assets removed (native binaries only). Build/run from that README, or point `ANTFLY_URL` at the **Antfly metadata / store HTTP API** (host that serves `POST /api/v1/tables/{name}/batch`). `./scripts/init-antfly.sh` creates **`content`** (full-text + **semantic template** using **`remoteMedia`** on `media_url` so OpenRouter `EMBED_MODEL` can see image/video/audio URLs) and **`pipeline_refs`** (active pipeline `prompt_template` rows for semantic novelty). Vectors are computed **inside Antfly** (configure `OPENROUTER_API_KEY` on Antfly or pass `api_key` in table embedder JSON). If you already have an old `content` table (single-field `prompt` index only), **drop** `content` / `pipeline_refs` and re-run `init-antfly.sh`.
 3. **Migrations:** Collections are created automatically from `pb_migrations/` when PocketBase starts. Restart the server to apply. The **`pipelines`** collection is listed and run from the dashboard; **create/update/delete** are **superuser-only** (Cursor agent / PocketBase admin), not app users.
    - If **`source_links`** rows have no `url` and the UI always shows **pending**, the collection likely existed before migrations ran (empty schema). Set `ADMIN_EMAIL` / `ADMIN_PASSWORD` in `.env`, then run **`php index.php repair-source-links-schema`**, delete broken rows via PocketBase Admin or **`php index.php delete-source-link`** (only when exactly one row exists; pass record id as second arg otherwise), and add links again.
 4. **Create user:** PocketBase Admin → Collections → users → Create record (email + password).  
    For self-signup on the login page (when on Tailscale/internal network), set the users collection **Create** rule to empty or `@request.auth.id = ""` in PocketBase Admin. Or set `ALLOW_SIGNUP=1` in `.env` to always show the create-account form.
 
+## Maintenance (CLI)
+
+- **Stack connectivity:** `php index.php probe-stack` — from **this PHP process**, checks **`GET POCKETBASE_URL/api/health`**, **`GET POCKETBASE_PUBLIC_URL/api/health`** (when it differs from internal PB), **`GET GARAGE_ENDPOINT/`** (403/400 is OK without auth), **`GET GARAGE_PUBLIC_URL/`** when set, **`GET ANTFLY_URL/api/v1/tables`**, and (if Garage keys are set) a **SigV4 PUT** like **`probe-garage`**. Exit **0** only when required services respond. Use after deploy or when Antfly/embeddings/Garage “can’t connect”. **`POCKETBASE_URL`** in `.env` overrides **`.pb-port`** (same precedence pattern as **`ANTFLY_URL`** vs **`.antfly-port`**).
+- **Antfly process:** the metadata API must be running for semantic novelty (`pipeline_refs`) and **`content`** indexing. Build once: **`cd antfly-src && go build -o ../bin/antfly ./cmd/antfly`**, then install **systemd**: **`sudo install -d -o www-data -g www-data /var/lib/formatforge-antfly`**, **`sudo cp scripts/formatforge-antfly.service /etc/systemd/system/`**, **`sudo systemctl daemon-reload && sudo systemctl enable --now formatforge-antfly`**. Manual run: **`./scripts/start-antfly.sh`**. Ensure **`.env.antfly`** is writable by **`www-data`** (e.g. **`sudo -u www-data python3 scripts/sync_antfly_env.py`**). Then **`./scripts/init-antfly.sh`** creates tables if missing.
+- **Antfly wiring:** `php index.php antfly-status` — prints the resolved **`antfly_url`**, how it was chosen (`ANTFLY_URL` vs `.antfly-port` vs default), and whether tables **`content`** and **`pipeline_refs`** exist (run `./scripts/init-antfly.sh` after Antfly is up). Each successful **Fetch** logs **`antfly_content_index_ok`** in **`pipeline-trace.jsonl`** (`fetch_link_pipeline_summary`).
+- **Clear all Curate data** (queued links + content items): `php index.php clear-curate-data` (dry-run: lists IDs) or `php index.php clear-curate-data --apply` — requires **`ADMIN_EMAIL`** / **`ADMIN_PASSWORD`** in `.env`. Does **not** delete `instagram_accounts`, `pipelines`, or `content_metrics`. Per collection: `delete-all-source-links` / `delete-all-content-items`.
+- **PocketBase file field (`content_items.media_file`):** New fetches and pipeline-generated videos upload bytes to PocketBase as well as Garage; the app prefers **`https://<your-site>/api/files/<collectionId>/<recordId>/<filename>`** (nginx must proxy **`/api/`** to PocketBase). If an older database has no `media_file` field, run **`php index.php repair-content-items-media-schema`** (superuser) or restart PocketBase so `pb_migrations/` applies. Set **`POCKETBASE_CONTENT_ITEMS_COLLECTION_ID`** in `.env` if the UI still showed Garage **`*.sslip.io`** URLs (list API often omits `collectionId` per row). After upgrading, **`php index.php sync-pb-garage-urls --dry-run`** then **`--apply`** rewrites **`garage_url`** to the PocketBase file URL for rows that already have **`media_file`**.
+
 ## Frontend
 
 1. **Curate — Send links** — Paste URLs to queue as content sources
 2. **Curate — Generated content** — View videos, approve or reject (with a dialog), publish to Instagram
-3. **Pipelines** — Cursor **agent** (or admin) creates `pipelines` records; **Run** opens a dialog for optional extra instructions, then starts generation
+3. **Pipelines** — Cursor **agent** (or admin) creates `pipelines` records; **Run** opens a dialog for optional **source link** alignment + extra instructions, then starts generation
+
+## Source alignment (all generation agents)
+
+Text-to-video only sees the **prompt string**. One worker — **`formatforge_generate_content_finish`** in **`index.php`** (used by the web UI and the **`complete-generate`** CLI) — **merges** fetched Curate context **before** calling Replicate/fal when it can resolve a backing link:
+
+- **`content_items.source_link_id`**, or
+- **`pipelines.metadata.backing_source_link_id`**, **`default_source_link_id`**, or **`source_link_id`** (if the generating row has **`metadata.pipeline_id`** but no `source_link_id` on the item)
+
+Any **agent** that creates a **`content_items`** row with **`status=generating`** and a resolvable link (UI, Go cron binary posting to PocketBase, future automations) gets the **same** alignment behavior — you do not rely on each pipeline’s prose alone. The merged prompt is **PATCH**ed onto the row and logged to **`pipeline-trace.jsonl`** as **`generate_content_backing_merged`**.
 
 ## Integrations
 
-- **PocketBase** — Auth, OAuth tokens, content state
-- **Garage S3** — Store generated .mp4 files. Check signed uploads from the **same host as PHP**: `php index.php probe-garage`. Set **`GARAGE_ENDPOINT`** to a URL PHP can reach (often `http://127.0.0.1:3900` if Garage is on the same machine).
+- **PocketBase** — Auth, OAuth tokens, content state; **`content_items.media_file`** stores a copy of media for browser-safe URLs via **`/api/files/…`** (same host as the app when proxied).
+- **Garage S3** — Store generated .mp4 files. Check signed uploads from the **same host as PHP**: `php index.php probe-garage`. Set **`GARAGE_ENDPOINT`** to the S3 API URL PHP can reach (often `http://127.0.0.1:3900`). Set **`GARAGE_PUBLIC_URL`** *or* **`GARAGE_PUBLIC_ROOT_DOMAIN`** (app builds `https://{GARAGE_BUCKET}.web.{ROOT}`) so browsers never get `127.0.0.1` URLs. After fixing `.env`, run **`php index.php rewrite-garage-urls --dry-run`** then without `--dry-run` to PATCH existing **`content_items.garage_url`** from **`garage_key`**. To remove rows that still point at loopback (e.g. `http://127.0.0.1/...`): **`php index.php delete-bad-garage-urls`** (dry-run) then **`php index.php delete-bad-garage-urls --apply`**. That command also removes **`source_links`** when every **`content_items`** row for that link is loopback-only (so fetched-queue rows don’t linger). If you already deleted bad **`content_items`** without links, run **`php index.php delete-orphan-source-links`** then **`--apply`** (removes non-**pending** links with no **`content_items`**). If **FormatForge is HTTPS** but **`garage_url` values are `http://`**, browsers **block** embedded media (mixed content). Instagram **`video_url`** generally needs **HTTPS** and a URL Meta can fetch.
 - **Replicate** — Video generation (minimax/video-01)
 - **fal.ai** — Alternative video generation (Kling, LTX, etc.)
 - **Instagram Graph API** — OAuth + publish Reels; **`php index.php sync-instagram-insights`** (or web `action=sync_instagram_insights` while logged in) PATCHes **`content_metrics`** with likes, comments, impressions/views, shares when the token has **insights** scopes. Some metrics lag ~24–48h per Meta.
@@ -65,7 +82,7 @@ After **Fetch**, if Antfly reports the item as **novel** vs synced **`pipeline_r
    - Creates `pipelines/pipeline-<id>/` from the template
    - Copies `.env` (Replicate, PocketBase, Garage, login) into the pipeline dir
    - Writes **`.cursor-pipeline/prompts/pipeline-<id>.md`** — task prompt for the agent (same repo; Cursor `--workspace` is the project root)
-3. Spawns **`agent`** in the background ([Cursor CLI](https://cursor.com/cli)) with **`-p`**, **`--trust`**, **`-f`**, **`--model composer-2-fast`** by default ([Composer 2 / Cursor 2.0](https://cursor.com/blog/2-0))
+3. Spawns **`agent`** in the background ([Cursor CLI](https://cursor.com/cli)) with **`-p`**, **`--trust`**, **`-f`**, **`--model composer-2`** by default ([Composer 2](https://cursor.com/docs/models/cursor-composer-2))
 
 The Markdown **`## Context`** block adds **`operating_context`**: latest **`pipelines`** rows, **`target_posts_per_day`** (from **`TARGET_POSTS_PER_DAY`**) vs **`published_count_last_24h`**, recent published items plus **`content_metrics_by_item_id`** when those columns are populated (run **`sync-instagram-insights`** or the web sync so likes/impressions/etc. are filled after publish), and small samples of fetched vs pipeline-generated **`content_items`**. For **novel** fetches it also adds **`semantic_nearest_pipeline_to_this_fetch`** and a **`semantic_novelty_explainer`**.
 
@@ -118,6 +135,6 @@ ls "$AGENT_DIR"   # expect index.js, node_modules, …
 
 ```bash
 cd pipelines/pipeline-<id> && go build -o pipeline-generate .
-# Cron: 0 */6 * * * cd /path/to/pipelines/pipeline-<id> && set -a && . .env && set +a && ./pipeline-generate
+# Cron: 0 * * * * cd /path/to/pipelines/pipeline-<id> && set -a && . .env && set +a && ./pipeline-generate
 ```
 

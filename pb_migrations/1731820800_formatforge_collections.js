@@ -1,4 +1,3 @@
-/// PocketBase v0.23+ JS migrations use (app) => { ... } and app.save(collection), not Dao.
 migrate((app) => {
   const createIfMissing = (config) => {
     try {
@@ -66,6 +65,8 @@ migrate((app) => {
       { name: "rejected_reason", type: "text" },
       { name: "instagram_account_id", type: "text" },
       { name: "published_at", type: "date" },
+      // Browser-facing copy: GET /api/files/{collectionId}/{recordId}/{filename} (nginx → PocketBase)
+      { name: "media_file", type: "file", maxSelect: 1, maxSize: 1073741824, mimeTypes: [] },
     ],
   })
 

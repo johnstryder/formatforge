@@ -8,4 +8,5 @@ alwaysApply: true
 - App logic lives in **PHP** (`index.php`) with **PocketBase**, Alpine in-page — there is **no** `/frontend` or `/backend` TypeScript app in this repo.
 - **Runtime (host only):** PocketBase binary + PHP (`./scripts/start.sh` locally, or systemd + nginx per DEPLOYMENT.md) on the **Linux server** — **no** Docker / Compose / container-only hostnames for the FormatForge app stack. Do **not** add Dockerfiles or compose files for the app.
 - **Do not** run `npm` / `pnpm` / `bun` typecheck or tests as a default “after editing” step unless the user explicitly asks or you are working inside a vendored subtree (e.g. `antfly-src/`) they called out.
-- After changes, **PHP**: `php -l index.php` when you edited PHP is enough unless they request more.
+- After **PHP** edits: `php -l index.php`, then **reload PHP-FPM on the host** per **`.cursor/rules/formatforge-deploy-after-php-nginx.mdc`** (not lint-only on prod).
+- **PocketBase list `sort`:** if the server returns `invalid sort field` for `created` / `updated`, use the special field **`sort=-@rowid`** (URL: `sort=-%40rowid`). Keep schema fields like `published_at`, `fetched_at`, `name` when those are intended.
