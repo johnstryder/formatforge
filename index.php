@@ -140,7 +140,7 @@ $CONFIG = [
     'pocketbase_admin_url' => rtrim($pbPublicUrl, '/') . '/_/',
     'site_url' => $siteUrl,
     'site_name' => getenv('SITE_NAME') ?: 'FormatForge',
-    'app_version' => getenv('APP_VERSION') ?: 'v1.1.214',
+    'app_version' => getenv('APP_VERSION') ?: 'v1.1.215',
     'gallery_dl_path' => ff_resolve_fetch_bin('GALLERY_DL_PATH', 'gallery-dl'),
     'yt_dlp_path' => ff_resolve_fetch_bin('YT_DLP_PATH', 'yt-dlp'),
     'users_collection' => 'users',
@@ -203,7 +203,35 @@ function pb_request(string $method, string $path, $data = null, ?string $token =
 }
 
 /**
+ * PATCH multipart file onto an existing record (PocketBase multi file fields use "name+" to append).
+ *
+ * @return array{code: int, body: array, raw: string}
+ */
+function ff_pb_patch_record_file(string $token, string $col, string $recordId, string $formField, CURLFile $file): array {
+    $base = rtrim((string) ($GLOBALS['CONFIG']['pocketbase_url'] ?? ''), '/');
+    $url = $base . '/api/collections/' . rawurlencode($col) . '/records/' . rawurlencode($recordId);
+    $t = trim($token);
+    if (stripos($t, 'Bearer ') !== 0) {
+        $t = 'Bearer ' . $t;
+    }
+    $ch = curl_init($url);
+    curl_setopt_array($ch, [
+        CURLOPT_CUSTOMREQUEST => 'PATCH',
+        CURLOPT_POSTFIELDS => [$formField => $file],
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_HTTPHEADER => ['Accept: application/json', 'Authorization: ' . $t],
+    ]);
+    $res = curl_exec($ch);
+    $code = (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
+    curl_close($ch);
+    $body = json_decode($res ?: '{}', true) ?? [];
+
+    return ['code' => $code, 'body' => $body, 'raw' => $res ?: ''];
+}
+
+/**
  * One input_media row with a single fetched_files file (carousels / albums → one PocketBase record per slide).
+ * JSON-create then PATCH file: single multipart create often drops file parts for multi-select file fields.
  *
  * @param array<string, mixed> $metaJson merged into metadata (e.g. carousel_index, fetch_batch_id)
  * @return array{code: int, body: array, raw: string}
@@ -217,8 +245,6 @@ function ff_pb_input_media_create_fetch_one(string $token, string $sourceUrl, st
     if (!is_file($absPath) || !is_readable($absPath)) {
         return ['code' => 0, 'body' => ['message' => 'Missing or unreadable file for upload.'], 'raw' => ''];
     }
-    $base = rtrim((string) ($cfg['pocketbase_url'] ?? ''), '/');
-    $url = $base . '/api/collections/' . rawurlencode($col) . '/records';
     if (!class_exists(CURLFile::class)) {
         return ['code' => 0, 'body' => ['message' => 'PHP CURLFile unavailable (install/enable php-curl).'], 'raw' => ''];
     }
@@ -234,33 +260,41 @@ function ff_pb_input_media_create_fetch_one(string $token, string $sourceUrl, st
         }
     }
     $fileField = new CURLFile($absPath, $mimeType, basename($absPath));
-    $post = [
+
+    $payload = [
         'role' => 'fetched',
         'status' => 'fetched',
         'url' => $sourceUrl,
         'input_url' => $sourceUrl,
         'title' => $title,
-        'is_active' => 'true',
-        'metadata' => json_encode($meta, JSON_UNESCAPED_UNICODE),
-        'fetched_files' => $fileField,
+        'is_active' => true,
+        'metadata' => $meta,
     ];
-    $t = trim($token);
-    if (stripos($t, 'Bearer ') !== 0) {
-        $t = 'Bearer ' . $t;
+    $create = pb_request('POST', '/api/collections/' . rawurlencode($col) . '/records', $payload, $token);
+    if ($create['code'] < 200 || $create['code'] >= 300) {
+        return $create;
     }
-    $ch = curl_init($url);
-    curl_setopt_array($ch, [
-        CURLOPT_POST => true,
-        CURLOPT_POSTFIELDS => $post,
-        CURLOPT_RETURNTRANSFER => true,
-        CURLOPT_HTTPHEADER => ['Accept: application/json', 'Authorization: ' . $t],
-    ]);
-    $res = curl_exec($ch);
-    $code = (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
-    curl_close($ch);
-    $body = json_decode($res ?: '{}', true) ?? [];
+    $id = trim((string) ($create['body']['id'] ?? ''));
+    if ($id === '') {
+        return ['code' => 0, 'body' => ['message' => 'PocketBase create returned no id.'], 'raw' => $create['raw'] ?? ''];
+    }
 
-    return ['code' => $code, 'body' => $body, 'raw' => $res ?: ''];
+    $patch = ff_pb_patch_record_file($token, $col, $id, 'fetched_files+', $fileField);
+    if ($patch['code'] < 200 || $patch['code'] >= 300) {
+        $patch2 = ff_pb_patch_record_file($token, $col, $id, 'fetched_files', $fileField);
+        if ($patch2['code'] < 200 || $patch2['code'] >= 300) {
+            ff_pb_delete_input_media_record($token, $id);
+            $msg = (string) (($patch['body']['message'] ?? '') ?: ($patch2['body']['message'] ?? '') ?: 'File upload failed.');
+            return ['code' => $patch2['code'], 'body' => ['message' => $msg, 'data' => $patch2['body']['data'] ?? $patch['body']['data'] ?? null], 'raw' => $patch2['raw'] ?: $patch['raw']];
+        }
+        $patch = $patch2;
+    }
+
+    if (empty($patch['body']['id'])) {
+        $patch['body']['id'] = $id;
+    }
+
+    return $patch;
 }
 
 function ff_pb_delete_input_media_record(string $token, string $recordId): void {
