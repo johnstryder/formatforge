@@ -12,13 +12,12 @@ migrate((app) => {
   }
   col.fields = [
     ...(col.fields || []),
-    {
+    new FileField({
       name: "fetched_files",
-      type: "file",
       maxSelect: 20,
       maxSize: 1073741824,
       mimeTypes: [],
-    },
+    }),
   ]
   app.save(col)
 })
