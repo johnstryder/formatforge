@@ -22,6 +22,7 @@ migrate((app) => {
   applyUserCrud('social_accounts')
   applyUserCrud('input_media')
   applyUserCrud('output_media')
+  applyUserCrud('prompts')
 
   let pipelines
   try {
