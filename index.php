@@ -140,7 +140,7 @@ $CONFIG = [
     'pocketbase_admin_url' => rtrim($pbPublicUrl, '/') . '/_/',
     'site_url' => $siteUrl,
     'site_name' => getenv('SITE_NAME') ?: 'FormatForge',
-    'app_version' => getenv('APP_VERSION') ?: 'v1.1.213',
+    'app_version' => getenv('APP_VERSION') ?: 'v1.1.214',
     'gallery_dl_path' => ff_resolve_fetch_bin('GALLERY_DL_PATH', 'gallery-dl'),
     'yt_dlp_path' => ff_resolve_fetch_bin('YT_DLP_PATH', 'yt-dlp'),
     'users_collection' => 'users',
@@ -219,49 +219,44 @@ function ff_pb_input_media_create_fetch_one(string $token, string $sourceUrl, st
     }
     $base = rtrim((string) ($cfg['pocketbase_url'] ?? ''), '/');
     $url = $base . '/api/collections/' . rawurlencode($col) . '/records';
-    if (!function_exists('curl_mime_init')) {
-        return ['code' => 0, 'body' => ['message' => 'PHP curl_mime API missing (php-curl).'], 'raw' => ''];
+    if (!class_exists(CURLFile::class)) {
+        return ['code' => 0, 'body' => ['message' => 'PHP CURLFile unavailable (install/enable php-curl).'], 'raw' => ''];
     }
-    $ch = curl_init($url);
-    $mime = curl_mime_init($ch);
-    $add = static function ($mime, string $name, string $value): void {
-        $p = curl_mime_addpart($mime);
-        curl_mime_name($p, $name);
-        curl_mime_data($p, $value);
-    };
     if (strlen($title) > 200) {
         $title = substr($title, 0, 200);
     }
     $meta = array_merge(['via' => $via], $metaJson, ['fetched_at' => gmdate('c')]);
-    $add($mime, 'role', 'fetched');
-    $add($mime, 'status', 'fetched');
-    $add($mime, 'url', $sourceUrl);
-    $add($mime, 'input_url', $sourceUrl);
-    $add($mime, 'title', $title);
-    $add($mime, 'is_active', 'true');
-    $add($mime, 'metadata', json_encode($meta, JSON_UNESCAPED_UNICODE));
-    $part = curl_mime_addpart($mime);
-    curl_mime_name($part, 'fetched_files');
-    curl_mime_filedata($part, $absPath);
-    curl_mime_filename($part, basename($absPath));
+    $mimeType = 'application/octet-stream';
     if (function_exists('mime_content_type')) {
         $mt = @mime_content_type($absPath);
         if (is_string($mt) && $mt !== '') {
-            curl_mime_type($part, $mt);
+            $mimeType = $mt;
         }
     }
+    $fileField = new CURLFile($absPath, $mimeType, basename($absPath));
+    $post = [
+        'role' => 'fetched',
+        'status' => 'fetched',
+        'url' => $sourceUrl,
+        'input_url' => $sourceUrl,
+        'title' => $title,
+        'is_active' => 'true',
+        'metadata' => json_encode($meta, JSON_UNESCAPED_UNICODE),
+        'fetched_files' => $fileField,
+    ];
     $t = trim($token);
     if (stripos($t, 'Bearer ') !== 0) {
         $t = 'Bearer ' . $t;
     }
+    $ch = curl_init($url);
     curl_setopt_array($ch, [
-        CURLOPT_MIMEPOST => $mime,
+        CURLOPT_POST => true,
+        CURLOPT_POSTFIELDS => $post,
         CURLOPT_RETURNTRANSFER => true,
         CURLOPT_HTTPHEADER => ['Accept: application/json', 'Authorization: ' . $t],
     ]);
     $res = curl_exec($ch);
     $code = (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
-    curl_mime_free($mime);
     curl_close($ch);
     $body = json_decode($res ?: '{}', true) ?? [];
 
