@@ -140,7 +140,7 @@ $CONFIG = [
     'pocketbase_admin_url' => rtrim($pbPublicUrl, '/') . '/_/',
     'site_url' => $siteUrl,
     'site_name' => getenv('SITE_NAME') ?: 'FormatForge',
-    'app_version' => getenv('APP_VERSION') ?: 'v1.1.211',
+    'app_version' => getenv('APP_VERSION') ?: 'v1.1.212',
     'gallery_dl_path' => ff_resolve_fetch_bin('GALLERY_DL_PATH', 'gallery-dl'),
     'yt_dlp_path' => ff_resolve_fetch_bin('YT_DLP_PATH', 'yt-dlp'),
     'users_collection' => 'users',
@@ -149,6 +149,8 @@ $CONFIG = [
     'instagram_redirect' => getenv('INSTAGRAM_REDIRECT_URI') ?: '',
     /** Instagram / Facebook Login: shown in UI and sent to Meta OAuth dialog. */
     'instagram_oauth_scope' => 'instagram_basic,instagram_content_publish,pages_show_list,pages_read_engagement,business_management',
+    /** PocketBase collection for Fetch uploads (fetched_files field; see pb_migrations). */
+    'input_media_collection' => getenv('INPUT_MEDIA_COLLECTION') ?: 'input_media',
 ];
 
 if (is_file(__DIR__ . '/config.php')) {
@@ -198,6 +200,127 @@ function pb_request(string $method, string $path, $data = null, ?string $token =
     curl_close($ch);
     $body = json_decode($res ?: '{}', true) ?? [];
     return ['code' => $code, 'body' => $body, 'raw' => $res ?: '', 'curl_errno' => $errNo];
+}
+
+/**
+ * Create input_media row with fetched_files via multipart (curl MIME API).
+ *
+ * @param array<int, string> $absPaths
+ * @return array{code: int, body: array, raw: string}
+ */
+function ff_pb_input_media_create_fetch(string $token, string $sourceUrl, string $via, array $absPaths): array {
+    $cfg = $GLOBALS['CONFIG'];
+    $col = trim((string) ($cfg['input_media_collection'] ?? 'input_media'));
+    if ($col === '') {
+        $col = 'input_media';
+    }
+    $base = rtrim((string) ($cfg['pocketbase_url'] ?? ''), '/');
+    $url = $base . '/api/collections/' . rawurlencode($col) . '/records';
+    if (!function_exists('curl_mime_init')) {
+        return ['code' => 0, 'body' => ['message' => 'PHP curl_mime API missing (php-curl).'], 'raw' => ''];
+    }
+    $ch = curl_init($url);
+    $mime = curl_mime_init($ch);
+    $add = static function ($mime, string $name, string $value): void {
+        $p = curl_mime_addpart($mime);
+        curl_mime_name($p, $name);
+        curl_mime_data($p, $value);
+    };
+    $host = parse_url($sourceUrl, PHP_URL_HOST);
+    $title = $host ? ('Fetch: ' . $host) : 'Fetched media';
+    if (strlen($title) > 200) {
+        $title = substr($title, 0, 200);
+    }
+    $add($mime, 'role', 'fetched');
+    $add($mime, 'status', 'fetched');
+    $add($mime, 'url', $sourceUrl);
+    $add($mime, 'input_url', $sourceUrl);
+    $add($mime, 'title', $title);
+    $add($mime, 'is_active', 'true');
+    $add($mime, 'metadata', json_encode(['via' => $via, 'fetched_at' => gmdate('c')], JSON_UNESCAPED_UNICODE));
+    foreach ($absPaths as $pth) {
+        if (!is_file($pth) || !is_readable($pth)) {
+            continue;
+        }
+        $part = curl_mime_addpart($mime);
+        curl_mime_name($part, 'fetched_files');
+        curl_mime_filedata($part, $pth);
+        curl_mime_filename($part, basename($pth));
+        if (function_exists('mime_content_type')) {
+            $mt = @mime_content_type($pth);
+            if (is_string($mt) && $mt !== '') {
+                curl_mime_type($part, $mt);
+            }
+        }
+    }
+    $t = trim($token);
+    if (stripos($t, 'Bearer ') !== 0) {
+        $t = 'Bearer ' . $t;
+    }
+    curl_setopt_array($ch, [
+        CURLOPT_MIMEPOST => $mime,
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_HTTPHEADER => ['Accept: application/json', 'Authorization: ' . $t],
+    ]);
+    $res = curl_exec($ch);
+    $code = (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
+    curl_mime_free($mime);
+    curl_close($ch);
+    $body = json_decode($res ?: '{}', true) ?? [];
+
+    return ['code' => $code, 'body' => $body, 'raw' => $res ?: ''];
+}
+
+function ff_pb_proxy_file_download(string $collection, string $recordId, string $filename, string $token): void {
+    $fn = basename(str_replace(["\0"], '', $filename));
+    if ($fn === '' || str_contains($fn, '..')) {
+        http_response_code(400);
+        header('Content-Type: text/plain; charset=utf-8');
+        echo 'Bad filename';
+        return;
+    }
+    $base = rtrim((string) ($GLOBALS['CONFIG']['pocketbase_url'] ?? ''), '/');
+    $url = $base . '/api/files/' . rawurlencode($collection) . '/' . rawurlencode($recordId) . '/' . rawurlencode($fn);
+    $t = trim($token);
+    if (stripos($t, 'Bearer ') !== 0) {
+        $t = 'Bearer ' . $t;
+    }
+    $httpStatus = 0;
+    $headersOut = false;
+    $errBuf = '';
+    $ch = curl_init($url);
+    curl_setopt($ch, CURLOPT_HEADERFUNCTION, static function ($ch, $headerLine) use (&$httpStatus): int {
+        $len = strlen($headerLine);
+        if (preg_match('#^HTTP/\S+\s+(\d+)#', $headerLine, $m)) {
+            $httpStatus = (int) $m[1];
+        }
+        return $len;
+    });
+    curl_setopt($ch, CURLOPT_WRITEFUNCTION, static function ($ch, $chunk) use (&$httpStatus, &$headersOut, &$errBuf, $fn): int {
+        if ($httpStatus !== 200) {
+            $errBuf .= $chunk;
+            return strlen($chunk);
+        }
+        if (!$headersOut) {
+            header('Content-Type: application/octet-stream');
+            header('Content-Disposition: attachment; filename="' . str_replace(["\r", "\n", '"'], '', $fn) . '"');
+            $headersOut = true;
+        }
+        echo $chunk;
+        return strlen($chunk);
+    });
+    curl_setopt_array($ch, [
+        CURLOPT_URL => $url,
+        CURLOPT_HTTPHEADER => ['Authorization: ' . $t],
+        CURLOPT_RETURNTRANSFER => false,
+    ]);
+    curl_exec($ch);
+    curl_close($ch);
+    if ($httpStatus !== 200 && !$headersOut) {
+        http_response_code($httpStatus >= 400 && $httpStatus < 600 ? $httpStatus : 502);
+        header('Content-Type: text/plain; charset=utf-8');
+        echo 'File not available';
+    }
 }
 
 function normalize_instagram_username(?string $username): ?string {
@@ -326,37 +449,6 @@ function ff_fetch_collect_files(string $dir): array {
     return $out;
 }
 
-function ff_fetch_run_id_valid(string $runId): bool {
-    return (bool) preg_match('/^\d{8}T\d{6}_[a-f0-9]{8}$/', $runId);
-}
-
-/**
- * @return array<int, string> relative paths using /
- */
-function ff_fetch_list_run_relative_files(string $runId): array {
-    if (!ff_fetch_run_id_valid($runId)) {
-        return [];
-    }
-    $base = __DIR__ . '/storage/fetches/' . $runId;
-    $baseReal = realpath($base);
-    if ($baseReal === false || !is_dir($baseReal)) {
-        return [];
-    }
-    $out = [];
-    $it = new RecursiveIteratorIterator(
-        new RecursiveDirectoryIterator($baseReal, FilesystemIterator::SKIP_DOTS)
-    );
-    foreach ($it as $f) {
-        if ($f->isFile()) {
-            $full = $f->getPathname();
-            $rel = substr($full, strlen($baseReal) + 1);
-            $out[] = str_replace(DIRECTORY_SEPARATOR, '/', $rel);
-        }
-    }
-    sort($out);
-    return $out;
-}
-
 /** If the pasted line has no scheme, assume https (browser type=url often blocks these). */
 function ff_fetch_normalize_url_input(string $url): string {
     $url = trim($url);
@@ -367,34 +459,6 @@ function ff_fetch_normalize_url_input(string $url): string {
         return 'https://' . ltrim($url, '/');
     }
     return $url;
-}
-
-/**
- * @return ?string absolute filesystem path
- */
-function ff_fetch_resolve_safe_path(string $runId, string $relFile): ?string {
-    if (!ff_fetch_run_id_valid($runId)) {
-        return null;
-    }
-    $baseReal = realpath(__DIR__ . '/storage/fetches/' . $runId);
-    if ($baseReal === false || !is_dir($baseReal)) {
-        return null;
-    }
-    $relFile = str_replace('\\', '/', $relFile);
-    $relFile = ltrim($relFile, '/');
-    if ($relFile === '' || str_contains($relFile, '..')) {
-        return null;
-    }
-    $full = $baseReal . DIRECTORY_SEPARATOR . str_replace('/', DIRECTORY_SEPARATOR, $relFile);
-    $fullReal = realpath($full);
-    if ($fullReal === false || !is_file($fullReal)) {
-        return null;
-    }
-    $prefix = $baseReal . DIRECTORY_SEPARATOR;
-    if (!str_starts_with($fullReal, $prefix)) {
-        return null;
-    }
-    return $fullReal;
 }
 
 function ff_fetch_validate_http_url(string $url): ?string {
@@ -485,22 +549,26 @@ function ff_fetch_run_tool(string $url, string $tool, string $destDir): array {
 }
 
 /**
- * @return array{ok: bool, rel: string, n: int, error: string, via: string}
+ * Download to system temp, then upload files to PocketBase input_media.fetched_files.
+ *
+ * @return array{ok: bool, record_id: string, pb_files: array<int, string>, n: int, error: string, via: string}
  */
-function ff_fetch_save_media(string $url, string $toolChoice): array {
+function ff_fetch_save_media(string $url, string $toolChoice, ?string $pbToken): array {
+    $empty = ['ok' => false, 'record_id' => '', 'pb_files' => [], 'n' => 0, 'error' => '', 'via' => ''];
     $url = ff_fetch_normalize_url_input($url);
     $err = ff_fetch_validate_http_url($url);
     if ($err !== null) {
-        return ['ok' => false, 'rel' => '', 'n' => 0, 'error' => $err, 'via' => ''];
+        $empty['error'] = $err;
+        return $empty;
     }
-    $base = __DIR__ . '/storage/fetches';
-    if (!is_dir($base) && !@mkdir($base, 0775, true)) {
-        return ['ok' => false, 'rel' => '', 'n' => 0, 'error' => 'Cannot create storage/fetches directory.', 'via' => ''];
+    if (!$pbToken || trim((string) $pbToken) === '') {
+        $empty['error'] = 'Not signed in.';
+        return $empty;
     }
-    $runId = gmdate('Ymd\THis') . '_' . bin2hex(random_bytes(4));
-    $destDir = $base . '/' . $runId;
-    if (!@mkdir($destDir, 0755, true)) {
-        return ['ok' => false, 'rel' => '', 'n' => 0, 'error' => 'Cannot create run directory.', 'via' => ''];
+    $destDir = sys_get_temp_dir() . DIRECTORY_SEPARATOR . 'ffetch_' . bin2hex(random_bytes(8));
+    if (!@mkdir($destDir, 0700, true)) {
+        $empty['error'] = 'Cannot create temp directory for download.';
+        return $empty;
     }
 
     $toolChoice = strtolower(trim($toolChoice));
@@ -508,37 +576,74 @@ function ff_fetch_save_media(string $url, string $toolChoice): array {
         $toolChoice = 'auto';
     }
 
+    $run = static function (string $tool, string $urlIn, string $dir) {
+        return ff_fetch_run_tool($urlIn, $tool, $dir);
+    };
+
+    $r = null;
+    $via = '';
     if ($toolChoice === 'gallery-dl') {
-        $r = ff_fetch_run_tool($url, 'gallery-dl', $destDir);
-        if ($r['ok']) {
-            $rel = 'storage/fetches/' . $runId;
-            return ['ok' => true, 'rel' => $rel, 'n' => count($r['files']), 'error' => '', 'via' => 'gallery-dl'];
+        $r = $run('gallery-dl', $url, $destDir);
+        $via = 'gallery-dl';
+    } elseif ($toolChoice === 'yt-dlp') {
+        $r = $run('yt-dlp', $url, $destDir);
+        $via = 'yt-dlp';
+    } else {
+        $r1 = $run('gallery-dl', $url, $destDir);
+        if ($r1['ok'] && $r1['files'] !== []) {
+            $r = $r1;
+            $via = 'gallery-dl';
+        } else {
+            ff_fetch_rmdir_recursive($destDir);
+            @mkdir($destDir, 0700, true);
+            $r2 = $run('yt-dlp', $url, $destDir);
+            $r = $r2;
+            $via = 'yt-dlp';
         }
-        ff_fetch_rmdir_recursive($destDir);
-        return ['ok' => false, 'rel' => '', 'n' => 0, 'error' => $r['error'], 'via' => ''];
-    }
-    if ($toolChoice === 'yt-dlp') {
-        $r = ff_fetch_run_tool($url, 'yt-dlp', $destDir);
-        if ($r['ok']) {
-            return ['ok' => true, 'rel' => 'storage/fetches/' . $runId, 'n' => count($r['files']), 'error' => '', 'via' => 'yt-dlp'];
-        }
-        ff_fetch_rmdir_recursive($destDir);
-        return ['ok' => false, 'rel' => '', 'n' => 0, 'error' => $r['error'], 'via' => ''];
     }
 
-    $r1 = ff_fetch_run_tool($url, 'gallery-dl', $destDir);
-    if ($r1['ok'] && $r1['files'] !== []) {
-        return ['ok' => true, 'rel' => 'storage/fetches/' . $runId, 'n' => count($r1['files']), 'error' => '', 'via' => 'gallery-dl'];
+    if (!$r || empty($r['ok']) || ($r['files'] ?? []) === []) {
+        $e = $r['error'] ?? 'Download failed.';
+        ff_fetch_rmdir_recursive($destDir);
+        $empty['error'] = $e;
+        return $empty;
     }
-    ff_fetch_rmdir_recursive($destDir);
-    @mkdir($destDir, 0755, true);
-    $r2 = ff_fetch_run_tool($url, 'yt-dlp', $destDir);
-    if ($r2['ok'] && $r2['files'] !== []) {
-        return ['ok' => true, 'rel' => 'storage/fetches/' . $runId, 'n' => count($r2['files']), 'error' => '', 'via' => 'yt-dlp'];
+
+    $paths = $r['files'];
+    sort($paths);
+    $max = 20;
+    if (count($paths) > $max) {
+        $paths = array_slice($paths, 0, $max);
     }
+
+    $up = ff_pb_input_media_create_fetch((string) $pbToken, $url, $via, $paths);
     ff_fetch_rmdir_recursive($destDir);
-    $parts = array_filter([$r1['error'] ?? '', $r2['error'] ?? '']);
-    return ['ok' => false, 'rel' => '', 'n' => 0, 'error' => $parts !== [] ? implode("\n\n---\n\n", $parts) : 'Download failed.', 'via' => ''];
+
+    if ($up['code'] < 200 || $up['code'] >= 300) {
+        $msg = (string) (($up['body']['message'] ?? '') ?: ($up['body']['data'] ?? '') ?: $up['raw'] ?: 'PocketBase upload failed.');
+        if (is_array($up['body']['data'] ?? null)) {
+            $msg = json_encode($up['body']['data'], JSON_UNESCAPED_UNICODE) ?: $msg;
+        }
+        $empty['error'] = 'PocketBase: ' . $msg;
+        return $empty;
+    }
+
+    $rec = $up['body'];
+    $id = (string) ($rec['id'] ?? '');
+    $names = $rec['fetched_files'] ?? [];
+    if (!is_array($names)) {
+        $names = $names !== null && $names !== '' ? [(string) $names] : [];
+    }
+    $names = array_values(array_filter(array_map('strval', $names)));
+
+    return [
+        'ok' => true,
+        'record_id' => $id,
+        'pb_files' => $names,
+        'n' => count($names),
+        'error' => '',
+        'via' => $via,
+    ];
 }
 
 if (PHP_SAPI === 'cli') {
@@ -576,12 +681,12 @@ $authHeader = $token ?: null;
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'fetch_media' && $user && $authHeader) {
     $url = (string) ($_POST['url'] ?? '');
     $tool = (string) ($_POST['tool'] ?? 'auto');
-    $res = ff_fetch_save_media($url, $tool);
+    $res = ff_fetch_save_media($url, $tool, $authHeader);
     if (!empty($res['ok'])) {
-        $runId = basename((string) ($res['rel'] ?? ''));
         $_SESSION['fetch_flash'] = [
             'ok' => true,
-            'run' => $runId,
+            'record_id' => (string) ($res['record_id'] ?? ''),
+            'pb_files' => is_array($res['pb_files'] ?? null) ? $res['pb_files'] : [],
             'n' => (int) ($res['n'] ?? 0),
             'via' => (string) ($res['via'] ?? ''),
         ];
@@ -595,25 +700,27 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'fetch
     ff_redirect_url('/?fetch_err=1');
 }
 
-if ($_SERVER['REQUEST_METHOD'] === 'GET' && isset($_GET['fetch_dl']) && $user && $authHeader) {
-    $run = (string) ($_GET['run'] ?? '');
-    $file = (string) ($_GET['file'] ?? '');
-    $path = ff_fetch_resolve_safe_path($run, $file);
-    if ($path === null) {
-        http_response_code(404);
+if ($_SERVER['REQUEST_METHOD'] === 'GET' && isset($_GET['ff_pb_file']) && $user && $authHeader) {
+    $col = (string) ($_GET['c'] ?? '');
+    $cfgCol = trim((string) ($GLOBALS['CONFIG']['input_media_collection'] ?? 'input_media'));
+    if ($cfgCol === '') {
+        $cfgCol = 'input_media';
+    }
+    if ($col !== $cfgCol) {
+        http_response_code(400);
         header('Content-Type: text/plain; charset=utf-8');
-        echo 'Not found';
+        echo 'Bad collection';
         exit;
     }
-    $mime = function_exists('mime_content_type') ? @mime_content_type($path) : false;
-    if (!is_string($mime) || $mime === '') {
-        $mime = 'application/octet-stream';
+    $rid = (string) ($_GET['id'] ?? '');
+    if ($rid === '' || !preg_match('/^[a-zA-Z0-9_-]{1,128}$/', $rid)) {
+        http_response_code(400);
+        header('Content-Type: text/plain; charset=utf-8');
+        echo 'Bad record id';
+        exit;
     }
-    header('Content-Type: ' . $mime);
-    $bn = basename($path);
-    header('Content-Disposition: attachment; filename="' . str_replace(["\r", "\n", '"'], '', $bn) . '"');
-    header('Content-Length: ' . (string) filesize($path));
-    readfile($path);
+    $fn = rawurldecode((string) ($_GET['n'] ?? ''));
+    ff_pb_proxy_file_download($col, $rid, $fn, (string) $authHeader);
     exit;
 }
 
@@ -828,9 +935,10 @@ if (is_array($fetchFlash)) {
 } else {
     $fetchFlash = null;
 }
-$fetchFlashRun = is_array($fetchFlash) && !empty($fetchFlash['ok']) && !empty($fetchFlash['run'])
-    ? (string) $fetchFlash['run'] : '';
-$fetchSavedFiles = ($flashFetchOk && $fetchFlashRun !== '') ? ff_fetch_list_run_relative_files($fetchFlashRun) : [];
+$fetchFlashRecord = is_array($fetchFlash) && !empty($fetchFlash['ok']) && !empty($fetchFlash['record_id'])
+    ? (string) $fetchFlash['record_id'] : '';
+$fetchPbFiles = ($flashFetchOk && is_array($fetchFlash) && !empty($fetchFlash['pb_files']) && is_array($fetchFlash['pb_files']))
+    ? $fetchFlash['pb_files'] : [];
 
 if (isset($_GET['privacy'])) {
     header('Content-Type: text/html; charset=utf-8');
@@ -964,7 +1072,7 @@ header('Content-Type: text/html; charset=utf-8');
 
         <div class="card">
             <h2>Fetch</h2>
-            <p style="font-size:.8125rem;">Downloads run on this server (gallery-dl / yt-dlp), then you can grab files below.</p>
+            <p style="font-size:.8125rem;">Runs gallery-dl / yt-dlp on this server, uploads into PocketBase <code style="color:#8b949e;">input_media</code> (<code style="color:#8b949e;">fetched_files</code>). Download copies here or open the record in Admin.</p>
             <?php if ($flashFetchOk): ?>
                 <p class="flash ok"><?php
                     if (is_array($fetchFlash) && !empty($fetchFlash['ok'])) {
@@ -977,12 +1085,12 @@ header('Content-Type: text/html; charset=utf-8');
                         echo 'Saved.';
                     }
                 ?></p>
-                <?php if ($fetchSavedFiles !== []): ?>
-                    <p style="font-size:.8125rem;margin:.25rem 0 0;">Download to your device:</p>
+                <?php if ($fetchPbFiles !== [] && $fetchFlashRecord !== ''): ?>
+                    <p style="font-size:.8125rem;margin:.25rem 0 0;">Download (from PocketBase):</p>
                     <ul class="fetch-files">
-                        <?php foreach ($fetchSavedFiles as $rel): ?>
+                        <?php foreach ($fetchPbFiles as $pfn): ?>
                             <li>
-                                <a href="/?fetch_dl=1&amp;run=<?php echo rawurlencode($fetchFlashRun); ?>&amp;file=<?php echo rawurlencode($rel); ?>"><?php echo htmlspecialchars($rel, ENT_QUOTES | ENT_HTML5, 'UTF-8'); ?></a>
+                                <a href="/?ff_pb_file=1&amp;c=<?php echo rawurlencode((string) ($CONFIG['input_media_collection'] ?? 'input_media')); ?>&amp;id=<?php echo rawurlencode($fetchFlashRecord); ?>&amp;n=<?php echo rawurlencode((string) $pfn); ?>"><?php echo htmlspecialchars((string) $pfn, ENT_QUOTES | ENT_HTML5, 'UTF-8'); ?></a>
                             </li>
                         <?php endforeach; ?>
                     </ul>
