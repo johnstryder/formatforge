@@ -1,8 +1,0 @@
-#!/bin/bash
-# Template — install script copies to /usr/local/sbin/formatforge-pipeline-cron with FORMATFORGE_ROOT set.
-set -euo pipefail
-FORMATFORGE_ROOT="REPLACE_WITH_ABSOLUTE_REPO_PATH"
-cd "$FORMATFORGE_ROOT"
-PHP_BIN="${PHP_CLI_BINARY:-/usr/bin/php}"
-LOG="${FF_PIPELINE_CRON_LOG:-/var/log/formatforge-pipeline-cron.log}"
-exec "$PHP_BIN" index.php pipeline-cron-tick >>"$LOG" 2>&1

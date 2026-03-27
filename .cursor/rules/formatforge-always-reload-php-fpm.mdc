@@ -1,0 +1,17 @@
+---
+description: After any PHP app change, reload PHP-FPM on the host (opcache) — do not skip
+alwaysApply: true
+---
+
+# Always reload PHP-FPM
+
+After you **change** **`index.php`** or **`config.php`** (the deployed FormatForge app), treat the task as **unfinished** until **PHP-FPM has been reloaded** on the Linux host so **opcache** picks up the new code.
+
+## Run on the host
+
+1. **`php -l`** on the file you edited (syntax check).
+2. **`sudo systemctl reload php8.3-fpm`** — or the unit that matches the pool socket (**`scripts/align-php-fpm-socket.sh`**, **`ls /run/php/*.sock`**: `php8.2-fpm` / `php8.4-fpm` when applicable).
+
+**nginx-only** edits do not require FPM reload; use the nginx rule. **PHP edits** require FPM reload even if nginx was not touched.
+
+If **`sudo`** or **`systemctl`** are unavailable in the agent environment, run what you can and **explicitly** tell the operator which **`systemctl reload …`** command still must run on the server.

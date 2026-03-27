@@ -1,0 +1,20 @@
+---
+description: Do not create or edit prose markdown (*.md, *.mdx, …); Cursor rules (.mdc) only when user asks
+alwaysApply: true
+---
+
+# No markdown documentation files
+
+- **Do not** create, edit, rename, or restore **prose/documentation** markdown in this repo: `*.md`, `*.mdx`, `*.markdown`, and similar (e.g. root `README.md`, `DEPLOYMENT.md`, `docs/**/*.md`).
+- **Do not** add new `.md` “notes” or README-style files unless the user **explicitly** names a path and asks for that file.
+- **Exception — Cursor rules:** `.cursor/rules/*.mdc` is allowed **only** when the user clearly requests a rule change (e.g. `/create-rule`, “add a cursor rule”). Those files use `.mdc`, not `.md`.
+- Prefer **inline comments** in code, **`.env.example` comments**, or **PocketBase** fields for operational notes instead of new markdown files.
+
+## Examples
+
+```text
+❌ Add README.md explaining the feature
+❌ Restore DEPLOYMENT.md after it was removed
+✅ Document behavior in index.php docblock or .env.example
+✅ User: “create-rule …” → write `.cursor/rules/foo.mdc`
+```

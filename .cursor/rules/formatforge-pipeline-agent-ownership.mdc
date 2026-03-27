@@ -1,23 +1,8 @@
 ---
-description: Pipelines are owned by pipeline agents only
+description: Pipeline agent tree removed from this repo
 alwaysApply: true
 ---
 
-# Pipeline Agent Ownership
+# Pipelines / Cursor agents
 
-`pipelines/` is pipeline-agent-owned territory.
-
-## Hard rule
-
-- Do not create, edit, delete, or rename files under `pipelines/**`.
-- Do not modify pipeline binaries, env files, docs, prompts, or generated artifacts inside `pipelines/**`.
-- Do not directly create/update/delete PocketBase `pipelines` records from normal app tasks.
-
-## Required behavior
-
-- If a user request needs pipeline changes, route it through the pipeline-agent flow (trigger/edit loop/orchestrator path) instead of direct edits.
-- If a change would touch `pipelines/**`, stop and report that pipeline agents must handle it.
-
-## Why
-
-Pipeline code and records must remain consistent with orchestrator state, agent UUID continuity, and step-chain artifacts.
+This deployment **does not** ship a `pipelines/` directory or Cursor-based pipeline agents. Do not reintroduce pipeline-agent automation, `.cursor-pipeline/` trigger flows, or `cursor-agent-run` unless the human explicitly asks to restore that architecture.
