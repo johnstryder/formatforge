@@ -1,102 +1,122 @@
 <?php
+
+declare(strict_types=1);
+
 /**
- * FormatForge — PocketBase + Alpine.js (single file).
+ * Carousel Generator (tarball UI) + PocketBase auth, Meta/Instagram OAuth,
+ * Gemini vector embeddings API, and optional prompts row creation.
  */
 
 session_start();
 
-if (is_file(__DIR__ . '/.env')) {
-    foreach (file(__DIR__ . '/.env', FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) ?: [] as $line) {
-        if (str_starts_with(trim($line), '#')) {
-            continue;
-        }
-        if (preg_match('/^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/', $line, $m)) {
-            putenv(trim($m[1]) . '=' . trim($m[2], " \t\"'"));
+$__ffRoot = __DIR__;
+$envFile = $__ffRoot . DIRECTORY_SEPARATOR . '.env';
+if (is_readable($envFile)) {
+    $lines = file($envFile, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
+    if ($lines !== false) {
+        foreach ($lines as $line) {
+            $line = trim($line);
+            if ($line === '' || str_starts_with($line, '#') || !str_contains($line, '=')) {
+                continue;
+            }
+            [$key, $value] = explode('=', $line, 2);
+            $key = trim($key);
+            $value = trim($value, " \t\"'");
+            $_ENV[$key] = $value;
+            putenv($key . '=' . $value);
         }
     }
 }
 
-/** First readable Netscape cookies file under storage/cookies (see also GALLERY_DL_COOKIES / YT_DLP_COOKIES in .env). */
-function ff_pick_storage_cookie_file(): string {
-    $dir = __DIR__ . '/storage/cookies';
-    foreach (['instagram_cookies.txt', 'cookies.txt'] as $name) {
-        $p = $dir . '/' . $name;
-        if (is_file($p) && is_readable($p) && (int) @filesize($p) > 32) {
-            return $p;
-        }
+/** @return string|false Value from env, or default when set and non-empty, or false when missing and no default. */
+function cg_env(string $key, string $default = ''): string|false
+{
+    $v = $_ENV[$key] ?? getenv($key);
+    if ($v === false || $v === null || $v === '') {
+        return $default !== '' ? $default : false;
     }
-    return '';
+    $s = trim((string) $v);
+
+    return $s !== '' ? $s : ($default !== '' ? $default : false);
 }
 
-function ff_fetch_executable(string $configured, string $fallbackName): string {
-    $configured = trim($configured);
-    $fallbackName = trim($fallbackName) ?: 'gallery-dl';
-    $base = $fallbackName;
-    if ($configured !== '') {
-        $base = str_starts_with($configured, '/') ? basename($configured) : $configured;
+/** @return array<int, mixed>|null */
+function cg_parse_slides_json(string $content): ?array
+{
+    $content = trim($content);
+    if ($content === '') {
+        return null;
     }
-    if ($base === '' || $base === '.' || $base === '..') {
-        $base = $fallbackName;
+    if (preg_match('/```(?:json)?\s*([\s\S]*?)\s*```/m', $content, $m)) {
+        $content = trim($m[1]);
     }
-    $candidates = [];
-    if ($configured !== '' && str_starts_with($configured, '/')) {
-        $candidates[] = $configured;
+    $decoded = json_decode($content, true);
+    if (!is_array($decoded) || !isset($decoded['slides']) || !is_array($decoded['slides'])) {
+        return null;
     }
-    $candidates[] = '/opt/ff-fetch/bin/' . $base;
-    $candidates[] = '/usr/bin/' . $base;
-    $candidates[] = '/usr/local/bin/' . $base;
-    $home = getenv('HOME');
-    if (is_string($home) && $home !== '') {
-        $candidates[] = rtrim($home, '/') . '/.local/bin/' . $base;
-    }
-    $seen = [];
-    foreach ($candidates as $c) {
-        if ($c === '' || isset($seen[$c])) {
-            continue;
-        }
-        $seen[$c] = true;
-        if (@is_file($c) && @is_executable($c)) {
-            return $c;
-        }
-    }
-    return $base;
-}
 
-function ff_fetch_path_env_prefix(): string {
-    $parts = ['/opt/ff-fetch/bin', '/usr/bin', '/usr/local/bin', '/bin', '/sbin'];
-    $home = getenv('HOME');
-    if (is_string($home) && $home !== '') {
-        array_unshift($parts, rtrim($home, '/') . '/.local/bin');
-    }
-    $existing = getenv('PATH');
-    if (is_string($existing) && $existing !== '') {
-        $parts[] = $existing;
-    }
-    return 'PATH=' . escapeshellarg(implode(':', $parts)) . ' ';
-}
-
-function ff_fetch_env_prefix(): string {
-    $out = ff_fetch_path_env_prefix();
-    $sites = @glob('/opt/ff-fetch/lib/python3.*/site-packages', GLOB_ONLYDIR) ?: [];
-    if ($sites !== [] && is_dir($sites[0])) {
-        $out = 'PYTHONPATH=' . escapeshellarg($sites[0]) . ' ' . $out;
-    }
-    return $out;
-}
-
-function ff_resolve_fetch_bin(string $envVar, string $fallbackName): string {
-    $raw = getenv($envVar);
-    $path = ($raw !== false && trim((string) $raw) !== '') ? trim((string) $raw) : $fallbackName;
-    if (str_starts_with($path, '/')) {
-        return (is_file($path) && is_executable($path)) ? $path : ff_fetch_executable($fallbackName, $fallbackName);
-    }
-    return ff_fetch_executable($path, $fallbackName);
+    return $decoded['slides'];
 }
 
 /**
- * @return array{url: string, source: string}
+ * Query action=… for API routes. Some stacks omit $_GET on POST; fall back to QUERY_STRING / REQUEST_URI.
  */
-function ff_resolve_pocketbase_url_meta(): array {
+function ff_request_action(): string
+{
+    $a = $_GET['action'] ?? null;
+    if (is_string($a) && $a !== '') {
+        return $a;
+    }
+    $qs = $_SERVER['QUERY_STRING'] ?? '';
+    if (is_string($qs) && $qs !== '' && preg_match('/(?:^|&)action=([^&]*)/', $qs, $m)) {
+        return rawurldecode(str_replace('+', ' ', $m[1]));
+    }
+    $uri = $_SERVER['REQUEST_URI'] ?? '';
+    if (is_string($uri) && $uri !== '' && preg_match('/[?&]action=([^&]*)/', $uri, $m)) {
+        return rawurldecode(str_replace('+', ' ', $m[1]));
+    }
+
+    return '';
+}
+
+/** Comma-separated override in FF_ALLOWED_EMAILS; default is the two operator accounts. */
+function ff_gate_allowed_emails(): array
+{
+    $env = trim((string) (getenv('FF_ALLOWED_EMAILS') ?: ''));
+    if ($env !== '') {
+        $out = [];
+        foreach (explode(',', $env) as $p) {
+            $p = strtolower(trim($p));
+            if ($p !== '') {
+                $out[] = $p;
+            }
+        }
+        if ($out !== []) {
+            return $out;
+        }
+    }
+
+    return ['jnstrdm05@gmail.com', 'dan@bbxp.app'];
+}
+
+function ff_gate_email_allowed(?string $email): bool
+{
+    $e = strtolower(trim((string) $email));
+
+    return $e !== '' && in_array($e, ff_gate_allowed_emails(), true);
+}
+
+/** PocketBase session present and email on the allowlist. */
+function ff_gate_session_ok(): bool
+{
+    $u = $_SESSION['pb_user'] ?? null;
+    $tok = $_SESSION['pb_token'] ?? null;
+
+    return is_array($u) && is_string($tok) && trim($tok) !== '' && ff_gate_email_allowed($u['email'] ?? null);
+}
+
+function ff_resolve_pocketbase_url_meta(): array
+{
     $env = trim((string) (getenv('POCKETBASE_URL') ?: ''));
     if ($env !== '') {
         return ['url' => rtrim($env, '/'), 'source' => 'POCKETBASE_URL'];
@@ -111,6 +131,7 @@ function ff_resolve_pocketbase_url_meta(): array {
             }
         }
     }
+
     return ['url' => 'http://127.0.0.1:8090', 'source' => 'default'];
 }
 
@@ -133,6 +154,8 @@ if (!$siteUrl) {
 }
 $pbPublicUrl = getenv('POCKETBASE_PUBLIC_URL') ?: rtrim((string) $siteUrl, '/');
 
+$defaultIgScope = 'instagram_basic,instagram_content_publish,pages_show_list,pages_read_engagement,business_management';
+$igScopeEnv = trim((string) (getenv('INSTAGRAM_OAUTH_SCOPE') ?: ''));
 $CONFIG = [
     'pocketbase_url' => $pbUrl,
     'pocketbase_url_resolution' => $_ffPbMeta['source'],
@@ -140,41 +163,45 @@ $CONFIG = [
     'pocketbase_admin_url' => rtrim($pbPublicUrl, '/') . '/_/',
     'site_url' => $siteUrl,
     'site_name' => getenv('SITE_NAME') ?: 'FormatForge',
-    'app_version' => getenv('APP_VERSION') ?: 'v1.1.230',
-    'gallery_dl_path' => ff_resolve_fetch_bin('GALLERY_DL_PATH', 'gallery-dl'),
-    'yt_dlp_path' => ff_resolve_fetch_bin('YT_DLP_PATH', 'yt-dlp'),
-    'users_collection' => 'users',
+    'app_version' => getenv('APP_VERSION') ?: 'v1.1.275',
+    'users_collection' => getenv('USERS_COLLECTION') ?: 'users',
     'fb_app_id' => getenv('FB_APP_ID') ?: '',
     'fb_app_secret' => getenv('FB_APP_SECRET') ?: '',
     'instagram_redirect' => getenv('INSTAGRAM_REDIRECT_URI') ?: '',
-    /** Instagram / Facebook Login: shown in UI and sent to Meta OAuth dialog. */
-    'instagram_oauth_scope' => 'instagram_basic,instagram_content_publish,pages_show_list,pages_read_engagement,business_management',
-    /** PocketBase collection for Fetch uploads (fetched_files field; see pb_migrations). */
+    'instagram_oauth_scope' => $igScopeEnv !== '' ? $igScopeEnv : $defaultIgScope,
     'input_media_collection' => getenv('INPUT_MEDIA_COLLECTION') ?: 'input_media',
-    /** PocketBase collection for prompts + Gemini embeddings (pb_migrations/1774800000_prompts_collection.js, 1774900000_prompts_gemini_schema_merge.js). */
+    'output_media_collection' => getenv('OUTPUT_MEDIA_COLLECTION') ?: 'output_media',
     'prompts_collection' => getenv('PROMPTS_COLLECTION') ?: 'prompts',
+    'garage_endpoint' => rtrim((string) (getenv('GARAGE_ENDPOINT') ?: ''), '/'),
+    'garage_access_key' => getenv('GARAGE_ACCESS_KEY') ?: '',
+    'garage_secret_key' => getenv('GARAGE_SECRET_KEY') ?: '',
+    'garage_region' => getenv('GARAGE_REGION') ?: 'garage',
+    'garage_bucket' => getenv('GARAGE_BUCKET') ?: '',
+    'garage_social_content_bucket' => trim((string) (getenv('GARAGE_SOCIAL_CONTENT_BUCKET') ?: '')) !== ''
+        ? trim((string) getenv('GARAGE_SOCIAL_CONTENT_BUCKET'))
+        : (trim((string) (getenv('GARAGE_BUCKET') ?: '')) !== '' ? trim((string) getenv('GARAGE_BUCKET')) : 'formatforge-social'),
+    // Public web endpoint for the social bucket (virtual-hosted style: {bucket}.web.{domain} or full base URL).
+    'garage_public_url' => rtrim((string) (getenv('GARAGE_PUBLIC_URL') ?: ''), '/'),
+    'garage_public_root_domain' => trim((string) (getenv('GARAGE_PUBLIC_ROOT_DOMAIN') ?: '')),
+    'garage_public_scheme' => strtolower(trim((string) (getenv('GARAGE_PUBLIC_SCHEME') ?: 'https'))) ?: 'https',
 ];
 
 if (is_file(__DIR__ . '/config.php')) {
     $CONFIG = array_merge($CONFIG, require __DIR__ . '/config.php');
 }
 
-$cookieDefault = ff_pick_storage_cookie_file();
-if (trim((string) ($CONFIG['gallery_dl_cookies'] ?? '')) === '') {
-    $CONFIG['gallery_dl_cookies'] = trim((string) (getenv('GALLERY_DL_COOKIES') ?: '')) ?: $cookieDefault;
-}
-if (trim((string) ($CONFIG['yt_dlp_cookies'] ?? '')) === '') {
-    $CONFIG['yt_dlp_cookies'] = trim((string) (getenv('YT_DLP_COOKIES') ?: '')) ?: (string) ($CONFIG['gallery_dl_cookies'] ?? '');
-}
-
-/** @var array<string, mixed> $CONFIG */
 $GLOBALS['CONFIG'] = $CONFIG;
 
 /**
  * @return array{code: int, body: array, raw: string, curl_errno: int}
  */
-function pb_request(string $method, string $path, $data = null, ?string $token = null): array {
-    $ch = curl_init($GLOBALS['CONFIG']['pocketbase_url'] . $path);
+function pb_request(string $method, string $path, $data = null, ?string $token = null): array
+{
+    $url = $GLOBALS['CONFIG']['pocketbase_url'] . $path;
+    $ch = curl_init($url);
+    if ($ch === false) {
+        return ['code' => 0, 'body' => [], 'raw' => '', 'curl_errno' => CURLE_FAILED_INIT];
+    }
     $headers = ['Accept: application/json'];
     $methodUpper = strtoupper($method);
     $sendsBody = $data !== null && in_array($methodUpper, ['POST', 'PATCH', 'PUT'], true);
@@ -201,70 +228,16 @@ function pb_request(string $method, string $path, $data = null, ?string $token =
     $errNo = curl_errno($ch);
     curl_close($ch);
     $body = json_decode($res ?: '{}', true) ?? [];
+
     return ['code' => $code, 'body' => $body, 'raw' => $res ?: '', 'curl_errno' => $errNo];
 }
 
-/** @param array<string, string> $textFields name => scalar string for multipart */
-function ff_pb_multipart_escape_name(string $name): string {
-    return str_replace(["\r", "\n", '"'], '', $name);
-}
-
 /**
- * Create record with one file via raw multipart (avoids PHP CURL quirks with JSON+PATCH).
- *
- * @param array<string, string> $textFields
- * @return array{code: int, body: array, raw: string}
- */
-function ff_pb_multipart_create_record_with_file(string $token, string $col, array $textFields, string $fileField, string $absPath, string $mimeType, string $filename): array {
-    $base = rtrim((string) ($GLOBALS['CONFIG']['pocketbase_url'] ?? ''), '/');
-    $url = $base . '/api/collections/' . rawurlencode($col) . '/records';
-    $bin = @file_get_contents($absPath);
-    if ($bin === false) {
-        return ['code' => 0, 'body' => ['message' => 'Could not read file for upload.'], 'raw' => ''];
-    }
-    $b = '----FFetch' . bin2hex(random_bytes(16));
-    $fn = str_replace(["\r", "\n", '"'], '', $filename);
-    $mimeType = str_replace(["\r", "\n"], '', $mimeType);
-    $fk = ff_pb_multipart_escape_name($fileField);
-    $out = '';
-    foreach ($textFields as $k => $v) {
-        $kn = ff_pb_multipart_escape_name((string) $k);
-        $out .= '--' . $b . "\r\nContent-Disposition: form-data; name=\"{$kn}\"\r\n\r\n" . $v . "\r\n";
-    }
-    $out .= '--' . $b . "\r\nContent-Disposition: form-data; name=\"{$fk}\"; filename=\"{$fn}\"\r\nContent-Type: {$mimeType}\r\n\r\n";
-    $out .= $bin;
-    $out .= "\r\n--" . $b . "--\r\n";
-    $body = $out;
-    $t = trim($token);
-    if (stripos($t, 'Bearer ') !== 0) {
-        $t = 'Bearer ' . $t;
-    }
-    $ch = curl_init($url);
-    curl_setopt_array($ch, [
-        CURLOPT_POST => true,
-        CURLOPT_POSTFIELDS => $body,
-        CURLOPT_RETURNTRANSFER => true,
-        CURLOPT_HTTPHEADER => [
-            'Accept: application/json',
-            'Authorization: ' . $t,
-            'Content-Type: multipart/form-data; boundary=' . $b,
-        ],
-    ]);
-    $res = curl_exec($ch);
-    $code = (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
-    curl_close($ch);
-    $parsed = json_decode($res ?: '{}', true) ?? [];
-
-    return ['code' => $code, 'body' => $parsed, 'raw' => $res ?: ''];
-}
-
-/**
- * Unwrap PocketBase-style or proxy-wrapped JSON so id / fetched_files are on one object.
- *
  * @param array<string, mixed> $body
  * @return array<string, mixed>
  */
-function ff_pb_normalize_api_record(array $body): array {
+function ff_pb_normalize_api_record(array $body): array
+{
     if (isset($body['data']) && is_array($body['data'])) {
         return $body['data'];
     }
@@ -275,42 +248,28 @@ function ff_pb_normalize_api_record(array $body): array {
     return $body;
 }
 
-/** True only if the API body explicitly lists at least one stored name in fetched_files (maxSelect>1 → array). */
-function ff_pb_fetched_files_nonempty_strict(array $rec): bool {
-    $rec = ff_pb_normalize_api_record($rec);
-    if (!array_key_exists('fetched_files', $rec)) {
-        return false;
+/**
+ * Safe list of records from a PocketBase list response (avoids offset access on non-array body).
+ *
+ * @param array{code?: int, body?: mixed} $pbResponse
+ * @return list<array<string, mixed>>
+ */
+function ff_pb_list_items(array $pbResponse): array
+{
+    if (($pbResponse['code'] ?? 0) !== 200) {
+        return [];
     }
-    $ff = $rec['fetched_files'];
-    if ($ff === null) {
-        return false;
+    $body = $pbResponse['body'] ?? null;
+    if (!is_array($body)) {
+        return [];
     }
-    if (is_string($ff)) {
-        return trim($ff) !== '';
-    }
-    if (is_array($ff)) {
-        if ($ff === []) {
-            return false;
-        }
-        foreach ($ff as $item) {
-            if (is_string($item) && trim($item) !== '') {
-                return true;
-            }
-            if (is_array($item) && trim((string) ($item['name'] ?? '')) !== '') {
-                return true;
-            }
-        }
+    $items = $body['items'] ?? null;
 
-        return false;
-    }
-
-    return false;
+    return is_array($items) ? $items : [];
 }
 
-/**
- * PocketBase record id from API JSON (string ids; tolerate int in older responses).
- */
-function ff_pb_body_record_id(array $rec): string {
+function ff_pb_body_record_id(array $rec): string
+{
     $rec = ff_pb_normalize_api_record($rec);
     if (!array_key_exists('id', $rec)) {
         return '';
@@ -326,29 +285,8 @@ function ff_pb_body_record_id(array $rec): string {
     return '';
 }
 
-/**
- * Ensure body used by callers always includes id when we already know it (multipart/PATCH sometimes omit id).
- *
- * @param array<string, mixed> $body
- * @return array<string, mixed>
- */
-function ff_pb_merge_record_id_into_body(array $body, string $recordId): array {
-    $body = ff_pb_normalize_api_record($body);
-    $recordId = trim($recordId);
-    if ($recordId === '') {
-        return $body;
-    }
-    if (ff_pb_body_record_id($body) === '') {
-        $body['id'] = $recordId;
-    }
-
-    return $body;
-}
-
-/**
- * PocketBase validation / API error body (message + optional data); no record id.
- */
-function ff_pb_extract_error_message(array $body): string {
+function ff_pb_extract_error_message(array $body): string
+{
     $m = $body['message'] ?? null;
     if (!is_string($m) || trim($m) === '') {
         return '';
@@ -365,741 +303,13 @@ function ff_pb_extract_error_message(array $body): string {
 }
 
 /**
- * After create/PATCH, require a real row with files (same instance as POCKETBASE_URL) or fail closed.
- *
- * @return array{ok: bool, body: array, message: string}
- */
-function ff_pb_finalize_fetch_upload(string $token, string $col, array $body): array {
-    $rid = ff_pb_body_record_id($body);
-    $body = ff_pb_merge_record_id_into_body(ff_pb_normalize_api_record($body), $rid);
-    if ($rid === '') {
-        return ['ok' => false, 'body' => $body, 'message' => 'PocketBase response did not include a record id after upload.'];
-    }
-    $g = pb_request('GET', '/api/collections/' . rawurlencode($col) . '/records/' . rawurlencode($rid), null, $token);
-    if ($g['code'] < 200 || $g['code'] >= 300) {
-        return [
-            'ok' => false,
-            'body' => $body,
-            'message' => 'PocketBase did not return the new record (HTTP ' . $g['code'] . '). Confirm POCKETBASE_URL matches the admin UI database and that input_media list/view rules allow this user.',
-        ];
-    }
-    $gBody = ff_pb_normalize_api_record($g['body']);
-    if (!ff_pb_fetched_files_nonempty_strict($gBody)) {
-        return [
-            'ok' => false,
-            'body' => $body,
-            'message' => 'Record exists but fetched_files is empty after save. Check input_media schema (fetched_files field) and PocketBase file limits.',
-        ];
-    }
-
-    return ['ok' => true, 'body' => ff_pb_merge_record_id_into_body($gBody, $rid), 'message' => ''];
-}
-
-/**
- * Create response may omit file fields; confirm with GET so we never return "ok" with an empty file slot.
- *
- * @return array{ok: bool, body: array, reason: string}
- */
-function ff_pb_verify_fetched_files_on_record(string $token, string $col, string $recordId, array $respBody): array {
-    if (ff_pb_fetched_files_nonempty_strict($respBody)) {
-        return ['ok' => true, 'body' => ff_pb_merge_record_id_into_body($respBody, $recordId), 'reason' => ''];
-    }
-    $g = pb_request('GET', '/api/collections/' . rawurlencode($col) . '/records/' . rawurlencode($recordId), null, $token);
-    $gBody = is_array($g['body'] ?? null) ? $g['body'] : [];
-    if ($g['code'] >= 200 && $g['code'] < 300 && ff_pb_fetched_files_nonempty_strict($gBody)) {
-        return ['ok' => true, 'body' => ff_pb_merge_record_id_into_body($gBody, $recordId), 'reason' => ''];
-    }
-    $reason = 'PATCH response had no usable fetched_files; ';
-    if ($g['code'] < 200 || $g['code'] >= 300) {
-        $reason .= 'GET /records/' . $recordId . ' returned HTTP ' . $g['code'] . '. ' . ff_pb_extract_error_message($gBody);
-        if ($g['code'] === 403 || $g['code'] === 401) {
-            $reason .= ' (check input_media viewRule — must allow this user to read the record after upload).';
-        }
-    } else {
-        $norm = ff_pb_normalize_api_record($gBody);
-        if (!array_key_exists('fetched_files', $norm)) {
-            $reason .= 'GET succeeded but the record has no fetched_files field. The input_media collection in PocketBase is missing that File field (PATCH uploads are ignored). In Admin → Collections → input_media, add a File field named fetched_files (max files ≥ 1), or apply migration pb_migrations/1774700000_input_media_fetched_files.js and restart PocketBase.';
-        } else {
-            $reason .= 'GET succeeded but fetched_files is empty. Check PocketBase file size limits and MIME settings for that field.';
-        }
-    }
-
-    return ['ok' => false, 'body' => ($g['code'] ?? 0) >= 200 && ($g['code'] ?? 0) < 300 ? $gBody : $respBody, 'reason' => $reason];
-}
-
-/**
- * PATCH one file part using raw multipart (more reliable than CURLFile+PATCH on some PHP/cURL builds).
- *
- * @return array{code: int, body: array, raw: string}
- */
-function ff_pb_multipart_patch_record_with_file(string $token, string $col, string $recordId, string $fileField, string $absPath, string $mimeType, string $filename): array {
-    $base = rtrim((string) ($GLOBALS['CONFIG']['pocketbase_url'] ?? ''), '/');
-    $url = $base . '/api/collections/' . rawurlencode($col) . '/records/' . rawurlencode($recordId);
-    $bin = @file_get_contents($absPath);
-    if ($bin === false) {
-        return ['code' => 0, 'body' => ['message' => 'Could not read file for upload.'], 'raw' => ''];
-    }
-    $b = '----FFPatch' . bin2hex(random_bytes(16));
-    $fn = str_replace(["\r", "\n", '"'], '', $filename);
-    $mimeType = str_replace(["\r", "\n"], '', $mimeType);
-    $fk = ff_pb_multipart_escape_name($fileField);
-    $out = '--' . $b . "\r\nContent-Disposition: form-data; name=\"{$fk}\"; filename=\"{$fn}\"\r\nContent-Type: {$mimeType}\r\n\r\n";
-    $out .= $bin;
-    $out .= "\r\n--" . $b . "--\r\n";
-    $t = trim($token);
-    if (stripos($t, 'Bearer ') !== 0) {
-        $t = 'Bearer ' . $t;
-    }
-    $ch = curl_init($url);
-    curl_setopt_array($ch, [
-        CURLOPT_CUSTOMREQUEST => 'PATCH',
-        CURLOPT_POSTFIELDS => $out,
-        CURLOPT_RETURNTRANSFER => true,
-        CURLOPT_HTTPHEADER => [
-            'Accept: application/json',
-            'Authorization: ' . $t,
-            'Content-Type: multipart/form-data; boundary=' . $b,
-        ],
-    ]);
-    $res = curl_exec($ch);
-    $code = (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
-    curl_close($ch);
-    $parsed = json_decode($res ?: '{}', true) ?? [];
-
-    return ['code' => $code, 'body' => $parsed, 'raw' => $res ?: ''];
-}
-
-/**
- * Fallback: libcurl multipart (CURLFile). Kept after raw multipart in case a host behaves differently.
- *
- * @return array{code: int, body: array, raw: string}
- */
-function ff_pb_patch_record_file(string $token, string $col, string $recordId, string $formField, string $absPath, string $mimeType, string $basename): array {
-    $file = new CURLFile($absPath, $mimeType, $basename);
-    $base = rtrim((string) ($GLOBALS['CONFIG']['pocketbase_url'] ?? ''), '/');
-    $url = $base . '/api/collections/' . rawurlencode($col) . '/records/' . rawurlencode($recordId);
-    $t = trim($token);
-    if (stripos($t, 'Bearer ') !== 0) {
-        $t = 'Bearer ' . $t;
-    }
-    $ch = curl_init($url);
-    curl_setopt_array($ch, [
-        CURLOPT_CUSTOMREQUEST => 'PATCH',
-        CURLOPT_POSTFIELDS => [$formField => $file],
-        CURLOPT_RETURNTRANSFER => true,
-        CURLOPT_HTTPHEADER => ['Accept: application/json', 'Authorization: ' . $t],
-    ]);
-    $res = curl_exec($ch);
-    $code = (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
-    curl_close($ch);
-    $body = json_decode($res ?: '{}', true) ?? [];
-
-    return ['code' => $code, 'body' => $body, 'raw' => $res ?: ''];
-}
-
-/**
- * One input_media row with a single fetched_files file (carousels / albums → one PocketBase record per slide).
- * Tries raw multipart create first; falls back to JSON create + PATCH file (fresh CURLFile each try).
- *
- * @param array<string, mixed> $metaJson merged into metadata (e.g. carousel_index, fetch_batch_id)
- * @return array{code: int, body: array, raw: string}
- */
-function ff_pb_input_media_create_fetch_one(string $token, string $sourceUrl, string $title, string $via, string $absPath, array $metaJson = []): array {
-    $cfg = $GLOBALS['CONFIG'];
-    $col = trim((string) ($cfg['input_media_collection'] ?? 'input_media'));
-    if ($col === '') {
-        $col = 'input_media';
-    }
-    if (!is_file($absPath) || !is_readable($absPath)) {
-        return ['code' => 0, 'body' => ['message' => 'Missing or unreadable file for upload.'], 'raw' => ''];
-    }
-    if (!class_exists(CURLFile::class)) {
-        return ['code' => 0, 'body' => ['message' => 'PHP CURLFile unavailable (install/enable php-curl).'], 'raw' => ''];
-    }
-    if (strlen($title) > 200) {
-        $title = substr($title, 0, 200);
-    }
-    $meta = array_merge(['via' => $via], $metaJson, ['fetched_at' => gmdate('c')]);
-    $metaStr = json_encode($meta, JSON_UNESCAPED_UNICODE);
-    if ($metaStr === false) {
-        $metaStr = '{}';
-    }
-    $mimeType = 'application/octet-stream';
-    if (function_exists('mime_content_type')) {
-        $mt = @mime_content_type($absPath);
-        if (is_string($mt) && $mt !== '') {
-            $mimeType = $mt;
-        }
-    }
-    $baseName = basename($absPath);
-
-    // Multipart form values are strings; do not send bool as the string "true" — PocketBase rejects it
-    // (validation error: { message, data }). Set is_active via JSON PATCH after create (see below).
-    $textFields = [
-        'role' => 'fetched',
-        'status' => 'fetched',
-        'url' => $sourceUrl,
-        'input_url' => $sourceUrl,
-        'title' => $title,
-        'metadata' => $metaStr,
-    ];
-    $mp = ff_pb_multipart_create_record_with_file($token, $col, $textFields, 'fetched_files', $absPath, $mimeType, $baseName);
-    if ($mp['code'] >= 200 && $mp['code'] < 300) {
-        if (ff_pb_body_record_id($mp['body']) === '' && ff_pb_extract_error_message($mp['body']) !== '') {
-            return ['code' => 400, 'body' => $mp['body'], 'raw' => $mp['raw']];
-        }
-        $mid = ff_pb_body_record_id($mp['body']);
-        if ($mid !== '') {
-            $mv = ff_pb_verify_fetched_files_on_record($token, $col, $mid, $mp['body']);
-            if ($mv['ok']) {
-                $body = ff_pb_merge_record_id_into_body($mv['body'], $mid);
-                $pact = pb_request('PATCH', '/api/collections/' . rawurlencode($col) . '/records/' . rawurlencode($mid), ['is_active' => true], $token);
-                if ($pact['code'] >= 200 && $pact['code'] < 300 && is_array($pact['body'])) {
-                    $body = ff_pb_merge_record_id_into_body(ff_pb_normalize_api_record($pact['body']), $mid);
-                }
-                $fin = ff_pb_finalize_fetch_upload($token, $col, $body);
-                if (!$fin['ok']) {
-                    ff_pb_delete_input_media_record($token, $mid);
-
-                    return ['code' => 0, 'body' => ['message' => $fin['message']], 'raw' => $mp['raw']];
-                }
-
-                return ['code' => $mp['code'], 'body' => $fin['body'], 'raw' => $mp['raw']];
-            }
-            ff_pb_delete_input_media_record($token, $mid);
-        }
-    }
-
-    $payload = [
-        'role' => 'fetched',
-        'status' => 'fetched',
-        'url' => $sourceUrl,
-        'input_url' => $sourceUrl,
-        'title' => $title,
-        'is_active' => true,
-        'metadata' => $meta,
-    ];
-    $create = pb_request('POST', '/api/collections/' . rawurlencode($col) . '/records', $payload, $token);
-    if ($create['code'] < 200 || $create['code'] >= 300) {
-        return $create;
-    }
-    $id = ff_pb_body_record_id($create['body']);
-    if ($id === '') {
-        return ['code' => 0, 'body' => ['message' => 'PocketBase create returned no id.'], 'raw' => $create['raw'] ?? ''];
-    }
-
-    // First file: prefer plain field name, then +append (see PocketBase files docs). CURLFile first — some PHP/cURL builds handle it better than raw multipart.
-    $patchAttempts = [
-        ['curlfile fetched_files', fn () => ff_pb_patch_record_file($token, $col, $id, 'fetched_files', $absPath, $mimeType, $baseName)],
-        ['curlfile fetched_files+', fn () => ff_pb_patch_record_file($token, $col, $id, 'fetched_files+', $absPath, $mimeType, $baseName)],
-        ['multipart fetched_files', fn () => ff_pb_multipart_patch_record_with_file($token, $col, $id, 'fetched_files', $absPath, $mimeType, $baseName)],
-        ['multipart fetched_files+', fn () => ff_pb_multipart_patch_record_with_file($token, $col, $id, 'fetched_files+', $absPath, $mimeType, $baseName)],
-    ];
-    $lastPatch = ['code' => 0, 'body' => [], 'raw' => ''];
-    $failures = [];
-    foreach ($patchAttempts as [$label, $fn]) {
-        $patch = $fn();
-        $lastPatch = $patch;
-        if ($patch['code'] < 200 || $patch['code'] >= 300) {
-            $failures[] = $label . ': HTTP ' . $patch['code'] . ' ' . ff_pb_extract_error_message(is_array($patch['body'] ?? null) ? $patch['body'] : []);
-
-            continue;
-        }
-        $pb = is_array($patch['body'] ?? null) ? $patch['body'] : [];
-        if (ff_pb_body_record_id($pb) === '' && ff_pb_extract_error_message($pb) !== '') {
-            $failures[] = $label . ': ' . ff_pb_extract_error_message($pb);
-
-            continue;
-        }
-        $pv = ff_pb_verify_fetched_files_on_record($token, $col, $id, $pb);
-        if ($pv['ok']) {
-            $body = ff_pb_merge_record_id_into_body($pv['body'], $id);
-            $fin = ff_pb_finalize_fetch_upload($token, $col, $body);
-            if (!$fin['ok']) {
-                ff_pb_delete_input_media_record($token, $id);
-
-                return ['code' => 0, 'body' => ['message' => $fin['message']], 'raw' => $patch['raw']];
-            }
-
-            return ['code' => $patch['code'], 'body' => $fin['body'], 'raw' => $patch['raw']];
-        }
-        $failures[] = $label . ': ' . ($pv['reason'] ?? 'verify failed');
-    }
-
-    ff_pb_delete_input_media_record($token, $id);
-    $detail = $failures !== [] ? implode(' | ', $failures) : '';
-    $fallback = ff_pb_extract_error_message(is_array($lastPatch['body'] ?? null) ? $lastPatch['body'] : []);
-    $msg = $detail !== '' ? $detail : ($fallback !== '' ? $fallback : 'File upload failed after create (multipart PATCH + fallback).');
-
-    return ['code' => $lastPatch['code'] ?: 400, 'body' => ['message' => $msg, 'data' => $lastPatch['body']['data'] ?? null], 'raw' => $lastPatch['raw']];
-}
-
-function ff_pb_delete_input_media_record(string $token, string $recordId): void {
-    $recordId = trim($recordId);
-    if ($recordId === '') {
-        return;
-    }
-    $col = trim((string) ($GLOBALS['CONFIG']['input_media_collection'] ?? 'input_media'));
-    if ($col === '') {
-        $col = 'input_media';
-    }
-    pb_request('DELETE', '/api/collections/' . rawurlencode($col) . '/records/' . rawurlencode($recordId), null, $token);
-}
-
-function ff_pb_proxy_file_download(string $collection, string $recordId, string $filename, string $token): void {
-    $fn = basename(str_replace(["\0"], '', $filename));
-    if ($fn === '' || str_contains($fn, '..')) {
-        http_response_code(400);
-        header('Content-Type: text/plain; charset=utf-8');
-        echo 'Bad filename';
-        return;
-    }
-    $base = rtrim((string) ($GLOBALS['CONFIG']['pocketbase_url'] ?? ''), '/');
-    $url = $base . '/api/files/' . rawurlencode($collection) . '/' . rawurlencode($recordId) . '/' . rawurlencode($fn);
-    $t = trim($token);
-    if (stripos($t, 'Bearer ') !== 0) {
-        $t = 'Bearer ' . $t;
-    }
-    $httpStatus = 0;
-    $headersOut = false;
-    $errBuf = '';
-    $ch = curl_init($url);
-    curl_setopt($ch, CURLOPT_HEADERFUNCTION, static function ($ch, $headerLine) use (&$httpStatus): int {
-        $len = strlen($headerLine);
-        if (preg_match('#^HTTP/\S+\s+(\d+)#', $headerLine, $m)) {
-            $httpStatus = (int) $m[1];
-        }
-        return $len;
-    });
-    curl_setopt($ch, CURLOPT_WRITEFUNCTION, static function ($ch, $chunk) use (&$httpStatus, &$headersOut, &$errBuf, $fn): int {
-        if ($httpStatus !== 200) {
-            $errBuf .= $chunk;
-            return strlen($chunk);
-        }
-        if (!$headersOut) {
-            header('Content-Type: application/octet-stream');
-            header('Content-Disposition: attachment; filename="' . str_replace(["\r", "\n", '"'], '', $fn) . '"');
-            $headersOut = true;
-        }
-        echo $chunk;
-        return strlen($chunk);
-    });
-    curl_setopt_array($ch, [
-        CURLOPT_URL => $url,
-        CURLOPT_HTTPHEADER => ['Authorization: ' . $t],
-        CURLOPT_RETURNTRANSFER => false,
-    ]);
-    curl_exec($ch);
-    curl_close($ch);
-    if ($httpStatus !== 200 && !$headersOut) {
-        http_response_code($httpStatus >= 400 && $httpStatus < 600 ? $httpStatus : 502);
-        header('Content-Type: text/plain; charset=utf-8');
-        echo 'File not available';
-    }
-}
-
-function normalize_instagram_username(?string $username): ?string {
-    if ($username === null) {
-        return null;
-    }
-    $u = trim(ltrim((string) $username, '@'));
-    if ($u === '') {
-        return null;
-    }
-    $lower = strtolower($u);
-    if (in_array($lower, ['undefined', 'null', 'account', 'active', 'inactive', 'n/a', 'na'], true)) {
-        return null;
-    }
-    return $u;
-}
-
-function fetch_instagram_username(string $igUserId, array $tokens): ?string {
-    $igUserId = trim($igUserId);
-    if ($igUserId === '') {
-        return null;
-    }
-    $seenTokens = [];
-    foreach ($tokens as $token) {
-        $tok = trim((string) $token);
-        if ($tok === '' || isset($seenTokens[$tok])) {
-            continue;
-        }
-        $seenTokens[$tok] = true;
-        foreach (['https://graph.instagram.com', 'https://graph.facebook.com'] as $host) {
-            $ch = curl_init("{$host}/v18.0/{$igUserId}?fields=username&access_token=" . urlencode($tok));
-            curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-            $res = curl_exec($ch);
-            curl_close($ch);
-            $body = json_decode($res ?: '{}', true) ?? [];
-            if (!empty($body['error'])) {
-                continue;
-            }
-            $username = normalize_instagram_username($body['username'] ?? null);
-            if ($username) {
-                return $username;
-            }
-        }
-    }
-    return null;
-}
-
-function pb_find_instagram_account_by_user_id(string $igUserId, ?string $authHeader): ?array {
-    $igUserId = trim($igUserId);
-    if ($igUserId === '' || !$authHeader) {
-        return null;
-    }
-    $safeId = str_replace(['\\', '"'], ['\\\\', '\"'], $igUserId);
-    $query = http_build_query(['filter' => 'instagram_user_id="' . $safeId . '"', 'perPage' => 1]);
-    $resp = pb_request('GET', '/api/collections/social_accounts/records?' . $query, null, $authHeader);
-    if ($resp['code'] !== 200) {
-        return null;
-    }
-    return $resp['body']['items'][0] ?? null;
-}
-
-function ff_redirect_url(string $pathWithQuery): void {
-    $cfg = $GLOBALS['CONFIG'];
-    $base = rtrim((string) ($cfg['site_url'] ?? ''), '/');
-    header('Location: ' . $base . $pathWithQuery);
-    exit;
-}
-
-function ff_shell_cookie_opt(string $path): string {
-    $path = trim($path);
-    if ($path === '' || !is_file($path) || !is_readable($path)) {
-        return '';
-    }
-    $real = realpath($path);
-    if ($real === false) {
-        return '';
-    }
-    return ' --cookies ' . escapeshellarg($real);
-}
-
-/**
- * @return array<string, string|bool|int>
- */
-function ff_debug_cookie_meta(string $label, string $path): array {
-    $path = trim($path);
-    if ($path === '') {
-        return ['label' => $label, 'path' => '', 'exists' => false, 'readable' => false, 'bytes' => 0];
-    }
-    $exists = is_file($path);
-    $readable = $exists && is_readable($path);
-
-    return [
-        'label' => $label,
-        'path' => $path,
-        'exists' => $exists,
-        'readable' => $readable,
-        'bytes' => $exists ? (int) @filesize($path) : 0,
-    ];
-}
-
-/**
- * Config snapshot for support: scalars only; secrets redacted (no cookie contents).
- *
- * @return array<string, mixed>
- */
-function ff_debug_redact_config(array $cfg): array {
-    $out = [];
-    $secretKeys = ['fb_app_secret'];
-    foreach ($cfg as $k => $v) {
-        $ks = (string) $k;
-        if (in_array($ks, $secretKeys, true)) {
-            $out[$ks] = is_string($v) && trim($v) !== '' ? '[redacted]' : '';
-
-            continue;
-        }
-        if (is_bool($v) || is_int($v) || is_float($v) || $v === null) {
-            $out[$ks] = $v;
-        } elseif (is_string($v)) {
-            $out[$ks] = $v;
-        } else {
-            $out[$ks] = '[non-scalar]';
-        }
-    }
-
-    return $out;
-}
-
-function ff_debug_shell_version_line(string $bin): string {
-    $bin = trim($bin);
-    if ($bin === '') {
-        return '';
-    }
-    if (str_starts_with($bin, '/') && (!is_file($bin) || !is_executable($bin))) {
-        return '';
-    }
-    $prefix = ff_fetch_env_prefix();
-    $log = sys_get_temp_dir() . '/ff_dbg_' . bin2hex(random_bytes(8)) . '.txt';
-    $cmd = $prefix . escapeshellarg($bin) . ' --version > ' . escapeshellarg($log) . ' 2>&1';
-    exec($cmd, $void, $code);
-    $tail = ff_tail_log_file($log, 4000);
-    @unlink($log);
-    $tail = trim($tail);
-    if ($tail !== '') {
-        return strlen($tail) > 2000 ? substr($tail, 0, 2000) . "\n…" : $tail;
-    }
-
-    return 'exit ' . $code;
-}
-
-/**
- * Safe JSON for support (no secrets, no Netscape cookie file contents).
- *
- * @return array<string, mixed>
- */
-function ff_debug_collect_safe(): array {
-    $cfg = $GLOBALS['CONFIG'];
-    $col = trim((string) ($cfg['input_media_collection'] ?? 'input_media'));
-    if ($col === '') {
-        $col = 'input_media';
-    }
-
-    $cookiePick = ff_pick_storage_cookie_file();
-    $gdCookieCfg = trim((string) ($cfg['gallery_dl_cookies'] ?? ''));
-    $ydCookieCfg = trim((string) ($cfg['yt_dlp_cookies'] ?? ''));
-    $envGd = trim((string) (getenv('GALLERY_DL_COOKIES') ?: ''));
-    $envYd = trim((string) (getenv('YT_DLP_COOKIES') ?: ''));
-    $cookieOptGallery = ff_shell_cookie_opt((string) ($cfg['gallery_dl_cookies'] ?? ''));
-
-    $gBin = ff_fetch_executable((string) ($cfg['gallery_dl_path'] ?? ''), 'gallery-dl');
-    $yBin = ff_fetch_executable((string) ($cfg['yt_dlp_path'] ?? ''), 'yt-dlp');
-
-    $gOk = str_starts_with($gBin, '/') ? (is_file($gBin) && is_executable($gBin)) : ($gBin !== '');
-    $yOk = str_starts_with($yBin, '/') ? (is_file($yBin) && is_executable($yBin)) : ($yBin !== '');
-
-    $pbHealth = pb_request('GET', '/api/health', null, null);
-
-    $lastFetch = null;
-    if (!empty($_SESSION['ff_debug_last_fetch']) && is_array($_SESSION['ff_debug_last_fetch'])) {
-        $lastFetch = $_SESSION['ff_debug_last_fetch'];
-    }
-    $lastFetchPb = null;
-    if (!empty($_SESSION['ff_debug_last_fetch_pb']) && is_array($_SESSION['ff_debug_last_fetch_pb'])) {
-        $lastFetchPb = $_SESSION['ff_debug_last_fetch_pb'];
-    }
-
-    return [
-        'generated_at' => gmdate('c'),
-        'app' => [
-            'version' => (string) ($cfg['app_version'] ?? ''),
-            'php_version' => PHP_VERSION,
-            'php_sapi' => PHP_SAPI,
-            'os' => PHP_OS_FAMILY,
-        ],
-        'process' => [
-            'user' => function_exists('posix_getpwuid') && function_exists('posix_geteuid')
-                ? (string) (posix_getpwuid(posix_geteuid())['name'] ?? '')
-                : '',
-            'uid' => function_exists('posix_geteuid') ? posix_geteuid() : null,
-            'home_env' => getenv('HOME') !== false ? (string) getenv('HOME') : '',
-        ],
-        'paths' => [
-            'app_root' => __DIR__,
-            'sys_temp_dir' => sys_get_temp_dir(),
-        ],
-        'config_redacted' => ff_debug_redact_config($cfg),
-        'pocketbase' => [
-            'url_resolution' => (string) ($cfg['pocketbase_url_resolution'] ?? ''),
-            'public_url' => (string) ($cfg['pocketbase_public_url'] ?? ''),
-            'api_health' => [
-                'http_code' => $pbHealth['code'],
-                'ok' => $pbHealth['code'] >= 200 && $pbHealth['code'] < 300,
-            ],
-        ],
-        'fetch_tools' => [
-            'gallery_dl' => [
-                'configured_path' => (string) ($cfg['gallery_dl_path'] ?? ''),
-                'resolved_executable' => $gBin,
-                'resolved_is_file' => str_starts_with($gBin, '/') && is_file($gBin),
-                'callable' => $gOk,
-                '--version' => $gOk ? ff_debug_shell_version_line($gBin) : '',
-            ],
-            'yt_dlp' => [
-                'configured_path' => (string) ($cfg['yt_dlp_path'] ?? ''),
-                'resolved_executable' => $yBin,
-                'resolved_is_file' => str_starts_with($yBin, '/') && is_file($yBin),
-                'callable' => $yOk,
-                '--version' => $yOk ? ff_debug_shell_version_line($yBin) : '',
-            ],
-            'fetch_env_path_prefix' => ff_fetch_path_env_prefix(),
-        ],
-        'cookies' => [
-            'storage_pick' => ff_debug_cookie_meta('storage pick', $cookiePick),
-            'env_GALLERY_DL_COOKIES' => ff_debug_cookie_meta('GALLERY_DL_COOKIES', $envGd),
-            'env_YT_DLP_COOKIES' => ff_debug_cookie_meta('YT_DLP_COOKIES', $envYd),
-            'config_gallery_dl_cookies' => ff_debug_cookie_meta('config gallery_dl_cookies', $gdCookieCfg),
-            'config_yt_dlp_cookies' => ff_debug_cookie_meta('config yt_dlp_cookies', $ydCookieCfg),
-            'gallery_dl_would_pass_cookies_flag' => $cookieOptGallery !== '',
-        ],
-        'input_media_collection' => $col,
-        'last_fetch' => $lastFetch,
-        'last_fetch_pb' => $lastFetchPb,
-        'openrouter_configured' => trim((string) (getenv('OPENROUTER_API_KEY') ?: '')) !== '',
-        'gemini_embed_configured' => trim((string) (getenv('GEMINI_API_KEY') ?: '')) !== '',
-        'prompts_collection' => trim((string) ($GLOBALS['CONFIG']['prompts_collection'] ?? 'prompts')),
-    ];
-}
-
-function ff_tail_log_file(string $path, int $maxBytes = 6000): string {
-    if ($maxBytes < 64) {
-        $maxBytes = 64;
-    }
-    if (!is_file($path)) {
-        return '';
-    }
-    $raw = @file_get_contents($path);
-    if ($raw === false || $raw === '') {
-        return '';
-    }
-    if (strlen($raw) <= $maxBytes) {
-        return $raw;
-    }
-    return "…(truncated)\n" . substr($raw, -$maxBytes);
-}
-
-function ff_fetch_rmdir_recursive(string $dir): void {
-    if (!is_dir($dir)) {
-        return;
-    }
-    $it = new RecursiveIteratorIterator(
-        new RecursiveDirectoryIterator($dir, RecursiveDirectoryIterator::SKIP_DOTS),
-        RecursiveIteratorIterator::CHILD_FIRST
-    );
-    foreach ($it as $f) {
-        $p = $f->getPathname();
-        $f->isDir() ? @rmdir($p) : @unlink($p);
-    }
-    @rmdir($dir);
-}
-
-function ff_fetch_collect_files(string $dir): array {
-    if (!is_dir($dir)) {
-        return [];
-    }
-    $out = [];
-    $it = new RecursiveIteratorIterator(
-        new RecursiveDirectoryIterator($dir, RecursiveDirectoryIterator::SKIP_DOTS)
-    );
-    foreach ($it as $f) {
-        if ($f->isFile()) {
-            $out[] = $f->getPathname();
-        }
-    }
-    return $out;
-}
-
-/** If the pasted line has no scheme, assume https (browser type=url often blocks these). */
-function ff_fetch_normalize_url_input(string $url): string {
-    $url = trim($url);
-    if ($url === '') {
-        return $url;
-    }
-    if (!preg_match('#^https?://#i', $url)) {
-        return 'https://' . ltrim($url, '/');
-    }
-    return $url;
-}
-
-function ff_fetch_validate_http_url(string $url): ?string {
-    $url = trim($url);
-    if ($url === '') {
-        return 'Enter a URL.';
-    }
-    if (strlen($url) > 4096) {
-        return 'URL is too long.';
-    }
-    if (!preg_match('#^https?://#i', $url)) {
-        return 'URL must start with http:// or https://';
-    }
-    if (parse_url($url, PHP_URL_HOST) === null || parse_url($url, PHP_URL_HOST) === '') {
-        return 'Invalid URL.';
-    }
-    return null;
-}
-
-/**
- * @return array{ok: bool, files: array<int, string>, error: string, exit_code: ?int, output_tail: string, cookies_file_used: bool}
- */
-function ff_fetch_run_tool(string $url, string $tool, string $destDir): array {
-    $cfg = $GLOBALS['CONFIG'];
-    $diag = ['ok' => false, 'files' => [], 'error' => '', 'exit_code' => null, 'output_tail' => '', 'cookies_file_used' => false];
-    $timeout = is_executable('/usr/bin/timeout') ? '/usr/bin/timeout 300 ' : '';
-    $prefix = ff_fetch_env_prefix();
-    $logFile = sys_get_temp_dir() . '/ff_fetch_' . bin2hex(random_bytes(8)) . '.log';
-
-    if ($tool === 'gallery-dl') {
-        $cookieOpt = ff_shell_cookie_opt((string) ($cfg['gallery_dl_cookies'] ?? ''));
-        if ($cookieOpt !== '') {
-            $diag['cookies_file_used'] = true;
-        }
-        $bin = ff_fetch_executable((string) ($cfg['gallery_dl_path'] ?? ''), 'gallery-dl');
-        $cmd = $prefix . $timeout . escapeshellarg($bin) . $cookieOpt . ' -d ' . escapeshellarg($destDir) . ' ' . escapeshellarg($url)
-            . ' > ' . escapeshellarg($logFile) . ' 2>&1';
-        exec($cmd, $void, $code);
-        $diag['exit_code'] = $code;
-        $diag['output_tail'] = ff_tail_log_file($logFile, 8000);
-        @unlink($logFile);
-        $files = ff_fetch_collect_files($destDir);
-        if ($code !== 0) {
-            $diag['error'] = 'gallery-dl exited with code ' . $code . ($diag['output_tail'] !== '' ? (". Log:\n" . $diag['output_tail']) : '');
-            return $diag;
-        }
-        if ($files === []) {
-            $diag['error'] = 'gallery-dl reported success but wrote no files.';
-            return $diag;
-        }
-        $diag['ok'] = true;
-        $diag['files'] = $files;
-        return $diag;
-    }
-
-    if ($tool === 'yt-dlp') {
-        $cookieOpt = ff_shell_cookie_opt((string) ($cfg['yt_dlp_cookies'] ?? ''));
-        if ($cookieOpt === '') {
-            $cookieOpt = ff_shell_cookie_opt((string) ($cfg['gallery_dl_cookies'] ?? ''));
-        }
-        if ($cookieOpt !== '') {
-            $diag['cookies_file_used'] = true;
-        }
-        $bin = ff_fetch_executable((string) ($cfg['yt_dlp_path'] ?? ''), 'yt-dlp');
-        $outTpl = $destDir . DIRECTORY_SEPARATOR . '%(id)s.%(ext)s';
-        $cmd = $prefix . $timeout . escapeshellarg($bin) . $cookieOpt . ' -o ' . escapeshellarg($outTpl) . ' ' . escapeshellarg($url)
-            . ' > ' . escapeshellarg($logFile) . ' 2>&1';
-        exec($cmd, $void, $code);
-        $diag['exit_code'] = $code;
-        $diag['output_tail'] = ff_tail_log_file($logFile, 8000);
-        @unlink($logFile);
-        $files = ff_fetch_collect_files($destDir);
-        if ($code !== 0) {
-            $diag['error'] = 'yt-dlp exited with code ' . $code . ($diag['output_tail'] !== '' ? (". Log:\n" . $diag['output_tail']) : '');
-            return $diag;
-        }
-        if ($files === []) {
-            $diag['error'] = 'yt-dlp reported success but wrote no files.';
-            return $diag;
-        }
-        $diag['ok'] = true;
-        $diag['files'] = $files;
-        return $diag;
-    }
-
-    $diag['error'] = 'Unknown tool.';
-    return $diag;
-}
-
-/** User + model instruction for OpenRouter vision after each fetched image (also shown in Fetch success UI). */
-define('FF_OPENROUTER_IMAGE_RECREATION_INSTRUCTION', 'Fully describe this image for me but do it like you are creating it to recreate the image with an image prompt.');
-
-/**
  * Merge keys into PocketBase record JSON metadata (GET → merge → PATCH).
  *
  * @param array<string, mixed> $merge
  * @param array<int, string> $removeKeys
  */
-function ff_pb_patch_merge_record_metadata(string $token, string $col, string $recordId, array $merge, array $removeKeys = []): bool {
+function ff_pb_patch_merge_record_metadata(string $token, string $col, string $recordId, array $merge, array $removeKeys = []): bool
+{
     $recordId = trim($recordId);
     if ($recordId === '') {
         return false;
@@ -1127,155 +337,82 @@ function ff_pb_patch_merge_record_metadata(string $token, string $col, string $r
     return $p['code'] >= 200 && $p['code'] < 300;
 }
 
-/**
- * OpenRouter vision: image → text suitable as an image-generation recreation prompt.
- *
- * @return array{ok: bool, text: string, error: string}
- */
-function ff_openrouter_image_recreation_prompt(string $apiKey, string $model, string $absPath, string $httpReferer): array {
-    $out = ['ok' => false, 'text' => '', 'error' => ''];
-    $apiKey = trim($apiKey);
-    if ($apiKey === '') {
-        $out['error'] = 'OPENROUTER_API_KEY not set';
+function normalize_instagram_username(?string $username): ?string
+{
+    if ($username === null) {
+        return null;
+    }
+    $u = trim(ltrim((string) $username, '@'));
+    if ($u === '') {
+        return null;
+    }
+    $lower = strtolower($u);
+    if (in_array($lower, ['undefined', 'null', 'account', 'active', 'inactive', 'n/a', 'na'], true)) {
+        return null;
+    }
 
-        return $out;
-    }
-    if (!is_file($absPath) || !is_readable($absPath)) {
-        $out['error'] = 'Image path not readable';
-
-        return $out;
-    }
-    $mime = 'image/jpeg';
-    if (function_exists('mime_content_type')) {
-        $mt = @mime_content_type($absPath);
-        if (is_string($mt) && $mt !== '') {
-            $mime = strtolower($mt);
-        }
-    }
-    $mimeNorm = str_replace('image/jpg', 'image/jpeg', $mime);
-    $allowed = ['image/jpeg', 'image/png', 'image/gif', 'image/webp'];
-    if (!in_array($mimeNorm, $allowed, true)) {
-        $out['error'] = 'OpenRouter vision skipped (not a raster image): ' . $mime;
-
-        return $out;
-    }
-    $bin = @file_get_contents($absPath);
-    if ($bin === false || $bin === '') {
-        $out['error'] = 'Could not read image bytes';
-
-        return $out;
-    }
-    $maxBytes = 4 * 1024 * 1024;
-    if (strlen($bin) > $maxBytes) {
-        $out['error'] = 'Image too large for OpenRouter (' . strlen($bin) . ' bytes)';
-
-        return $out;
-    }
-    $b64 = base64_encode($bin);
-    $prompt = FF_OPENROUTER_IMAGE_RECREATION_INSTRUCTION;
-    $payload = [
-        'model' => $model,
-        'messages' => [
-            [
-                'role' => 'user',
-                'content' => [
-                    ['type' => 'text', 'text' => $prompt],
-                    ['type' => 'image_url', 'image_url' => ['url' => 'data:' . $mimeNorm . ';base64,' . $b64]],
-                ],
-            ],
-        ],
-        'max_tokens' => 4096,
-    ];
-    $referer = trim($httpReferer);
-    if ($referer === '') {
-        $referer = 'http://localhost';
-    }
-    $ch = curl_init('https://openrouter.ai/api/v1/chat/completions');
-    curl_setopt_array($ch, [
-        CURLOPT_POST => true,
-        CURLOPT_RETURNTRANSFER => true,
-        CURLOPT_HTTPHEADER => [
-            'Authorization: Bearer ' . $apiKey,
-            'Content-Type: application/json',
-            'HTTP-Referer: ' . str_replace(["\r", "\n"], '', $referer),
-            'X-Title: FormatForge',
-        ],
-        CURLOPT_POSTFIELDS => json_encode($payload, JSON_UNESCAPED_UNICODE),
-        CURLOPT_TIMEOUT => 180,
-    ]);
-    $res = curl_exec($ch);
-    $code = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
-    curl_close($ch);
-    if ($res === false) {
-        $out['error'] = 'OpenRouter request failed (curl)';
-
-        return $out;
-    }
-    $body = json_decode($res, true) ?? [];
-    if ($code < 200 || $code >= 300) {
-        $out['error'] = ff_pb_extract_error_message(is_array($body) ? $body : []) ?: ('HTTP ' . $code);
-
-        return $out;
-    }
-    $text = trim((string) ($body['choices'][0]['message']['content'] ?? ''));
-    if ($text === '') {
-        $out['error'] = 'OpenRouter returned empty assistant content';
-
-        return $out;
-    }
-    $out['ok'] = true;
-    $out['text'] = $text;
-
-    return $out;
+    return $u;
 }
 
-/**
- * Raster image bytes for ML (same MIME/size rules as OpenRouter vision).
- *
- * @return array{ok: bool, mime: string, b64: string, error: string}
- */
-function ff_fetch_raster_image_for_ml(string $absPath): array {
-    $out = ['ok' => false, 'mime' => '', 'b64' => '', 'error' => ''];
-    if (!is_file($absPath) || !is_readable($absPath)) {
-        $out['error'] = 'File not readable';
-
-        return $out;
+function fetch_instagram_username(string $igUserId, array $tokens): ?string
+{
+    $igUserId = trim($igUserId);
+    if ($igUserId === '') {
+        return null;
     }
-    $mime = 'image/jpeg';
-    if (function_exists('mime_content_type')) {
-        $mt = @mime_content_type($absPath);
-        if (is_string($mt) && $mt !== '') {
-            $mime = strtolower($mt);
+    $seenTokens = [];
+    foreach ($tokens as $token) {
+        $tok = trim((string) $token);
+        if ($tok === '' || isset($seenTokens[$tok])) {
+            continue;
+        }
+        $seenTokens[$tok] = true;
+        foreach (['https://graph.instagram.com', 'https://graph.facebook.com'] as $host) {
+            $ch = curl_init("{$host}/v18.0/{$igUserId}?fields=username&access_token=" . urlencode($tok));
+            curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+            $res = curl_exec($ch);
+            curl_close($ch);
+            $body = json_decode($res ?: '{}', true) ?? [];
+            if (!empty($body['error'])) {
+                continue;
+            }
+            $username = normalize_instagram_username($body['username'] ?? null);
+            if ($username) {
+                return $username;
+            }
         }
     }
-    $mimeNorm = str_replace('image/jpg', 'image/jpeg', $mime);
-    $allowed = ['image/jpeg', 'image/png', 'image/gif', 'image/webp'];
-    if (!in_array($mimeNorm, $allowed, true)) {
-        $out['error'] = 'Not a raster image: ' . $mime;
 
-        return $out;
+    return null;
+}
+
+function pb_find_instagram_account_by_user_id(string $igUserId, ?string $authHeader): ?array
+{
+    $igUserId = trim($igUserId);
+    if ($igUserId === '' || !$authHeader) {
+        return null;
     }
-    $bin = @file_get_contents($absPath);
-    if ($bin === false || $bin === '') {
-        $out['error'] = 'Could not read image bytes';
-
-        return $out;
+    $safeId = str_replace(['\\', '"'], ['\\\\', '\"'], $igUserId);
+    $query = http_build_query(['filter' => 'instagram_user_id="' . $safeId . '"', 'perPage' => 1]);
+    $resp = pb_request('GET', '/api/collections/social_accounts/records?' . $query, null, $authHeader);
+    if ($resp['code'] !== 200) {
+        return null;
     }
-    $maxBytes = 4 * 1024 * 1024;
-    if (strlen($bin) > $maxBytes) {
-        $out['error'] = 'Image too large for embedding API (' . strlen($bin) . ' bytes)';
 
-        return $out;
-    }
-    $out['ok'] = true;
-    $out['mime'] = $mimeNorm;
-    $out['b64'] = base64_encode($bin);
+    return $resp['body']['items'][0] ?? null;
+}
 
-    return $out;
+function ff_redirect_url(string $pathWithQuery): void
+{
+    $cfg = $GLOBALS['CONFIG'];
+    $base = rtrim((string) ($cfg['site_url'] ?? ''), '/');
+    header('Location: ' . $base . $pathWithQuery);
+    exit;
 }
 
 /** Short human-readable float preview for UI (not full vector). */
-function ff_embedding_preview_string(array $vec, int $head = 8): string {
+function ff_embedding_preview_string(array $vec, int $head = 8): string
+{
     $n = count($vec);
     if ($n === 0) {
         return '(empty vector)';
@@ -1302,20 +439,11 @@ function ff_embedding_preview_string(array $vec, int $head = 8): string {
     return $s;
 }
 
-function ff_fetch_pipeline_truncate_detail(string $s, int $max = 420): string {
-    if (strlen($s) <= $max) {
-        return $s;
-    }
-
-    return substr($s, 0, $max) . '…';
-}
-
 /**
- * Google Gemini multimodal embedding (image) via embedContent.
- *
  * @return array{ok: bool, vector: array<int, float>, error: string}
  */
-function ff_gemini_embed_image_b64(string $apiKey, string $modelId, string $mimeNorm, string $b64): array {
+function ff_gemini_embed_image_b64(string $apiKey, string $modelId, string $mimeNorm, string $b64): array
+{
     $out = ['ok' => false, 'vector' => [], 'error' => ''];
     $modelId = trim($modelId);
     if ($modelId === '') {
@@ -1387,11 +515,10 @@ function ff_gemini_embed_image_b64(string $apiKey, string $modelId, string $mime
 }
 
 /**
- * Google Gemini embeddings API (GEMINI_API_KEY). Model default: gemini-embedding-2-preview (~3072 dims).
- *
  * @return array{ok: bool, vector: array<int, float>, error: string}
  */
-function ff_gemini_embed_text(string $apiKey, string $modelId, string $text): array {
+function ff_gemini_embed_text(string $apiKey, string $modelId, string $text): array
+{
     $out = ['ok' => false, 'vector' => [], 'error' => ''];
     $text = trim($text);
     if ($text === '') {
@@ -1471,7 +598,7 @@ function ff_gemini_embed_text(string $apiKey, string $modelId, string $text): ar
 }
 
 /**
- * Create prompts row (Gemini embedding + prompt_original_media); links back via input_media.metadata.prompts_record_id.
+ * Create prompts row (Gemini embedding + prompt_original_media); links input_media.metadata.prompts_record_id.
  *
  * @return array{skipped: bool, skip_reason: string, record_id: string, embedding_dims: int, embedding_stored: bool, embedding_preview: string, gemini_error: string, pb_error: string}
  */
@@ -1558,368 +685,1796 @@ function ff_pb_create_prompt_after_fetch(
 }
 
 /**
- * Download to system temp, then upload to PocketBase: one input_media row per file (carousel = N rows).
- *
- * @return array{ok: bool, record_id: string, record_rows: array<int, array{id: string, file: string, label: string, image_prompt?: string, image_prompt_error?: string}>, pb_files: array<int, string>, n: int, error: string, via: string}
+ * @return array<string, mixed>
  */
-function ff_fetch_save_media(string $url, string $toolChoice, ?string $pbToken): array {
-    $empty = ['ok' => false, 'record_id' => '', 'record_rows' => [], 'pb_files' => [], 'n' => 0, 'error' => '', 'via' => ''];
-    $url = ff_fetch_normalize_url_input($url);
-    $err = ff_fetch_validate_http_url($url);
-    if ($err !== null) {
-        $empty['error'] = $err;
-        return $empty;
-    }
-    if (!$pbToken || trim((string) $pbToken) === '') {
-        $empty['error'] = 'Not signed in.';
-        return $empty;
-    }
-    $destDir = sys_get_temp_dir() . DIRECTORY_SEPARATOR . 'ffetch_' . bin2hex(random_bytes(8));
-    if (!@mkdir($destDir, 0700, true)) {
-        $empty['error'] = 'Cannot create temp directory for download.';
-        return $empty;
+function ff_debug_redact_config(array $cfg): array
+{
+    $out = [];
+    $secretKeys = ['fb_app_secret', 'garage_secret_key'];
+    foreach ($cfg as $k => $v) {
+        $ks = (string) $k;
+        if (in_array($ks, $secretKeys, true)) {
+            $out[$ks] = is_string($v) && trim($v) !== '' ? '[redacted]' : '';
+
+            continue;
+        }
+        if (is_bool($v) || is_int($v) || is_float($v) || $v === null) {
+            $out[$ks] = $v;
+        } elseif (is_string($v)) {
+            $out[$ks] = $v;
+        } else {
+            $out[$ks] = '[non-scalar]';
+        }
     }
 
-    $toolChoice = strtolower(trim($toolChoice));
-    if (!in_array($toolChoice, ['auto', 'gallery-dl', 'yt-dlp'], true)) {
-        $toolChoice = 'auto';
+    return $out;
+}
+
+/**
+ * S3 object prefix for one PocketBase social_accounts row (isolated from other linked accounts).
+ */
+function ff_garage_social_key_prefix(string $socialAccountId): string
+{
+    $id = preg_replace('/[^a-zA-Z0-9_-]/', '', $socialAccountId);
+    if ($id === '') {
+        return '';
     }
 
-    $run = static function (string $tool, string $urlIn, string $dir) {
-        return ff_fetch_run_tool($urlIn, $tool, $dir);
+    return 'social_accounts/' . $id . '/';
+}
+
+/**
+ * Full object key under garage_social_content_bucket; empty string if ids/path are invalid.
+ */
+function ff_garage_social_object_key(string $socialAccountId, string $relativePath): string
+{
+    $prefix = ff_garage_social_key_prefix($socialAccountId);
+    if ($prefix === '') {
+        return '';
+    }
+    $rel = str_replace('\\', '/', $relativePath);
+    $rel = trim($rel, '/');
+    if ($rel === '' || str_contains($rel, '..')) {
+        return '';
+    }
+    $parts = explode('/', $rel);
+    $out = [];
+    foreach ($parts as $p) {
+        if ($p === '' || $p === '.' || $p === '..') {
+            return '';
+        }
+        $out[] = preg_replace('/[^a-zA-Z0-9._-]/', '_', $p);
+    }
+
+    return $prefix . implode('/', $out);
+}
+
+/** PocketBase users record id from the signed-in session (for Garage paths). */
+function ff_session_pb_user_id(): string
+{
+    $u = $_SESSION['pb_user'] ?? null;
+    if (!is_array($u)) {
+        return '';
+    }
+    $id = isset($u['id']) ? (string) $u['id'] : '';
+    $id = preg_replace('/[^a-zA-Z0-9_-]/', '', $id);
+
+    return $id;
+}
+
+function ff_garage_generated_user_prefix(string $pbUserId): string
+{
+    $id = preg_replace('/[^a-zA-Z0-9_-]/', '', $pbUserId);
+    if ($id === '') {
+        return '';
+    }
+
+    return 'generated/users/' . $id . '/';
+}
+
+/**
+ * Full object key for app-generated files (slides JSON, AI images) under garage_social_content_bucket.
+ */
+function ff_garage_generated_object_key(string $pbUserId, string $relativePath): string
+{
+    $prefix = ff_garage_generated_user_prefix($pbUserId);
+    if ($prefix === '') {
+        return '';
+    }
+    $rel = str_replace('\\', '/', $relativePath);
+    $rel = trim($rel, '/');
+    if ($rel === '' || str_contains($rel, '..')) {
+        return '';
+    }
+    $parts = explode('/', $rel);
+    $out = [];
+    foreach ($parts as $p) {
+        if ($p === '' || $p === '.' || $p === '..') {
+            return '';
+        }
+        $out[] = preg_replace('/[^a-zA-Z0-9._-]/', '_', $p);
+    }
+
+    return $prefix . implode('/', $out);
+}
+
+function ff_should_save_generated_to_garage(): bool
+{
+    if (!ff_garage_ready()) {
+        return false;
+    }
+    $v = strtolower(trim((string) (getenv('FF_SAVE_GENERATED_TO_GARAGE') ?: '1')));
+
+    return !in_array($v, ['0', 'false', 'off', 'no'], true);
+}
+
+/** @return array{ok: bool, bytes: string, content_type: string, error: string} */
+function ff_http_get_bytes(string $url, int $maxBytes, int $timeoutSec = 120): array
+{
+    $out = ['ok' => false, 'bytes' => '', 'content_type' => '', 'error' => ''];
+    if (!preg_match('#^https://#i', $url)) {
+        $out['error'] = 'URL must be HTTPS';
+
+        return $out;
+    }
+    $buf = '';
+    $ct = '';
+    $ch = curl_init($url);
+    curl_setopt_array($ch, [
+        CURLOPT_RETURNTRANSFER => false,
+        CURLOPT_FOLLOWLOCATION => true,
+        CURLOPT_MAXREDIRS => 5,
+        CURLOPT_TIMEOUT => $timeoutSec,
+        CURLOPT_HTTPHEADER => ['Accept: */*'],
+        CURLOPT_HEADERFUNCTION => static function ($ch, $header) use (&$ct) {
+            if (preg_match('/^content-type:\s*(.+)$/i', $header, $m)) {
+                $ct = trim(explode(';', trim($m[1]))[0]);
+            }
+
+            return strlen($header);
+        },
+        CURLOPT_WRITEFUNCTION => static function ($ch, $chunk) use (&$buf, $maxBytes, &$out) {
+            $buf .= $chunk;
+            if (strlen($buf) > $maxBytes) {
+                $out['error'] = 'Response too large';
+
+                return 0;
+            }
+
+            return strlen($chunk);
+        },
+    ]);
+    $exec = curl_exec($ch);
+    $code = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $cerr = curl_error($ch);
+    curl_close($ch);
+    if ($exec === false) {
+        $out['error'] = $out['error'] !== '' ? $out['error'] : ($cerr !== '' ? $cerr : 'Download failed');
+
+        return $out;
+    }
+    if ($code < 200 || $code >= 300) {
+        $out['error'] = $out['error'] !== '' ? $out['error'] : ('HTTP ' . $code);
+
+        return $out;
+    }
+    if ($buf === '') {
+        $out['error'] = 'Empty body';
+
+        return $out;
+    }
+    $out['ok'] = true;
+    $out['bytes'] = $buf;
+    $out['content_type'] = $ct !== '' ? $ct : 'application/octet-stream';
+
+    return $out;
+}
+
+function ff_mime_for_image_ext(string $ext): string
+{
+    $e = strtolower($ext);
+
+    return match ($e) {
+        'png' => 'image/png',
+        'jpg', 'jpeg' => 'image/jpeg',
+        'webp' => 'image/webp',
+        'gif' => 'image/gif',
+        default => 'image/png',
     };
+}
 
-    $r = null;
-    $via = '';
-    if ($toolChoice === 'gallery-dl') {
-        $r = $run('gallery-dl', $url, $destDir);
-        $via = 'gallery-dl';
-    } elseif ($toolChoice === 'yt-dlp') {
-        $r = $run('yt-dlp', $url, $destDir);
-        $via = 'yt-dlp';
-    } else {
-        $r1 = $run('gallery-dl', $url, $destDir);
-        if ($r1['ok'] && $r1['files'] !== []) {
-            $r = $r1;
-            $via = 'gallery-dl';
+function ff_ini_size_bytes(string $val): int
+{
+    $val = trim(strtolower($val));
+    if ($val === '') {
+        return 0;
+    }
+    $u = substr($val, -1);
+    $n = $val;
+    $mul = 1;
+    if ($u === 'g') {
+        $mul = 1073741824;
+        $n = substr($val, 0, -1);
+    } elseif ($u === 'm') {
+        $mul = 1048576;
+        $n = substr($val, 0, -1);
+    } elseif ($u === 'k') {
+        $mul = 1024;
+        $n = substr($val, 0, -1);
+    }
+    if (!is_numeric($n)) {
+        return 0;
+    }
+
+    return (int) round((float) $n * $mul);
+}
+
+function ff_garage_ready(): bool
+{
+    $c = $GLOBALS['CONFIG'];
+
+    return trim((string) ($c['garage_endpoint'] ?? '')) !== ''
+        && trim((string) ($c['garage_access_key'] ?? '')) !== ''
+        && trim((string) ($c['garage_secret_key'] ?? '')) !== ''
+        && trim((string) ($c['garage_social_content_bucket'] ?? '')) !== '';
+}
+
+/**
+ * @return array<string, mixed>|null
+ */
+function ff_pb_owned_social_account(?string $authHeader, string $id): ?array
+{
+    if ($authHeader === null || trim((string) $authHeader) === '') {
+        return null;
+    }
+    $clean = preg_replace('/[^a-zA-Z0-9_-]/', '', $id);
+    if ($clean === '') {
+        return null;
+    }
+    $r = pb_request('GET', '/api/collections/social_accounts/records/' . rawurlencode($clean), null, $authHeader);
+    if (($r['code'] ?? 0) !== 200) {
+        return null;
+    }
+    $rec = ff_pb_normalize_api_record($r['body']);
+
+    return is_array($rec) ? $rec : null;
+}
+
+/**
+ * Base URL for objects in GARAGE_SOCIAL_CONTENT_BUCKET as served by your public Garage/web gateway (no trailing slash).
+ */
+function ff_garage_public_base_url(): string
+{
+    $c = $GLOBALS['CONFIG'];
+    $direct = trim((string) ($c['garage_public_url'] ?? ''));
+    if ($direct !== '') {
+        return rtrim($direct, '/');
+    }
+    $domain = trim((string) ($c['garage_public_root_domain'] ?? ''));
+    if ($domain === '') {
+        return '';
+    }
+    $bucket = trim((string) ($c['garage_social_content_bucket'] ?? ''));
+    if ($bucket === '') {
+        return '';
+    }
+    $scheme = strtolower(trim((string) ($c['garage_public_scheme'] ?? 'https')));
+    if ($scheme !== 'http' && $scheme !== 'https') {
+        $scheme = 'https';
+    }
+    $domain = ltrim($domain, '/');
+
+    return $scheme . '://' . $bucket . '.web.' . $domain;
+}
+
+/**
+ * Public HTTPS URL for one object key in the social bucket (path segments encoded).
+ */
+function ff_garage_public_https_url_for_object_key(string $objectKey): string
+{
+    $base = ff_garage_public_base_url();
+    if ($base === '') {
+        return '';
+    }
+    $objectKey = trim(str_replace('\\', '/', $objectKey), '/');
+    if ($objectKey === '' || str_contains($objectKey, '..')) {
+        return '';
+    }
+    $parts = explode('/', $objectKey);
+    $enc = [];
+    foreach ($parts as $p) {
+        if ($p === '' || $p === '.' || $p === '..') {
+            return '';
+        }
+        $enc[] = rawurlencode($p);
+    }
+    $path = implode('/', $enc);
+    $wantHttps = strtolower(trim((string) ($GLOBALS['CONFIG']['garage_public_scheme'] ?? 'https'))) !== 'http';
+    if (str_starts_with($base, 'http://') && $wantHttps) {
+        $base = 'https://' . substr($base, 7);
+    }
+
+    return $base . '/' . $path;
+}
+
+/**
+ * @return array{kind: string, social_account_id?: string, rel: string}|null
+ */
+function ff_parse_internal_garage_app_url(string $absoluteUrl): ?array
+{
+    $absoluteUrl = trim($absoluteUrl);
+    if ($absoluteUrl === '') {
+        return null;
+    }
+    $p = parse_url($absoluteUrl);
+    if (!is_array($p)) {
+        return null;
+    }
+    $query = $p['query'] ?? '';
+    if (!is_string($query) || $query === '') {
+        return null;
+    }
+    parse_str($query, $q);
+    $action = (string) ($q['action'] ?? '');
+    if ($action === 'garage_download') {
+        $sid = trim((string) ($q['social_account_id'] ?? ''));
+        $rel = trim((string) ($q['key'] ?? ''));
+        if ($sid === '' || $rel === '') {
+            return null;
+        }
+
+        return ['kind' => 'social', 'social_account_id' => $sid, 'rel' => $rel];
+    }
+    if ($action === 'garage_generated_download') {
+        $rel = trim((string) ($q['key'] ?? ''));
+        if ($rel === '') {
+            return null;
+        }
+
+        return ['kind' => 'generated', 'rel' => $rel];
+    }
+
+    return null;
+}
+
+/**
+ * Turn carousel image src into a public HTTPS URL Instagram can fetch (or '' if not resolvable).
+ *
+ * @param  ?string  $pbUserId  PocketBase user id for generated/… Garage paths when the URL is garage_generated_download.
+ */
+function ff_instagram_public_https_image_url(string $src, ?string $pbUserId): string
+{
+    $src = trim($src);
+    if ($src === '') {
+        return '';
+    }
+    $site = rtrim((string) ($GLOBALS['CONFIG']['site_url'] ?? ''), '/');
+    if (!preg_match('#^https?://#i', $src)) {
+        if (str_starts_with($src, '//')) {
+            $src = 'https:' . $src;
+        } elseif (str_starts_with($src, '/') && $site !== '') {
+            $src = $site . $src;
         } else {
-            ff_fetch_rmdir_recursive($destDir);
-            @mkdir($destDir, 0700, true);
-            $r2 = $run('yt-dlp', $url, $destDir);
-            $r = $r2;
-            $via = 'yt-dlp';
+            return '';
         }
     }
-
-    if (!$r || empty($r['ok']) || ($r['files'] ?? []) === []) {
-        $e = $r['error'] ?? 'Download failed.';
-        ff_fetch_rmdir_recursive($destDir);
-        $empty['error'] = $e;
-        return $empty;
-    }
-
-    $paths = $r['files'];
-    sort($paths);
-    $max = 20;
-    if (count($paths) > $max) {
-        $paths = array_slice($paths, 0, $max);
-    }
-
-    $host = parse_url($url, PHP_URL_HOST);
-    $baseTitle = $host ? ('Fetch: ' . $host) : 'Fetched media';
-    $total = count($paths);
-    $batchId = bin2hex(random_bytes(8));
-    $createdIds = [];
-    $recordRows = [];
-    $pbFiles = [];
-    $imCol = trim((string) ($GLOBALS['CONFIG']['input_media_collection'] ?? 'input_media'));
-    if ($imCol === '') {
-        $imCol = 'input_media';
-    }
-    $orKey = trim((string) (getenv('OPENROUTER_API_KEY') ?: ''));
-    $orModel = trim((string) (getenv('OPENROUTER_MODEL') ?: 'google/gemini-3.1-pro-preview'));
-    if ($orModel === '') {
-        $orModel = 'google/gemini-3.1-pro-preview';
-    }
-    $orReferer = rtrim((string) ($GLOBALS['CONFIG']['site_url'] ?? ''), '/');
-    if ($orReferer === '') {
-        $orReferer = 'http://localhost';
-    }
-
-    foreach ($paths as $i => $pth) {
-        $idx = $i + 1;
-        $fn = basename($pth);
-        $title = $baseTitle;
-        $label = $fn;
-        if ($total > 1) {
-            $title = $baseTitle . ' (' . $idx . '/' . $total . ')';
-            $label = '(' . $idx . '/' . $total . ') ' . $fn;
-            if (strlen($title) > 200) {
-                $title = substr($title, 0, 200);
-            }
-        }
-        $meta = [
-            'fetch_batch_id' => $batchId,
-            'carousel_index' => $idx,
-            'carousel_total' => $total,
-            'is_carousel' => $total > 1,
-            'source_filename' => $fn,
-        ];
-        $up = ff_pb_input_media_create_fetch_one((string) $pbToken, $url, $title, $via, $pth, $meta);
-        if ($up['code'] < 200 || $up['code'] >= 300) {
-            foreach (array_reverse($createdIds) as $badId) {
-                ff_pb_delete_input_media_record((string) $pbToken, $badId);
-            }
-            ff_fetch_rmdir_recursive($destDir);
-            $em = ff_pb_extract_error_message(is_array($up['body'] ?? null) ? $up['body'] : []);
-            $msg = $em !== '' ? $em : (string) (($up['body']['message'] ?? '') ?: $up['raw'] ?: 'PocketBase upload failed.');
-            $empty['error'] = 'PocketBase (item ' . $idx . '/' . $total . '): ' . $msg;
-            return $empty;
-        }
-        $rec = is_array($up['body'] ?? null) ? $up['body'] : [];
-        $norm = ff_pb_normalize_api_record($rec);
-        $id = ff_pb_body_record_id($rec);
-        $names = $norm['fetched_files'] ?? [];
-        if (!is_array($names)) {
-            $names = $names !== null && $names !== '' ? [(string) $names] : [];
-        }
-        $names = array_values(array_filter(array_map('strval', $names)));
-        $storedName = $names[0] ?? $fn;
-        if ($id === '') {
-            foreach (array_reverse($createdIds) as $badId) {
-                ff_pb_delete_input_media_record((string) $pbToken, $badId);
-            }
-            ff_fetch_rmdir_recursive($destDir);
-            $em = ff_pb_extract_error_message($rec);
-            $empty['error'] = $em !== ''
-                ? ('PocketBase (item ' . $idx . '/' . $total . '): ' . $em)
-                : ('PocketBase (item ' . $idx . '/' . $total . '): HTTP ' . $up['code'] . ' but no record id (keys: ' . implode(', ', array_keys($rec)) . ').');
-            return $empty;
-        }
-        $_SESSION['ff_debug_last_fetch_pb'] = [
-            'pb_http_code' => $up['code'],
-            'body_top_level_keys' => array_keys($rec),
-            'normalized_keys' => array_keys($norm),
-            'record_id_parsed' => $id,
-        ];
-        $createdIds[] = $id;
-        $raster = ff_fetch_raster_image_for_ml($pth);
-        $pipeline = [];
-        $pipeline[] = [
-            'key' => 'pocketbase',
-            'title' => 'Save file to PocketBase',
-            'state' => 'ok',
-            'detail' => ff_fetch_pipeline_truncate_detail('Collection `' . $imCol . '` · record `' . $id . '` · stored file `' . $storedName . '`'),
-        ];
-
-        $gemKey = trim((string) (getenv('GEMINI_API_KEY') ?: ''));
-        $embModel = trim((string) (getenv('GEMINI_EMBED_MODEL') ?: 'gemini-embedding-2-preview'));
-        if ($embModel === '') {
-            $embModel = 'gemini-embedding-2-preview';
-        }
-        $inputEmbDims = 0;
-        $inputEmbPreview = '';
-        $inputEmbErr = '';
-        $inputEmbStored = false;
-        if ($gemKey === '') {
-            $pipeline[] = [
-                'key' => 'input_embed',
-                'title' => 'Embed source image (Gemini → input_media.embedding)',
-                'state' => 'skip',
-                'detail' => 'Set GEMINI_API_KEY and GEMINI_EMBED_MODEL to vectorize the downloaded raster on the input row.',
-            ];
-        } elseif (!$raster['ok']) {
-            $pipeline[] = [
-                'key' => 'input_embed',
-                'title' => 'Embed source image (Gemini → input_media.embedding)',
-                'state' => 'skip',
-                'detail' => ff_fetch_pipeline_truncate_detail($raster['error']),
-            ];
-        } else {
-            $gemImg = ff_gemini_embed_image_b64($gemKey, $embModel, $raster['mime'], $raster['b64']);
-            if ($gemImg['ok'] && $gemImg['vector'] !== []) {
-                $inputEmbDims = count($gemImg['vector']);
-                $inputEmbPreview = ff_embedding_preview_string($gemImg['vector']);
-                $patchEmb = pb_request('PATCH', '/api/collections/' . rawurlencode($imCol) . '/records/' . rawurlencode($id), [
-                    'embedding' => $gemImg['vector'],
-                    'embedding_model' => $embModel,
-                ], $pbToken);
-                if ($patchEmb['code'] >= 200 && $patchEmb['code'] < 300) {
-                    $inputEmbStored = true;
-                    $pipeline[] = [
-                        'key' => 'input_embed',
-                        'title' => 'Embed source image (Gemini → input_media.embedding)',
-                        'state' => 'ok',
-                        'detail' => ff_fetch_pipeline_truncate_detail($embModel . ' · ' . $inputEmbDims . '-dim vector · preview ' . $inputEmbPreview),
-                    ];
-                } else {
-                    $inputEmbErr = ff_pb_extract_error_message(is_array($patchEmb['body'] ?? null) ? $patchEmb['body'] : []) ?: ('HTTP ' . $patchEmb['code']);
-                    $pipeline[] = [
-                        'key' => 'input_embed',
-                        'title' => 'Embed source image (Gemini → input_media.embedding)',
-                        'state' => 'err',
-                        'detail' => ff_fetch_pipeline_truncate_detail('Gemini returned a vector but PocketBase PATCH failed: ' . $inputEmbErr),
-                    ];
-                    ff_pb_patch_merge_record_metadata((string) $pbToken, $imCol, $id, [
-                        'input_embedding_patch_error' => $inputEmbErr,
-                        'input_embedding_patch_at' => gmdate('c'),
-                    ], []);
-                }
-            } else {
-                $inputEmbErr = $gemImg['error'];
-                $pipeline[] = [
-                    'key' => 'input_embed',
-                    'title' => 'Embed source image (Gemini → input_media.embedding)',
-                    'state' => 'err',
-                    'detail' => ff_fetch_pipeline_truncate_detail($inputEmbErr),
-                ];
-            }
-        }
-
-        $vr = ['ok' => false, 'text' => '', 'error' => ''];
-        $promptRec = '';
-        $promptEmbDims = 0;
-        $promptEmbPreview = '';
-        $promptEmbStored = false;
-        $promptPipelineErr = '';
-        $pcol = trim((string) ($GLOBALS['CONFIG']['prompts_collection'] ?? 'prompts'));
-        if ($orKey !== '') {
-            $vr = ff_openrouter_image_recreation_prompt($orKey, $orModel, $pth, $orReferer);
-            $merge = [
-                'image_recreation_prompt_at' => gmdate('c'),
-                'image_recreation_prompt_model' => $orModel,
-            ];
-            $remove = [];
-            if ($vr['ok']) {
-                $merge['image_recreation_prompt'] = $vr['text'];
-                $remove[] = 'image_recreation_prompt_error';
-            } else {
-                $merge['image_recreation_prompt_error'] = $vr['error'];
-            }
-            ff_pb_patch_merge_record_metadata((string) $pbToken, $imCol, $id, $merge, $remove);
-            if ($vr['ok']) {
-                $pipeline[] = [
-                    'key' => 'vision',
-                    'title' => 'Describe image (OpenRouter vision)',
-                    'state' => 'ok',
-                    'detail' => ff_fetch_pipeline_truncate_detail('Model `' . $orModel . '` · text stored in metadata.image_recreation_prompt'),
-                ];
-                if ($pcol !== '') {
-                    $pr = ff_pb_create_prompt_after_fetch((string) $pbToken, $pcol, $imCol, $id, $vr['text']);
-                    $promptRec = (string) $pr['record_id'];
-                    $promptEmbDims = (int) $pr['embedding_dims'];
-                    $promptEmbPreview = (string) $pr['embedding_preview'];
-                    $promptEmbStored = !empty($pr['embedding_stored']);
-                    if ($pr['skipped']) {
-                        $promptPipelineErr = (string) $pr['skip_reason'];
-                        $pipeline[] = [
-                            'key' => 'prompt_row',
-                            'title' => 'Embed prompt + create prompts row',
-                            'state' => 'skip',
-                            'detail' => ff_fetch_pipeline_truncate_detail($promptPipelineErr),
-                        ];
-                    } elseif ($promptRec !== '') {
-                        $warn = $pr['pb_error'] !== '' || $pr['gemini_error'] !== '' || !$promptEmbStored;
-                        $pipeline[] = [
-                            'key' => 'prompt_row',
-                            'title' => 'Embed prompt + create prompts row',
-                            'state' => $warn ? 'warn' : 'ok',
-                            'detail' => ff_fetch_pipeline_truncate_detail(
-                                'Collection `' . $pcol . '` · record `' . $promptRec . '` · model `' . $embModel . '` · '
-                                . ($promptEmbStored
-                                    ? ($promptEmbDims . '-dim prompt_embedding on row · preview ' . $promptEmbPreview)
-                                    : 'prompt row created; vector not stored (Gemini or PocketBase dimension mismatch).')
-                                . ($pr['pb_error'] !== '' ? ' · PB: ' . $pr['pb_error'] : '')
-                                . ($pr['gemini_error'] !== '' ? ' · Gemini: ' . $pr['gemini_error'] : '')
-                            ),
-                        ];
-                    } else {
-                        $promptPipelineErr = $pr['pb_error'] !== '' ? $pr['pb_error'] : ($pr['gemini_error'] !== '' ? $pr['gemini_error'] : 'Prompt row failed');
-                        $pipeline[] = [
-                            'key' => 'prompt_row',
-                            'title' => 'Embed prompt + create prompts row',
-                            'state' => 'err',
-                            'detail' => ff_fetch_pipeline_truncate_detail($promptPipelineErr),
-                        ];
+    $publicBase = ff_garage_public_base_url();
+    $parsed = ff_parse_internal_garage_app_url($src);
+    if ($parsed !== null) {
+        if ($publicBase !== '') {
+            if ($parsed['kind'] === 'social') {
+                $full = ff_garage_social_object_key($parsed['social_account_id'], $parsed['rel']);
+                if ($full !== '') {
+                    $u = ff_garage_public_https_url_for_object_key($full);
+                    if ($u !== '') {
+                        return $u;
                     }
-                } else {
-                    $pipeline[] = [
-                        'key' => 'prompt_row',
-                        'title' => 'Embed prompt + create prompts row',
-                        'state' => 'skip',
-                        'detail' => 'PROMPTS_COLLECTION / prompts_collection is empty.',
-                    ];
                 }
-            } else {
-                $pipeline[] = [
-                    'key' => 'vision',
-                    'title' => 'Describe image (OpenRouter vision)',
-                    'state' => 'err',
-                    'detail' => ff_fetch_pipeline_truncate_detail($vr['error']),
-                ];
-                $pipeline[] = [
-                    'key' => 'prompt_row',
-                    'title' => 'Embed prompt + create prompts row',
-                    'state' => 'skip',
-                    'detail' => 'Skipped because vision did not return prompt text.',
-                ];
             }
-        } else {
-            $pipeline[] = [
-                'key' => 'vision',
-                'title' => 'Describe image (OpenRouter vision)',
-                'state' => 'skip',
-                'detail' => 'OPENROUTER_API_KEY not set.',
-            ];
-            $pipeline[] = [
-                'key' => 'prompt_row',
-                'title' => 'Embed prompt + create prompts row',
-                'state' => 'skip',
-                'detail' => 'Requires vision text (set OPENROUTER_API_KEY) and GEMINI_API_KEY for embeddings.',
-            ];
+            if ($parsed['kind'] === 'generated') {
+                $uid = $pbUserId !== null ? preg_replace('/[^a-zA-Z0-9_-]/', '', $pbUserId) : '';
+                if ($uid !== '') {
+                    $full = ff_garage_generated_object_key($uid, $parsed['rel']);
+                    if ($full !== '') {
+                        $u = ff_garage_public_https_url_for_object_key($full);
+                        if ($u !== '') {
+                            return $u;
+                        }
+                    }
+                }
+            }
         }
 
-        $row = [
-            'id' => $id,
-            'file' => $storedName,
-            'label' => $label,
-            'is_raster' => $raster['ok'],
-            'mime' => $raster['ok'] ? (string) $raster['mime'] : '',
-            'pipeline' => $pipeline,
-            'input_embedding_dims' => $inputEmbDims,
-            'input_embedding_preview' => $inputEmbPreview,
-            'input_embedding_stored' => $inputEmbStored,
-            'input_embedding_error' => $inputEmbErr,
-            'prompt_record_id' => $promptRec,
-            'prompt_embedding_dims' => $promptEmbDims,
-            'prompt_embedding_preview' => $promptEmbPreview,
-            'prompt_embedding_stored' => $promptEmbStored,
-            'prompt_pipeline_error' => $promptPipelineErr,
-            'embed_model' => $embModel,
-        ];
-        if ($orKey !== '') {
-            $row['image_prompt'] = $vr['ok'] ? $vr['text'] : '';
-            $row['image_prompt_error'] = $vr['ok'] ? '' : $vr['error'];
+        return '';
+    }
+    if (preg_match('#^https://#i', $src)) {
+        return $src;
+    }
+    if (preg_match('#^http://#i', $src)) {
+        $pub = parse_url($publicBase !== '' ? $publicBase : '');
+        $cur = parse_url($src);
+        if (is_array($pub) && is_array($cur) && ($cur['host'] ?? '') !== ''
+            && ($cur['host'] ?? '') === ($pub['host'] ?? '')
+            && (int) ($cur['port'] ?? 0) === (int) ($pub['port'] ?? 0)) {
+            return 'https://' . substr($src, 7);
         }
-        $recordRows[] = $row;
-        $pbFiles[] = $storedName;
+
+        return 'https://' . substr($src, 7);
     }
 
-    ff_fetch_rmdir_recursive($destDir);
+    return '';
+}
+
+/**
+ * @return list<string>
+ */
+function ff_carousel_doc_extract_https_image_urls(array $doc, ?string $pbUserId = null): array
+{
+    $raws = [];
+    $slides = $doc['slides'] ?? null;
+    if (!is_array($slides)) {
+        return [];
+    }
+    foreach ($slides as $slide) {
+        if (!is_array($slide)) {
+            continue;
+        }
+        $els = $slide['elements'] ?? [];
+        if (is_array($els)) {
+            foreach ($els as $el) {
+                if (!is_array($el)) {
+                    continue;
+                }
+                $t = $el['type'] ?? '';
+                if ($t !== 'ContentImage' && $t !== 'Image') {
+                    continue;
+                }
+                $src = $el['source']['src'] ?? '';
+                if (is_string($src) && trim($src) !== '') {
+                    $raws[] = trim($src);
+                }
+            }
+        }
+        $bg = $slide['backgroundImage'] ?? null;
+        if (is_array($bg)) {
+            $st = $bg['source'] ?? null;
+            if (is_array($st)) {
+                $src = $st['src'] ?? '';
+                if (is_string($src) && trim($src) !== '') {
+                    $raws[] = trim($src);
+                }
+            }
+        }
+    }
+    $out = [];
+    foreach ($raws as $raw) {
+        $u = ff_instagram_public_https_image_url($raw, $pbUserId);
+        if ($u !== '' && preg_match('#^https://#i', $u)) {
+            $out[] = $u;
+        }
+    }
+
+    return array_values(array_unique($out));
+}
+
+/**
+ * @return list<string>
+ */
+function ff_carousel_doc_collect_raw_image_srcs(array $doc): array
+{
+    $raws = [];
+    $slides = $doc['slides'] ?? null;
+    if (!is_array($slides)) {
+        return [];
+    }
+    foreach ($slides as $slide) {
+        if (!is_array($slide)) {
+            continue;
+        }
+        $els = $slide['elements'] ?? [];
+        if (is_array($els)) {
+            foreach ($els as $el) {
+                if (!is_array($el)) {
+                    continue;
+                }
+                $t = $el['type'] ?? '';
+                if ($t !== 'ContentImage' && $t !== 'Image') {
+                    continue;
+                }
+                $src = $el['source']['src'] ?? '';
+                if (is_string($src) && trim($src) !== '') {
+                    $raws[] = trim($src);
+                }
+            }
+        }
+        $bg = $slide['backgroundImage'] ?? null;
+        if (is_array($bg)) {
+            $st = $bg['source'] ?? null;
+            if (is_array($st)) {
+                $src = $st['src'] ?? '';
+                if (is_string($src) && trim($src) !== '') {
+                    $raws[] = trim($src);
+                }
+            }
+        }
+    }
+
+    return array_values(array_unique($raws));
+}
+
+function ff_ig_hmac_secret(): string
+{
+    $s = trim((string) (getenv('IG_PUBLIC_IMAGE_SECRET') ?: ''));
+    if ($s !== '') {
+        return $s;
+    }
+
+    return trim((string) (getenv('CRON_SECRET') ?: ''));
+}
+
+/**
+ * @return array{ok: bool, bytes: string, content_type: string, error: string}
+ */
+function ff_http_get_bytes_any(string $url, int $maxBytes, int $timeoutSec = 120): array
+{
+    $out = ['ok' => false, 'bytes' => '', 'content_type' => '', 'error' => ''];
+    $url = trim($url);
+    if (!preg_match('#^https?://#i', $url)) {
+        $out['error'] = 'URL must be http(s)';
+
+        return $out;
+    }
+    $buf = '';
+    $ct = '';
+    $ch = curl_init($url);
+    curl_setopt_array($ch, [
+        CURLOPT_RETURNTRANSFER => false,
+        CURLOPT_FOLLOWLOCATION => true,
+        CURLOPT_MAXREDIRS => 5,
+        CURLOPT_TIMEOUT => $timeoutSec,
+        CURLOPT_HTTPHEADER => ['Accept: */*'],
+        CURLOPT_HEADERFUNCTION => static function ($ch, $header) use (&$ct) {
+            if (preg_match('/^content-type:\s*(.+)$/i', $header, $m)) {
+                $ct = trim(explode(';', trim($m[1]))[0]);
+            }
+
+            return strlen($header);
+        },
+        CURLOPT_WRITEFUNCTION => static function ($ch, $chunk) use (&$buf, $maxBytes, &$out) {
+            $buf .= $chunk;
+            if (strlen($buf) > $maxBytes) {
+                $out['error'] = 'Response too large';
+
+                return 0;
+            }
+
+            return strlen($chunk);
+        },
+    ]);
+    $exec = curl_exec($ch);
+    $code = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $cerr = curl_error($ch);
+    curl_close($ch);
+    if ($exec === false) {
+        $out['error'] = $out['error'] !== '' ? $out['error'] : ($cerr !== '' ? $cerr : 'Download failed');
+
+        return $out;
+    }
+    if ($code < 200 || $code >= 300) {
+        $out['error'] = $out['error'] !== '' ? $out['error'] : ('HTTP ' . $code);
+
+        return $out;
+    }
+    if ($buf === '') {
+        $out['error'] = 'Empty body';
+
+        return $out;
+    }
+    $out['ok'] = true;
+    $out['bytes'] = $buf;
+    $out['content_type'] = $ct !== '' ? $ct : 'application/octet-stream';
+
+    return $out;
+}
+
+/**
+ * @return array{ok: bool, bytes: string, content_type: string, error: string}
+ */
+function ff_pb_file_get_bytes(string $collection, string $recordId, string $filename, string $bearerToken): array
+{
+    $out = ['ok' => false, 'bytes' => '', 'content_type' => '', 'error' => ''];
+    $base = rtrim((string) ($GLOBALS['CONFIG']['pocketbase_url'] ?? ''), '/');
+    if ($base === '') {
+        $out['error'] = 'PocketBase URL not configured';
+
+        return $out;
+    }
+    $fn = basename(str_replace('\\', '/', $filename));
+    if ($fn === '' || str_contains($fn, '..')) {
+        $out['error'] = 'Bad filename';
+
+        return $out;
+    }
+    $t = preg_replace('/^\s*Bearer\s+/i', '', trim($bearerToken));
+    if ($t === '') {
+        $out['error'] = 'Missing token';
+
+        return $out;
+    }
+    $url = $base . '/api/files/' . rawurlencode($collection) . '/' . rawurlencode($recordId) . '/' . rawurlencode($fn);
+    $ch = curl_init($url);
+    $buf = '';
+    $ct = '';
+    curl_setopt_array($ch, [
+        CURLOPT_RETURNTRANSFER => false,
+        CURLOPT_FOLLOWLOCATION => true,
+        CURLOPT_TIMEOUT => 120,
+        CURLOPT_HTTPHEADER => ['Authorization: Bearer ' . $t],
+        CURLOPT_HEADERFUNCTION => static function ($ch, $header) use (&$ct) {
+            if (preg_match('/^content-type:\s*(.+)$/i', $header, $m)) {
+                $ct = trim(explode(';', trim($m[1]))[0]);
+            }
+
+            return strlen($header);
+        },
+        CURLOPT_WRITEFUNCTION => static function ($ch, $chunk) use (&$buf) {
+            $buf .= $chunk;
+            if (strlen($buf) > 40 * 1024 * 1024) {
+                return 0;
+            }
+
+            return strlen($chunk);
+        },
+    ]);
+    $exec = curl_exec($ch);
+    $code = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    curl_close($ch);
+    if ($exec === false || $code < 200 || $code >= 300) {
+        $out['error'] = 'HTTP ' . $code;
+
+        return $out;
+    }
+    if ($buf === '') {
+        $out['error'] = 'Empty file';
+
+        return $out;
+    }
+    $out['ok'] = true;
+    $out['bytes'] = $buf;
+    $out['content_type'] = $ct !== '' ? $ct : 'application/octet-stream';
+
+    return $out;
+}
+
+/**
+ * @return array{ok: bool, bytes: string, content_type: string, error: string}
+ */
+function ff_ig_fetch_carousel_image_bytes(string $raw, ?string $authHeader, ?string $pbUserId): array
+{
+    $fail = ['ok' => false, 'bytes' => '', 'content_type' => '', 'error' => ''];
+    $site = rtrim((string) ($GLOBALS['CONFIG']['site_url'] ?? ''), '/');
+    $src = trim($raw);
+    if ($src === '') {
+        $fail['error'] = 'Empty URL';
+
+        return $fail;
+    }
+    if (!preg_match('#^https?://#i', $src)) {
+        if (str_starts_with($src, '//')) {
+            $src = 'https:' . $src;
+        } elseif (str_starts_with($src, '/') && $site !== '') {
+            $src = $site . $src;
+        } else {
+            $fail['error'] = 'Unsupported URL';
+
+            return $fail;
+        }
+    }
+    $maxB = 40 * 1024 * 1024;
+    $parsed = ff_parse_internal_garage_app_url($src);
+    if ($parsed !== null) {
+        if ($authHeader === null || trim($authHeader) === '') {
+            $fail['error'] = 'Session required for Garage image';
+
+            return $fail;
+        }
+        if ($parsed['kind'] === 'social') {
+            $sid = (string) $parsed['social_account_id'];
+            $rel = (string) $parsed['rel'];
+            if (ff_pb_owned_social_account($authHeader, $sid) === null) {
+                $fail['error'] = 'Garage image not accessible';
+
+                return $fail;
+            }
+            $fullKey = ff_garage_social_object_key($sid, $rel);
+            if ($fullKey === '') {
+                $fail['error'] = 'Bad Garage key';
+
+                return $fail;
+            }
+            $r = ff_garage_s3_request('GET', $fullKey, [], '');
+            if (!$r['ok'] || strlen($r['body']) > $maxB) {
+                $fail['error'] = $r['error'] !== '' ? $r['error'] : 'Garage fetch failed';
+
+                return $fail;
+            }
+
+            return ['ok' => true, 'bytes' => $r['body'], 'content_type' => $r['content_type'] ?? 'application/octet-stream', 'error' => ''];
+        }
+        if ($parsed['kind'] === 'generated') {
+            $uid = $pbUserId !== null ? preg_replace('/[^a-zA-Z0-9_-]/', '', $pbUserId) : '';
+            if ($uid === '') {
+                $fail['error'] = 'User id required for generated image';
+
+                return $fail;
+            }
+            $fullKey = ff_garage_generated_object_key($uid, (string) $parsed['rel']);
+            if ($fullKey === '') {
+                $fail['error'] = 'Bad generated key';
+
+                return $fail;
+            }
+            $r = ff_garage_s3_request('GET', $fullKey, [], '');
+            if (!$r['ok'] || strlen($r['body']) > $maxB) {
+                $fail['error'] = $r['error'] !== '' ? $r['error'] : 'Garage fetch failed';
+
+                return $fail;
+            }
+
+            return ['ok' => true, 'bytes' => $r['body'], 'content_type' => $r['content_type'] ?? 'application/octet-stream', 'error' => ''];
+        }
+    }
+    $pq = parse_url($src, PHP_URL_QUERY);
+    if (is_string($pq) && $pq !== '') {
+        parse_str($pq, $q);
+        if (($q['action'] ?? '') === 'media_file') {
+            $cfg = $GLOBALS['CONFIG'];
+            $inpCol = (string) ($cfg['input_media_collection'] ?? 'input_media');
+            $outCol = (string) ($cfg['output_media_collection'] ?? 'output_media');
+            $colWant = trim((string) ($q['collection'] ?? ''));
+            $rid = trim((string) ($q['record_id'] ?? ''));
+            $fn = basename(str_replace('\\', '/', (string) ($q['filename'] ?? '')));
+            if ($colWant === '' || $rid === '' || $fn === '' || str_contains($fn, '..')) {
+                $fail['error'] = 'Bad media_file URL';
+
+                return $fail;
+            }
+            if ($colWant !== $inpCol && $colWant !== $outCol) {
+                $fail['error'] = 'Unsupported collection';
+
+                return $fail;
+            }
+            if ($authHeader === null || trim($authHeader) === '') {
+                $fail['error'] = 'Session required for media file';
+
+                return $fail;
+            }
+            $recR = pb_request('GET', '/api/collections/' . rawurlencode($colWant) . '/records/' . rawurlencode($rid), null, $authHeader);
+            if (($recR['code'] ?? 0) !== 200) {
+                $fail['error'] = 'Record not found';
+
+                return $fail;
+            }
+            $rec = ff_pb_normalize_api_record($recR['body']);
+            if (!is_array($rec) || !ff_pb_record_has_filename($rec, $fn)) {
+                $fail['error'] = 'File not in record';
+
+                return $fail;
+            }
+            $tok = preg_replace('/^\s*Bearer\s+/i', '', trim($authHeader));
+
+            return ff_pb_file_get_bytes($colWant, $rid, $fn, $tok);
+        }
+    }
+    if (preg_match('#^https://#i', $src)) {
+        return ff_http_get_bytes($src, $maxB, 120);
+    }
+    if (preg_match('#^http://#i', $src)) {
+        return ff_http_get_bytes_any($src, $maxB, 120);
+    }
+    $fail['error'] = 'Unsupported image URL';
+
+    return $fail;
+}
+
+/**
+ * @return array{ok: bool, error: string, record_id: string, stored_filename: string}
+ */
+function ff_ig_pb_create_input_media_from_bytes(string $bytes, string $mime, string $fname, string $authHeader): array
+{
+    $out = ['ok' => false, 'error' => '', 'record_id' => '', 'stored_filename' => ''];
+    $cfg = $GLOBALS['CONFIG'];
+    $inpCol = (string) ($cfg['input_media_collection'] ?? 'input_media');
+    $base = rtrim((string) ($cfg['pocketbase_url'] ?? ''), '/');
+    if ($base === '') {
+        $out['error'] = 'PocketBase URL not configured';
+
+        return $out;
+    }
+    $t = preg_replace('/^\s*Bearer\s+/i', '', trim($authHeader));
+    if ($t === '') {
+        $out['error'] = 'No auth token';
+
+        return $out;
+    }
+    $tmp = tempnam(sys_get_temp_dir(), 'igup_');
+    if ($tmp === false) {
+        $out['error'] = 'Temp file failed';
+
+        return $out;
+    }
+    file_put_contents($tmp, $bytes);
+    $safeBase = basename($fname);
+    if (!preg_match('/\.[a-z0-9]{2,8}$/i', $safeBase)) {
+        $safeBase .= '.png';
+    }
+    $cf = new CURLFile($tmp, $mime !== '' ? $mime : 'image/png', $safeBase);
+    $ch = curl_init($base . '/api/collections/' . rawurlencode($inpCol) . '/records');
+    curl_setopt_array($ch, [
+        CURLOPT_POST => true,
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_HTTPHEADER => [
+            'Authorization: Bearer ' . $t,
+        ],
+        CURLOPT_POSTFIELDS => [
+            'body' => json_encode([
+                'title' => 'Instagram carousel',
+                'role' => 'ig_carousel_cache',
+            ], JSON_UNESCAPED_UNICODE),
+            'fetched_files' => $cf,
+        ],
+        CURLOPT_TIMEOUT => 120,
+    ]);
+    $raw = curl_exec($ch);
+    $code = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    curl_close($ch);
+    @unlink($tmp);
+    $body = json_decode($raw ?: '{}', true);
+    if ($code < 200 || $code >= 300 || !is_array($body)) {
+        $out['error'] = is_array($body) ? (string) ($body['message'] ?? 'HTTP ' . $code) : 'HTTP ' . $code;
+
+        return $out;
+    }
+    $rec = ff_pb_normalize_api_record($body);
+    if (!is_array($rec)) {
+        $out['error'] = 'Bad create response';
+
+        return $out;
+    }
+    $rid = trim((string) ($rec['id'] ?? ''));
+    $manifest = ff_pb_record_file_manifest($rec);
+    $stored = $manifest[0] ?? '';
+    if ($rid === '' || $stored === '') {
+        $out['error'] = 'Record missing file';
+
+        return $out;
+    }
+    $out['ok'] = true;
+    $out['record_id'] = $rid;
+    $out['stored_filename'] = $stored;
+
+    return $out;
+}
+
+function ff_ig_signed_public_image_url(string $inpCol, string $rid, string $fname, int $exp): string
+{
+    $secret = ff_ig_hmac_secret();
+    if ($secret === '') {
+        return '';
+    }
+    $sig = hash_hmac('sha256', "ig_pub|$inpCol|$rid|$fname|$exp", $secret);
+    $site = rtrim((string) ($GLOBALS['CONFIG']['site_url'] ?? ''), '/');
+    $path = ff_app_script_path();
+    $q = http_build_query([
+        'action' => 'ig_public_image',
+        'c' => $inpCol,
+        'id' => $rid,
+        'f' => $fname,
+        'exp' => $exp,
+        'sig' => $sig,
+    ], '', '&', PHP_QUERY_RFC3986);
+
+    return $site . $path . '?' . $q;
+}
+
+/**
+ * @return array{ok: bool, url: string, error: string}
+ */
+function ff_ig_materialize_signed_url_for_src(string $raw, ?string $authHeader, ?string $pbUserId): array
+{
+    $out = ['ok' => false, 'url' => '', 'error' => ''];
+    if (ff_ig_hmac_secret() === '') {
+        $out['error'] = 'Set CRON_SECRET or IG_PUBLIC_IMAGE_SECRET for Instagram image URLs.';
+
+        return $out;
+    }
+    $cronTok = trim((string) (getenv('FF_CRON_PB_TOKEN') ?: ''));
+    if ($cronTok === '') {
+        $out['error'] = 'Set FF_CRON_PB_TOKEN (PocketBase token that can read input_media files for publishing).';
+
+        return $out;
+    }
+    if ($authHeader === null || trim($authHeader) === '') {
+        $out['error'] = 'Session required';
+
+        return $out;
+    }
+    $fb = ff_ig_fetch_carousel_image_bytes($raw, $authHeader, $pbUserId);
+    if (!$fb['ok']) {
+        $out['error'] = $fb['error'] !== '' ? $fb['error'] : 'Download failed';
+
+        return $out;
+    }
+    $mime = strtolower(trim($fb['content_type']));
+    if ($mime !== '' && !str_starts_with($mime, 'image/')) {
+        $out['error'] = 'Not an image (Content-Type: ' . $mime . ')';
+
+        return $out;
+    }
+    $ext = 'png';
+    if (str_contains($mime, 'jpeg') || str_contains($mime, 'jpg')) {
+        $ext = 'jpg';
+    } elseif (str_contains($mime, 'webp')) {
+        $ext = 'webp';
+    } elseif (str_contains($mime, 'gif')) {
+        $ext = 'gif';
+    }
+    $fname = 'ig_carousel_' . gmdate('Ymd\THis\Z') . '_' . bin2hex(random_bytes(3)) . '.' . $ext;
+    $cr = ff_ig_pb_create_input_media_from_bytes($fb['bytes'], $fb['content_type'] !== '' ? $fb['content_type'] : 'image/png', $fname, $authHeader);
+    if (!$cr['ok']) {
+        $out['error'] = $cr['error'] !== '' ? $cr['error'] : 'PocketBase upload failed';
+
+        return $out;
+    }
+    $cfg = $GLOBALS['CONFIG'];
+    $inpCol = (string) ($cfg['input_media_collection'] ?? 'input_media');
+    $probe = ff_pb_file_get_bytes($inpCol, $cr['record_id'], $cr['stored_filename'], $cronTok);
+    if (!$probe['ok']) {
+        $out['error'] = 'FF_CRON_PB_TOKEN cannot read the uploaded file (check PocketBase rules / use a superuser token).';
+
+        return $out;
+    }
+    $exp = time() + (86400 * 400);
+    $u = ff_ig_signed_public_image_url($inpCol, $cr['record_id'], $cr['stored_filename'], $exp);
+    if ($u === '' || !preg_match('#^https://#i', $u)) {
+        $out['error'] = 'Could not build signed URL (APP_URL must be https in production).';
+
+        return $out;
+    }
+    $out['ok'] = true;
+    $out['url'] = $u;
+
+    return $out;
+}
+
+/**
+ * @return array{ok: bool, urls: list<string>, error: string}
+ */
+function ff_carousel_doc_resolve_ig_image_urls_for_schedule(array $doc, string $authHeader, ?string $pbUserId): array
+{
+    $raws = ff_carousel_doc_collect_raw_image_srcs($doc);
+    if ($raws === []) {
+        return ['ok' => false, 'urls' => [], 'error' => 'No image URLs in this carousel. In the Slides tab, set a Content image or Background image URL on each slide (or add content-image blocks). Instagram only receives public https:// links to image files—Meta does not screenshot the center preview card.'];
+    }
+    $needMat = false;
+    foreach ($raws as $raw) {
+        $u = ff_instagram_public_https_image_url($raw, $pbUserId);
+        if ($u === '' || !preg_match('#^https://#i', $u)) {
+            $needMat = true;
+            break;
+        }
+    }
+    if ($needMat && ff_ig_hmac_secret() === '') {
+        return ['ok' => false, 'urls' => [], 'error' => 'Set CRON_SECRET or IG_PUBLIC_IMAGE_SECRET so images can be hosted as signed HTTPS URLs for Instagram.'];
+    }
+    $urls = [];
+    foreach ($raws as $raw) {
+        $u = ff_instagram_public_https_image_url($raw, $pbUserId);
+        if ($u !== '' && preg_match('#^https://#i', $u)) {
+            $urls[] = $u;
+
+            continue;
+        }
+        $mat = ff_ig_materialize_signed_url_for_src($raw, $authHeader, $pbUserId);
+        if (!$mat['ok']) {
+            return ['ok' => false, 'urls' => [], 'error' => $mat['error'] !== '' ? $mat['error'] : 'Could not prepare image for Instagram.'];
+        }
+        $urls[] = $mat['url'];
+    }
+
+    return ['ok' => true, 'urls' => array_values(array_unique($urls)), 'error' => ''];
+}
+
+/**
+ * @return array{code: int, body: array<string, mixed>, raw: string}
+ */
+function ff_ig_graph_request(string $method, string $path, string $accessToken, array $params = []): array
+{
+    $path = ltrim($path, '/');
+    $url = 'https://graph.facebook.com/v18.0/' . $path;
+    $method = strtoupper($method);
+    $params['access_token'] = $accessToken;
+    $ch = curl_init();
+    if ($method === 'GET') {
+        $url .= '?' . http_build_query($params);
+        curl_setopt_array($ch, [
+            CURLOPT_URL => $url,
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_TIMEOUT => 120,
+        ]);
+    } else {
+        curl_setopt_array($ch, [
+            CURLOPT_URL => $url,
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_TIMEOUT => 120,
+            CURLOPT_POST => true,
+            CURLOPT_POSTFIELDS => $params,
+        ]);
+    }
+    $raw = curl_exec($ch);
+    $code = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    curl_close($ch);
+    $decoded = json_decode($raw ?: '{}', true);
+    $body = is_array($decoded) ? $decoded : [];
+
+    return ['code' => $code, 'body' => $body, 'raw' => $raw ?: ''];
+}
+
+function ff_ig_wait_media_ready(string $creationId, string $accessToken, int $maxWaitSec = 90): bool
+{
+    $deadline = time() + $maxWaitSec;
+    while (time() < $deadline) {
+        $r = ff_ig_graph_request('GET', $creationId, $accessToken, ['fields' => 'status_code,status']);
+        if (($r['code'] ?? 0) !== 200) {
+            return false;
+        }
+        $st = (string) ($r['body']['status_code'] ?? $r['body']['status'] ?? '');
+        if ($st === 'FINISHED' || $st === 'PUBLISHED') {
+            return true;
+        }
+        if ($st === 'ERROR' || $st === 'EXPIRED') {
+            return false;
+        }
+        usleep(500000);
+    }
+
+    return false;
+}
+
+/**
+ * @param  list<string>  $imageUrls
+ * @return list<string>
+ */
+function ff_ig_normalize_image_url_list(array $imageUrls, ?string $pbUserIdForGarage): array
+{
+    $out = [];
+    foreach ($imageUrls as $u) {
+        if (!is_string($u)) {
+            continue;
+        }
+        $n = ff_instagram_public_https_image_url(trim($u), $pbUserIdForGarage);
+        if ($n !== '' && preg_match('#^https://#i', $n)) {
+            $out[] = $n;
+        }
+    }
+
+    return array_values(array_unique($out));
+}
+
+/**
+ * @return array{ok: bool, error: string, media_id: string}
+ */
+function ff_ig_publish_carousel_or_single(string $igUserId, string $accessToken, array $imageUrls, string $caption, ?string $pbUserIdForGarage = null): array
+{
+    $out = ['ok' => false, 'error' => '', 'media_id' => ''];
+    $caption = trim($caption);
+    if (mb_strlen($caption) > 2200) {
+        $caption = mb_substr($caption, 0, 2200);
+    }
+    $imageUrls = ff_ig_normalize_image_url_list($imageUrls, $pbUserIdForGarage);
+    if ($imageUrls === []) {
+        $out['error'] = 'No public HTTPS image URLs for Instagram. Configure GARAGE_PUBLIC_URL / GARAGE_PUBLIC_ROOT_DOMAIN or use direct https:// image links.';
+
+        return $out;
+    }
+    if (count($imageUrls) > 10) {
+        $out['error'] = 'Instagram allows at most 10 images per post.';
+
+        return $out;
+    }
+
+    if (count($imageUrls) === 1) {
+        $r = ff_ig_graph_request('POST', $igUserId . '/media', $accessToken, [
+            'image_url' => $imageUrls[0],
+            'caption' => $caption,
+        ]);
+        if (($r['code'] ?? 0) < 200 || ($r['code'] ?? 0) >= 300) {
+            $out['error'] = (string) ($r['body']['error']['message'] ?? $r['raw'] ?? 'Graph API error');
+
+            return $out;
+        }
+        $cid = (string) ($r['body']['id'] ?? '');
+        if ($cid === '') {
+            $out['error'] = 'Graph API returned no media id';
+
+            return $out;
+        }
+        if (!ff_ig_wait_media_ready($cid, $accessToken)) {
+            $out['error'] = 'Image did not finish processing in time.';
+
+            return $out;
+        }
+        $pub = ff_ig_graph_request('POST', $igUserId . '/media_publish', $accessToken, ['creation_id' => $cid]);
+        if (($pub['code'] ?? 0) < 200 || ($pub['code'] ?? 0) >= 300) {
+            $out['error'] = (string) ($pub['body']['error']['message'] ?? $pub['raw'] ?? 'Publish failed');
+
+            return $out;
+        }
+        $out['ok'] = true;
+        $out['media_id'] = (string) ($pub['body']['id'] ?? '');
+
+        return $out;
+    }
+
+    $childIds = [];
+    foreach ($imageUrls as $imgUrl) {
+        $r = ff_ig_graph_request('POST', $igUserId . '/media', $accessToken, [
+            'image_url' => $imgUrl,
+            'is_carousel_item' => 'true',
+        ]);
+        if (($r['code'] ?? 0) < 200 || ($r['code'] ?? 0) >= 300) {
+            $out['error'] = (string) ($r['body']['error']['message'] ?? $r['raw'] ?? 'Graph API error (carousel item)');
+
+            return $out;
+        }
+        $cid = (string) ($r['body']['id'] ?? '');
+        if ($cid === '') {
+            $out['error'] = 'Graph API returned no child media id';
+
+            return $out;
+        }
+        if (!ff_ig_wait_media_ready($cid, $accessToken)) {
+            $out['error'] = 'A carousel image did not finish processing in time.';
+
+            return $out;
+        }
+        $childIds[] = $cid;
+    }
+
+    $r = ff_ig_graph_request('POST', $igUserId . '/media', $accessToken, [
+        'media_type' => 'CAROUSEL',
+        'children' => implode(',', $childIds),
+        'caption' => $caption,
+    ]);
+    if (($r['code'] ?? 0) < 200 || ($r['code'] ?? 0) >= 300) {
+        $out['error'] = (string) ($r['body']['error']['message'] ?? $r['raw'] ?? 'Graph API error (carousel container)');
+
+        return $out;
+    }
+    $carouselId = (string) ($r['body']['id'] ?? '');
+    if ($carouselId === '') {
+        $out['error'] = 'Graph API returned no carousel id';
+
+        return $out;
+    }
+    if (!ff_ig_wait_media_ready($carouselId, $accessToken)) {
+        $out['error'] = 'Carousel container did not finish processing in time.';
+
+        return $out;
+    }
+    $pub = ff_ig_graph_request('POST', $igUserId . '/media_publish', $accessToken, ['creation_id' => $carouselId]);
+    if (($pub['code'] ?? 0) < 200 || ($pub['code'] ?? 0) >= 300) {
+        $out['error'] = (string) ($pub['body']['error']['message'] ?? $pub['raw'] ?? 'Publish failed');
+
+        return $out;
+    }
+    $out['ok'] = true;
+    $out['media_id'] = (string) ($pub['body']['id'] ?? '');
+
+    return $out;
+}
+
+function ff_app_script_path(): string
+{
+    return $_SERVER['SCRIPT_NAME'] ?? '/index.php';
+}
+
+/** @return 'image'|'video'|'audio'|'file' */
+function ff_media_kind_from_filename(string $name): string
+{
+    $ext = strtolower(pathinfo(str_replace('\\', '/', $name), PATHINFO_EXTENSION));
+    $img = ['jpg', 'jpeg', 'png', 'gif', 'webp', 'avif', 'svg', 'bmp', 'ico', 'heic', 'heif'];
+    $vid = ['mp4', 'webm', 'mov', 'mkv', 'm4v', 'ogv', 'avi'];
+    $aud = ['mp3', 'wav', 'ogg', 'flac', 'm4a', 'aac', 'opus', 'wma', 'aiff', 'aif'];
+
+    if (in_array($ext, $img, true)) {
+        return 'image';
+    }
+    if (in_array($ext, $vid, true)) {
+        return 'video';
+    }
+    if (in_array($ext, $aud, true)) {
+        return 'audio';
+    }
+
+    return 'file';
+}
+
+/**
+ * @return list<string>
+ */
+function ff_pb_normalize_file_field($v): array
+{
+    if ($v === null || $v === '') {
+        return [];
+    }
+    if (is_string($v)) {
+        $decoded = json_decode($v, true);
+        if (is_array($decoded)) {
+            $v = $decoded;
+        } else {
+            return [$v];
+        }
+    }
+    if (!is_array($v)) {
+        return [];
+    }
+    $out = [];
+    foreach ($v as $x) {
+        if (is_string($x) && $x !== '') {
+            $out[] = $x;
+        }
+    }
+
+    return $out;
+}
+
+/**
+ * Filenames attached to a PocketBase record (fetched_files, media_file, …).
+ *
+ * @param array<string, mixed> $rec
+ * @return list<string>
+ */
+function ff_pb_record_file_manifest(array $rec): array
+{
+    $names = [];
+    foreach (['fetched_files', 'media_file'] as $f) {
+        if (isset($rec[$f])) {
+            $names = array_merge($names, ff_pb_normalize_file_field($rec[$f]));
+        }
+    }
+
+    return array_values(array_unique(array_filter($names)));
+}
+
+/**
+ * @param array<string, mixed> $rec
+ */
+function ff_pb_record_has_filename(array $rec, string $want): bool
+{
+    $wantBase = basename(str_replace('\\', '/', $want));
+    foreach (ff_pb_record_file_manifest($rec) as $n) {
+        if (basename(str_replace('\\', '/', $n)) === $wantBase) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+function ff_pb_files_base_url(): string
+{
+    $cfg = $GLOBALS['CONFIG'];
+    $pub = rtrim((string) ($cfg['pocketbase_public_url'] ?? ''), '/');
+    if ($pub !== '') {
+        return $pub;
+    }
+
+    return rtrim((string) ($cfg['pocketbase_url'] ?? ''), '/');
+}
+
+function ff_pb_build_files_token_url(string $collectionName, string $recordId, string $filename, string $authHeader): string
+{
+    $base = ff_pb_files_base_url();
+    if ($base === '') {
+        return '';
+    }
+    $t = preg_replace('/^\s*Bearer\s+/i', '', trim($authHeader));
+    if ($t === '') {
+        return '';
+    }
+    $fn = basename(str_replace('\\', '/', $filename));
+    if ($fn === '' || str_contains($fn, '..')) {
+        return '';
+    }
+    $path = '/api/files/' . rawurlencode($collectionName) . '/' . rawurlencode($recordId) . '/' . rawurlencode($fn);
+
+    return $base . $path . '?token=' . rawurlencode($t);
+}
+
+/**
+ * Preview entries for one PocketBase record (file fields + thumbnail + garage URL).
+ *
+ * @param array<string, mixed> $rec
+ * @return list<array{kind: string, label: string, url: string, external: bool}>
+ */
+function ff_media_entries_from_pb_record(array $rec, string $collectionName, string $script): array
+{
+    $entries = [];
+    $rid = trim((string) ($rec['id'] ?? ''));
+    if ($rid === '') {
+        return [];
+    }
+    foreach (ff_pb_record_file_manifest($rec) as $fname) {
+        $fname = (string) $fname;
+        $entries[] = [
+            'kind' => ff_media_kind_from_filename($fname),
+            'label' => $fname,
+            'url' => $script . '?action=media_file&collection=' . rawurlencode($collectionName)
+                . '&record_id=' . rawurlencode($rid) . '&filename=' . rawurlencode($fname),
+            'external' => false,
+        ];
+    }
+    $tu = trim((string) ($rec['thumbnail_url'] ?? ''));
+    if ($tu !== '' && (str_starts_with($tu, 'http://') || str_starts_with($tu, 'https://'))) {
+        $entries[] = [
+            'kind' => 'image',
+            'label' => 'thumbnail',
+            'url' => $tu,
+            'external' => true,
+        ];
+    }
+    $gu = trim((string) ($rec['garage_url'] ?? ''));
+    if ($gu !== '' && (str_starts_with($gu, 'http://') || str_starts_with($gu, 'https://'))) {
+        $path = (string) (parse_url($gu, PHP_URL_PATH) ?: '');
+        $gk = ff_media_kind_from_filename($path !== '' ? $path : $gu);
+        if ($gk === 'file') {
+            $gk = 'video';
+        }
+        $entries[] = [
+            'kind' => $gk,
+            'label' => 'garage_url',
+            'url' => $gu,
+            'external' => true,
+        ];
+    }
+
+    return $entries;
+}
+
+/**
+ * Path-style canonical URI: /bucket or /bucket/key/with/slashes (each segment URI-encoded).
+ */
+function ff_garage_s3_uri_path(string $bucket, string $objectKey): string
+{
+    $segs = [$bucket];
+    if ($objectKey !== '') {
+        foreach (explode('/', $objectKey) as $p) {
+            if ($p !== '') {
+                $segs[] = rawurlencode($p);
+            }
+        }
+    }
+
+    return '/' . implode('/', $segs);
+}
+
+/**
+ * @param array<string, string> $query
+ */
+function ff_garage_s3_canonical_query(array $query): string
+{
+    if ($query === []) {
+        return '';
+    }
+    ksort($query, SORT_STRING);
+    $pairs = [];
+    foreach ($query as $k => $v) {
+        $pairs[] = rawurlencode((string) $k) . '=' . rawurlencode((string) $v);
+    }
+
+    return implode('&', $pairs);
+}
+
+function ff_http_block_content_type(string $rawHeaders): string
+{
+    foreach (preg_split("/\r\n|\n|\r/", $rawHeaders) as $line) {
+        if (stripos($line, 'Content-Type:') === 0) {
+            return trim(substr($line, strlen('Content-Type:')));
+        }
+    }
+
+    return 'application/octet-stream';
+}
+
+/**
+ * @return array{ok: bool, code: int, body: string, error: string, content_type: string}
+ */
+function ff_garage_s3_request(string $method, string $objectKey, array $query, string $body): array
+{
+    $cfg = $GLOBALS['CONFIG'];
+    $endpoint = rtrim((string) ($cfg['garage_endpoint'] ?? ''), '/');
+    $bucket = (string) ($cfg['garage_social_content_bucket'] ?? '');
+    $region = (string) ($cfg['garage_region'] ?? 'garage');
+    $accessKey = (string) ($cfg['garage_access_key'] ?? '');
+    $secretKey = (string) ($cfg['garage_secret_key'] ?? '');
+    $pu = parse_url($endpoint);
+    if (!is_array($pu) || empty($pu['host'])) {
+        return ['ok' => false, 'code' => 0, 'body' => '', 'error' => 'Invalid GARAGE_ENDPOINT', 'content_type' => ''];
+    }
+    $scheme = $pu['scheme'] ?? 'http';
+    $port = isset($pu['port']) ? (int) $pu['port'] : ($scheme === 'https' ? 443 : 80);
+    $hostHeader = (string) $pu['host'];
+    if (!(($scheme === 'https' && $port === 443) || ($scheme === 'http' && $port === 80))) {
+        $hostHeader .= ':' . $port;
+    }
+    $canonicalUri = ff_garage_s3_uri_path($bucket, $objectKey);
+    $canonicalQuery = ff_garage_s3_canonical_query($query);
+    $payloadHash = hash('sha256', $body);
+    $amzDate = gmdate('Ymd\THis\Z');
+    $dateStamp = gmdate('Ymd');
+    $canonicalHeaders = 'host:' . $hostHeader . "\n"
+        . 'x-amz-content-sha256:' . $payloadHash . "\n"
+        . 'x-amz-date:' . $amzDate . "\n";
+    $signedHeaders = 'host;x-amz-content-sha256;x-amz-date';
+    $canonicalRequest = strtoupper($method) . "\n"
+        . $canonicalUri . "\n"
+        . $canonicalQuery . "\n"
+        . $canonicalHeaders . "\n"
+        . $signedHeaders . "\n"
+        . $payloadHash;
+    $algorithm = 'AWS4-HMAC-SHA256';
+    $credentialScope = $dateStamp . '/' . $region . '/s3/aws4_request';
+    $stringToSign = $algorithm . "\n"
+        . $amzDate . "\n"
+        . $credentialScope . "\n"
+        . hash('sha256', $canonicalRequest);
+    $kDate = hash_hmac('sha256', $dateStamp, 'AWS4' . $secretKey, true);
+    $kRegion = hash_hmac('sha256', $region, $kDate, true);
+    $kService = hash_hmac('sha256', 's3', $kRegion, true);
+    $kSigning = hash_hmac('sha256', 'aws4_request', $kService, true);
+    $signature = hash_hmac('sha256', $stringToSign, $kSigning);
+    $authHeader = $algorithm . ' Credential=' . $accessKey . '/' . $credentialScope
+        . ', SignedHeaders=' . $signedHeaders . ', Signature=' . $signature;
+    $baseUrl = $scheme . '://' . (string) $pu['host'];
+    if (!(($scheme === 'https' && $port === 443) || ($scheme === 'http' && $port === 80))) {
+        $baseUrl .= ':' . $port;
+    }
+    $url = $baseUrl . $canonicalUri . ($canonicalQuery !== '' ? '?' . $canonicalQuery : '');
+    $reqHeaders = [
+        'Host: ' . $hostHeader,
+        'X-Amz-Date: ' . $amzDate,
+        'X-Amz-Content-Sha256: ' . $payloadHash,
+        'Authorization: ' . $authHeader,
+    ];
+    $splitObjectHeaders = strtoupper($method) === 'GET' && $objectKey !== '' && $query === [];
+    $ch = curl_init($url);
+    curl_setopt_array($ch, [
+        CURLOPT_CUSTOMREQUEST => strtoupper($method),
+        CURLOPT_HTTPHEADER => $reqHeaders,
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_HEADER => $splitObjectHeaders,
+    ]);
+    if ($body !== '' || strtoupper($method) === 'PUT') {
+        curl_setopt($ch, CURLOPT_POSTFIELDS, $body);
+    }
+    $raw = curl_exec($ch);
+    $outCode = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $headerSize = $splitObjectHeaders ? (int) curl_getinfo($ch, CURLINFO_HEADER_SIZE) : 0;
+    curl_close($ch);
+    $outBody = is_string($raw) ? $raw : '';
+    $outCt = 'application/octet-stream';
+    if ($splitObjectHeaders && $outBody !== '' && $headerSize > 0 && $headerSize < strlen($outBody)) {
+        $head = substr($outBody, 0, $headerSize);
+        $outBody = substr($outBody, $headerSize);
+        $outCt = ff_http_block_content_type($head);
+    }
+
+    return ['ok' => $outCode >= 200 && $outCode < 300, 'code' => $outCode, 'body' => $outBody, 'error' => '', 'content_type' => $outCt];
+}
+
+function ff_s3_xml_text_decode(string $s): string
+{
+    return html_entity_decode(trim($s), ENT_XML1 | ENT_QUOTES | ENT_HTML5, 'UTF-8');
+}
+
+/**
+ * S3 error body (Code / Message) without ext-simplexml.
+ */
+function ff_garage_s3_xml_error(string $xml): string
+{
+    if ($xml === '' || !str_contains($xml, '<')) {
+        return '';
+    }
+    if (function_exists('simplexml_load_string')) {
+        $x = @simplexml_load_string($xml);
+        if ($x !== false) {
+            $code = (string) ($x->Code ?? '');
+            $msg = (string) ($x->Message ?? '');
+            $err = trim($code . ($msg !== '' ? ': ' . $msg : ''));
+            if ($err !== '') {
+                return $err;
+            }
+        }
+    }
+    $code = '';
+    $msg = '';
+    if (preg_match('/<(?:[a-z0-9]+:)?Code>([^<]*)<\/(?:[a-z0-9]+:)?Code>/i', $xml, $c)) {
+        $code = ff_s3_xml_text_decode($c[1]);
+    }
+    if (preg_match('/<(?:[a-z0-9]+:)?Message>([^<]*)<\/(?:[a-z0-9]+:)?Message>/is', $xml, $m)) {
+        $msg = ff_s3_xml_text_decode($m[1]);
+    }
+
+    return trim($code . ($msg !== '' ? ': ' . $msg : ''));
+}
+
+/**
+ * Regex parse for S3 ListBucket (ListBucketResult) when SimpleXML is unavailable.
+ *
+ * @return list<array{key: string, size: int, last_modified: string}>|null null = not a valid list response
+ */
+function ff_garage_parse_list_bucket_xml_regex(string $body): ?array
+{
+    if ($body === '' || !str_contains($body, '<')) {
+        return null;
+    }
+    if (!preg_match('/<(?:[a-z0-9]+:)?ListBucketResult\b/i', $body)) {
+        return null;
+    }
+    if (!preg_match_all('/<(?:[a-z0-9]+:)?Contents>([\s\S]*?)<\/(?:[a-z0-9]+:)?Contents>/i', $body, $blocks, PREG_SET_ORDER)) {
+        return [];
+    }
+    $items = [];
+    foreach ($blocks as $b) {
+        $block = $b[1] ?? '';
+        if (!preg_match('/<(?:[a-z0-9]+:)?Key>([^<]*)<\/(?:[a-z0-9]+:)?Key>/i', $block, $mk)) {
+            continue;
+        }
+        $key = ff_s3_xml_text_decode($mk[1]);
+        if ($key === '') {
+            continue;
+        }
+        $size = 0;
+        if (preg_match('/<(?:[a-z0-9]+:)?Size>([^<]*)<\/(?:[a-z0-9]+:)?Size>/i', $block, $ms)) {
+            $size = (int) trim($ms[1]);
+        }
+        $lastMod = '';
+        if (preg_match('/<(?:[a-z0-9]+:)?LastModified>([^<]*)<\/(?:[a-z0-9]+:)?LastModified>/i', $block, $ml)) {
+            $lastMod = ff_s3_xml_text_decode($ml[1]);
+        }
+        $items[] = [
+            'key' => $key,
+            'size' => $size,
+            'last_modified' => $lastMod,
+        ];
+    }
+
+    return $items;
+}
+
+/**
+ * @return list<array{key: string, size: int, last_modified: string}>|null
+ */
+function ff_garage_parse_list_bucket_xml(string $body): ?array
+{
+    if (function_exists('simplexml_load_string')) {
+        $xml = @simplexml_load_string($body);
+        if ($xml !== false) {
+            $items = [];
+            if (isset($xml->Contents)) {
+                foreach ($xml->Contents as $c) {
+                    $key = (string) ($c->Key ?? '');
+                    if ($key === '') {
+                        continue;
+                    }
+                    $items[] = [
+                        'key' => $key,
+                        'size' => (int) ($c->Size ?? 0),
+                        'last_modified' => (string) ($c->LastModified ?? ''),
+                    ];
+                }
+            }
+
+            return $items;
+        }
+    }
+
+    return ff_garage_parse_list_bucket_xml_regex($body);
+}
+
+/**
+ * @return array{ok: bool, items: list<array{key: string, rel: string, size: int, last_modified: string}>, error: string}
+ */
+function ff_garage_list_under_prefix(string $prefix, int $maxKeys): array
+{
+    $q = [
+        'list-type' => '2',
+        'prefix' => $prefix,
+        'max-keys' => (string) max(1, min(1000, $maxKeys)),
+    ];
+    $r = ff_garage_s3_request('GET', '', $q, '');
+    if (!$r['ok']) {
+        $err = ff_garage_s3_xml_error($r['body']) ?: ('HTTP ' . $r['code']);
+
+        return ['ok' => false, 'items' => [], 'error' => $err];
+    }
+    $parsed = ff_garage_parse_list_bucket_xml($r['body']);
+    if ($parsed === null) {
+        return ['ok' => false, 'items' => [], 'error' => 'Invalid S3 list response'];
+    }
+    $items = [];
+    foreach ($parsed as $row) {
+        $key = $row['key'];
+        if ($key === '' || str_ends_with($key, '/')) {
+            continue;
+        }
+        $rel = $key;
+        if (str_starts_with($rel, $prefix)) {
+            $rel = substr($rel, strlen($prefix));
+        }
+        $items[] = [
+            'key' => $key,
+            'rel' => $rel,
+            'size' => $row['size'],
+            'last_modified' => $row['last_modified'],
+            'kind' => ff_media_kind_from_filename($rel),
+        ];
+    }
+
+    return ['ok' => true, 'items' => $items, 'error' => ''];
+}
+
+/**
+ * @return array{ok: bool, error: string}
+ */
+function ff_garage_delete_object(string $objectKey): array
+{
+    $r = ff_garage_s3_request('DELETE', $objectKey, [], '');
+    if ($r['ok'] || $r['code'] === 404) {
+        return ['ok' => true, 'error' => ''];
+    }
+
+    return ['ok' => false, 'error' => ff_garage_s3_xml_error($r['body']) ?: ('HTTP ' . $r['code'])];
+}
+
+/**
+ * @return array{ok: bool, error: string}
+ */
+function ff_garage_put_object(string $objectKey, string $bytes, string $contentType): array
+{
+    $cfg = $GLOBALS['CONFIG'];
+    $endpoint = rtrim((string) ($cfg['garage_endpoint'] ?? ''), '/');
+    $bucket = (string) ($cfg['garage_social_content_bucket'] ?? '');
+    $region = (string) ($cfg['garage_region'] ?? 'garage');
+    $accessKey = (string) ($cfg['garage_access_key'] ?? '');
+    $secretKey = (string) ($cfg['garage_secret_key'] ?? '');
+    $pu = parse_url($endpoint);
+    if (!is_array($pu) || empty($pu['host'])) {
+        return ['ok' => false, 'error' => 'Invalid GARAGE_ENDPOINT'];
+    }
+    $scheme = $pu['scheme'] ?? 'http';
+    $port = isset($pu['port']) ? (int) $pu['port'] : ($scheme === 'https' ? 443 : 80);
+    $hostHeader = (string) $pu['host'];
+    if (!(($scheme === 'https' && $port === 443) || ($scheme === 'http' && $port === 80))) {
+        $hostHeader .= ':' . $port;
+    }
+    $canonicalUri = ff_garage_s3_uri_path($bucket, $objectKey);
+    $payloadHash = hash('sha256', $bytes);
+    $amzDate = gmdate('Ymd\THis\Z');
+    $dateStamp = gmdate('Ymd');
+    $canonicalHeaders = 'content-type:' . $contentType . "\n"
+        . 'host:' . $hostHeader . "\n"
+        . 'x-amz-content-sha256:' . $payloadHash . "\n"
+        . 'x-amz-date:' . $amzDate . "\n";
+    $signedHeaders = 'content-type;host;x-amz-content-sha256;x-amz-date';
+    $canonicalRequest = "PUT\n"
+        . $canonicalUri . "\n"
+        . "\n"
+        . $canonicalHeaders . "\n"
+        . $signedHeaders . "\n"
+        . $payloadHash;
+    $algorithm = 'AWS4-HMAC-SHA256';
+    $credentialScope = $dateStamp . '/' . $region . '/s3/aws4_request';
+    $stringToSign = $algorithm . "\n"
+        . $amzDate . "\n"
+        . $credentialScope . "\n"
+        . hash('sha256', $canonicalRequest);
+    $kDate = hash_hmac('sha256', $dateStamp, 'AWS4' . $secretKey, true);
+    $kRegion = hash_hmac('sha256', $region, $kDate, true);
+    $kService = hash_hmac('sha256', 's3', $kRegion, true);
+    $kSigning = hash_hmac('sha256', 'aws4_request', $kService, true);
+    $signature = hash_hmac('sha256', $stringToSign, $kSigning);
+    $authHeader = $algorithm . ' Credential=' . $accessKey . '/' . $credentialScope
+        . ', SignedHeaders=' . $signedHeaders . ', Signature=' . $signature;
+    $baseUrl = $scheme . '://' . (string) $pu['host'];
+    if (!(($scheme === 'https' && $port === 443) || ($scheme === 'http' && $port === 80))) {
+        $baseUrl .= ':' . $port;
+    }
+    $url = $baseUrl . $canonicalUri;
+    $ch = curl_init($url);
+    curl_setopt_array($ch, [
+        CURLOPT_CUSTOMREQUEST => 'PUT',
+        CURLOPT_POSTFIELDS => $bytes,
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_HTTPHEADER => [
+            'Host: ' . $hostHeader,
+            'Content-Type: ' . $contentType,
+            'X-Amz-Date: ' . $amzDate,
+            'X-Amz-Content-Sha256: ' . $payloadHash,
+            'Authorization: ' . $authHeader,
+        ],
+    ]);
+    $raw = curl_exec($ch);
+    $code = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    curl_close($ch);
+    if ($code >= 200 && $code < 300) {
+        return ['ok' => true, 'error' => ''];
+    }
+
+    return ['ok' => false, 'error' => ff_garage_s3_xml_error(is_string($raw) ? $raw : '') ?: ('HTTP ' . $code)];
+}
+
+/**
+ * @return array<string, mixed>
+ */
+function ff_debug_collect_safe(): array
+{
+    $cfg = $GLOBALS['CONFIG'];
+    $pbHealth = pb_request('GET', '/api/health', null, null);
 
     return [
-        'ok' => true,
-        'record_id' => (string) ($recordRows[0]['id'] ?? ''),
-        'record_rows' => $recordRows,
-        'pb_files' => $pbFiles,
-        'n' => count($recordRows),
-        'error' => '',
-        'via' => $via,
+        'generated_at' => gmdate('c'),
+        'app' => [
+            'version' => (string) ($cfg['app_version'] ?? ''),
+            'php_version' => PHP_VERSION,
+            'php_sapi' => PHP_SAPI,
+            'os' => PHP_OS_FAMILY,
+        ],
+        'config_redacted' => ff_debug_redact_config($cfg),
+        'pocketbase' => [
+            'url_resolution' => (string) ($cfg['pocketbase_url_resolution'] ?? ''),
+            'public_url' => (string) ($cfg['pocketbase_public_url'] ?? ''),
+            'api_health' => [
+                'http_code' => $pbHealth['code'],
+                'ok' => $pbHealth['code'] >= 200 && $pbHealth['code'] < 300,
+            ],
+        ],
+        'ai_carousel' => [
+            'slide_generator' => 'openrouter_only',
+            'openrouter_configured' => trim((string) (getenv('OPENROUTER_API_KEY') ?: '')) !== '',
+            'gemini' => trim((string) (getenv('GEMINI_API_KEY') ?: '')) !== '',
+            'openai' => trim((string) (getenv('OPENAI_API_KEY') ?: '')) !== '',
+        ],
+        'gemini_embed' => [
+            'api_key_set' => trim((string) (getenv('GEMINI_API_KEY') ?: '')) !== '',
+            'model' => trim((string) (getenv('GEMINI_EMBED_MODEL') ?: 'gemini-embedding-2-preview')),
+        ],
+        'instagram_facebook' => [
+            'app_configured' => trim((string) ($cfg['fb_app_id'] ?? '')) !== '' && trim((string) ($cfg['fb_app_secret'] ?? '')) !== '',
+        ],
+        'replicate' => [
+            'token_set' => trim((string) (getenv('REPLICATE_API_TOKEN') ?: '')) !== '',
+        ],
+        'garage' => [
+            'endpoint_configured' => trim((string) ($cfg['garage_endpoint'] ?? '')) !== '',
+            'credentials_configured' => trim((string) ($cfg['garage_access_key'] ?? '')) !== ''
+                && trim((string) ($cfg['garage_secret_key'] ?? '')) !== '',
+            'social_content_bucket' => (string) ($cfg['garage_social_content_bucket'] ?? ''),
+            'object_key_prefix' => 'social_accounts/{pocketbase_social_account_id}/',
+            'generated_save_enabled' => ff_should_save_generated_to_garage(),
+            'generated_key_prefix' => 'generated/users/{pocketbase_users_record_id}/slides|images/',
+            's3_operations_ready' => ff_garage_ready(),
+        ],
+        'collections' => [
+            'input_media' => (string) ($cfg['input_media_collection'] ?? 'input_media'),
+            'prompts' => (string) ($cfg['prompts_collection'] ?? 'prompts'),
+        ],
     ];
 }
 
 if (PHP_SAPI === 'cli') {
-    fwrite(STDERR, "FormatForge: no CLI commands — use the web UI.\n");
+    fwrite(STDERR, "Carousel app: use the web UI.\n");
     exit(1);
 }
 
@@ -1933,8 +2488,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'login
             'password' => $password,
         ], null);
         if ($auth['code'] === 200 && !empty($auth['body']['token'])) {
+            $rec = is_array($auth['body']['record'] ?? null) ? $auth['body']['record'] : [];
+            $em = $rec['email'] ?? '';
+            if (!ff_gate_email_allowed(is_string($em) ? $em : '')) {
+                ff_redirect_url('/?login_error=2');
+            }
             $_SESSION['pb_token'] = $auth['body']['token'];
-            $_SESSION['pb_user'] = $auth['body']['record'] ?? [];
+            $_SESSION['pb_user'] = $rec;
             ff_redirect_url('/');
         }
     }
@@ -1947,87 +2507,1070 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'logou
 }
 
 $user = $_SESSION['pb_user'] ?? null;
-$token = $_SESSION['pb_token'] ?? null;
-$authHeader = $token ?: null;
+$pbTok = $_SESSION['pb_token'] ?? null;
+$token = is_string($pbTok) && trim($pbTok) !== '' ? $pbTok : null;
+$authHeader = $token;
+
+if ($user !== null && is_array($user) && !ff_gate_email_allowed($user['email'] ?? null)) {
+    unset($_SESSION['pb_user'], $_SESSION['pb_token']);
+    $user = null;
+    $token = null;
+    $authHeader = null;
+}
 
 if ($_SERVER['REQUEST_METHOD'] === 'GET' && isset($_GET['ff_debug_json'])) {
     header('Cache-Control: no-store');
-    if (!$user || !$authHeader) {
+    if (!ff_gate_session_ok()) {
         http_response_code(403);
         header('Content-Type: application/json; charset=utf-8');
         echo json_encode(['error' => 'Sign in required.'], JSON_UNESCAPED_UNICODE);
-
         exit;
     }
     header('Content-Type: application/json; charset=utf-8');
     echo json_encode(ff_debug_collect_safe(), JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT);
-
     exit;
 }
 
-if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'fetch_media' && $user && $authHeader) {
-    $url = (string) ($_POST['url'] ?? '');
-    $tool = (string) ($_POST['tool'] ?? 'auto');
-    $res = ff_fetch_save_media($url, $tool, $authHeader);
-    if (!empty($res['ok'])) {
-        $_SESSION['ff_debug_last_fetch'] = [
-            'at' => gmdate('c'),
-            'ok' => true,
-            'via' => (string) ($res['via'] ?? ''),
-            'n' => (int) ($res['n'] ?? 0),
-            'error' => '',
-            'record_id' => (string) ($res['record_id'] ?? ''),
-            'record_rows_count' => is_array($res['record_rows'] ?? null) ? count($res['record_rows']) : 0,
-        ];
-        $_SESSION['fetch_flash'] = [
-            'ok' => true,
-            'record_id' => (string) ($res['record_id'] ?? ''),
-            'record_rows' => is_array($res['record_rows'] ?? null) ? $res['record_rows'] : [],
-            'pb_files' => is_array($res['pb_files'] ?? null) ? $res['pb_files'] : [],
-            'n' => (int) ($res['n'] ?? 0),
-            'via' => (string) ($res['via'] ?? ''),
-        ];
-        ff_redirect_url('/?fetch_ok=1');
+/** JSON API: Gemini text embedding (requires sign-in). POST ?action=embed_text */
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_GET['action'] ?? '') === 'embed_text') {
+    header('Content-Type: application/json; charset=utf-8');
+    if (!ff_gate_session_ok()) {
+        http_response_code(403);
+        echo json_encode(['error' => 'Sign in required.']);
+        exit;
     }
-    $err = (string) ($res['error'] ?? 'Failed');
-    if (strlen($err) > 6000) {
-        $err = substr($err, 0, 6000) . "\n…";
+    $gemKey = trim((string) (getenv('GEMINI_API_KEY') ?: ''));
+    if ($gemKey === '') {
+        http_response_code(503);
+        echo json_encode(['error' => 'GEMINI_API_KEY not set']);
+        exit;
     }
-    $errTrim = strlen($err) > 2000 ? substr($err, 0, 2000) . '…' : $err;
-    $_SESSION['ff_debug_last_fetch'] = [
-        'at' => gmdate('c'),
-        'ok' => false,
-        'via' => (string) ($res['via'] ?? ''),
-        'n' => 0,
-        'error' => $errTrim,
-        'record_id' => '',
-        'record_rows_count' => 0,
-    ];
-    $_SESSION['fetch_flash'] = ['ok' => false, 'error' => $err];
-    ff_redirect_url('/?fetch_err=1');
+    $raw = file_get_contents('php://input') ?: '';
+    $data = json_decode($raw, true);
+    $text = is_array($data) && isset($data['text']) ? trim((string) $data['text']) : '';
+    if ($text === '') {
+        http_response_code(400);
+        echo json_encode(['error' => 'JSON body must include non-empty "text"']);
+        exit;
+    }
+    $embModel = trim((string) (getenv('GEMINI_EMBED_MODEL') ?: 'gemini-embedding-2-preview'));
+    if ($embModel === '') {
+        $embModel = 'gemini-embedding-2-preview';
+    }
+    $emb = ff_gemini_embed_text($gemKey, $embModel, $text);
+    if (!$emb['ok']) {
+        http_response_code(502);
+        echo json_encode(['error' => $emb['error']]);
+        exit;
+    }
+    echo json_encode([
+        'ok' => true,
+        'model' => $embModel,
+        'dims' => count($emb['vector']),
+        'preview' => ff_embedding_preview_string($emb['vector']),
+        'values' => $emb['vector'],
+    ], JSON_UNESCAPED_UNICODE);
+    exit;
 }
 
-if ($_SERVER['REQUEST_METHOD'] === 'GET' && isset($_GET['ff_pb_file']) && $user && $authHeader) {
-    $col = (string) ($_GET['c'] ?? '');
-    $cfgCol = trim((string) ($GLOBALS['CONFIG']['input_media_collection'] ?? 'input_media'));
-    if ($cfgCol === '') {
-        $cfgCol = 'input_media';
+/** JSON API: Gemini image embedding from base64 (requires sign-in). POST ?action=embed_image */
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_GET['action'] ?? '') === 'embed_image') {
+    header('Content-Type: application/json; charset=utf-8');
+    if (!ff_gate_session_ok()) {
+        http_response_code(403);
+        echo json_encode(['error' => 'Sign in required.']);
+        exit;
     }
-    if ($col !== $cfgCol) {
+    $gemKey = trim((string) (getenv('GEMINI_API_KEY') ?: ''));
+    if ($gemKey === '') {
+        http_response_code(503);
+        echo json_encode(['error' => 'GEMINI_API_KEY not set']);
+        exit;
+    }
+    $raw = file_get_contents('php://input') ?: '';
+    $data = json_decode($raw, true);
+    if (!is_array($data) || !isset($data['data'], $data['mime'])) {
+        http_response_code(400);
+        echo json_encode(['error' => 'JSON must include "mime" and base64 "data"']);
+        exit;
+    }
+    $mime = strtolower(str_replace('image/jpg', 'image/jpeg', trim((string) $data['mime'])));
+    $allowed = ['image/jpeg', 'image/png', 'image/gif', 'image/webp'];
+    if (!in_array($mime, $allowed, true)) {
+        http_response_code(400);
+        echo json_encode(['error' => 'Unsupported mime type']);
+        exit;
+    }
+    $b64 = preg_replace('/\s+/', '', (string) $data['data']);
+    $bin = base64_decode($b64, true);
+    if ($bin === false || $bin === '') {
+        http_response_code(400);
+        echo json_encode(['error' => 'Invalid base64 data']);
+        exit;
+    }
+    if (strlen($bin) > 4 * 1024 * 1024) {
+        http_response_code(400);
+        echo json_encode(['error' => 'Image too large']);
+        exit;
+    }
+    $embModel = trim((string) (getenv('GEMINI_EMBED_MODEL') ?: 'gemini-embedding-2-preview'));
+    if ($embModel === '') {
+        $embModel = 'gemini-embedding-2-preview';
+    }
+    $emb = ff_gemini_embed_image_b64($gemKey, $embModel, $mime, base64_encode($bin));
+    if (!$emb['ok']) {
+        http_response_code(502);
+        echo json_encode(['error' => $emb['error']]);
+        exit;
+    }
+    echo json_encode([
+        'ok' => true,
+        'model' => $embModel,
+        'dims' => count($emb['vector']),
+        'preview' => ff_embedding_preview_string($emb['vector']),
+        'values' => $emb['vector'],
+    ], JSON_UNESCAPED_UNICODE);
+    exit;
+}
+
+/** JSON API: create prompts row + optional embedding (requires sign-in). POST ?action=prompt_embed */
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_GET['action'] ?? '') === 'prompt_embed') {
+    header('Content-Type: application/json; charset=utf-8');
+    if (!ff_gate_session_ok()) {
+        http_response_code(403);
+        echo json_encode(['error' => 'Sign in required.']);
+        exit;
+    }
+    $raw = file_get_contents('php://input') ?: '';
+    $data = json_decode($raw, true);
+    $promptText = is_array($data) && isset($data['prompt_text']) ? trim((string) $data['prompt_text']) : '';
+    $inputMediaId = is_array($data) && isset($data['input_media_id']) ? trim((string) $data['input_media_id']) : '';
+    if ($promptText === '' || $inputMediaId === '') {
+        http_response_code(400);
+        echo json_encode(['error' => 'JSON must include prompt_text and input_media_id']);
+        exit;
+    }
+    $cfg = $GLOBALS['CONFIG'];
+    $pr = ff_pb_create_prompt_after_fetch(
+        (string) $authHeader,
+        (string) ($cfg['prompts_collection'] ?? 'prompts'),
+        (string) ($cfg['input_media_collection'] ?? 'input_media'),
+        $inputMediaId,
+        $promptText
+    );
+    if (!empty($pr['skipped'])) {
+        http_response_code(503);
+        echo json_encode(['error' => $pr['skip_reason'] ?: 'Skipped', 'detail' => $pr]);
+        exit;
+    }
+    if ($pr['record_id'] === '') {
+        http_response_code(502);
+        echo json_encode(['error' => $pr['pb_error'] ?: $pr['gemini_error'] ?: 'Failed', 'detail' => $pr]);
+        exit;
+    }
+    echo json_encode(['ok' => true, 'detail' => $pr], JSON_UNESCAPED_UNICODE);
+    exit;
+}
+
+/** Garage S3: list objects for one social_accounts row. GET ?action=garage_list&social_account_id=… */
+if ($_SERVER['REQUEST_METHOD'] === 'GET' && ($_GET['action'] ?? '') === 'garage_list') {
+    header('Content-Type: application/json; charset=utf-8');
+    header('Cache-Control: no-store');
+    if (!ff_gate_session_ok()) {
+        http_response_code(403);
+        echo json_encode(['error' => 'Sign in required.']);
+        exit;
+    }
+    if (!ff_garage_ready()) {
+        http_response_code(503);
+        echo json_encode(['error' => 'Garage S3 not configured (GARAGE_ENDPOINT, keys, bucket).']);
+        exit;
+    }
+    $sid = trim((string) ($_GET['social_account_id'] ?? ''));
+    if ($sid === '') {
+        http_response_code(400);
+        echo json_encode(['error' => 'Missing social_account_id']);
+        exit;
+    }
+    if (ff_pb_owned_social_account($authHeader, $sid) === null) {
+        http_response_code(403);
+        echo json_encode(['error' => 'Unknown or inaccessible social account.']);
+        exit;
+    }
+    $prefix = ff_garage_social_key_prefix($sid);
+    $list = ff_garage_list_under_prefix($prefix, 200);
+    if (!$list['ok']) {
+        http_response_code(502);
+        echo json_encode(['error' => $list['error']]);
+        exit;
+    }
+    $script = ff_app_script_path();
+    $itemsOut = [];
+    foreach ($list['items'] as $it) {
+        if (!is_array($it)) {
+            continue;
+        }
+        $rel = (string) ($it['rel'] ?? '');
+        $fullKeyG = ff_garage_social_object_key($sid, $rel);
+        $pubG = $fullKeyG !== '' ? ff_garage_public_https_url_for_object_key($fullKeyG) : '';
+        $itemsOut[] = array_merge($it, [
+            'preview_url' => $script . '?action=garage_download&inline=1&social_account_id=' . rawurlencode($sid) . '&key=' . rawurlencode($rel),
+            'download_url' => $script . '?action=garage_download&social_account_id=' . rawurlencode($sid) . '&key=' . rawurlencode($rel),
+            'public_url' => $pubG,
+        ]);
+    }
+    echo json_encode(['ok' => true, 'prefix' => $prefix, 'items' => $itemsOut], JSON_UNESCAPED_UNICODE);
+    exit;
+}
+
+/** Garage S3: download object (scoped). GET ?action=garage_download&social_account_id=…&key=relative/path */
+if ($_SERVER['REQUEST_METHOD'] === 'GET' && ($_GET['action'] ?? '') === 'garage_download') {
+    header('Cache-Control: no-store');
+    if (!ff_gate_session_ok()) {
+        http_response_code(403);
+        header('Content-Type: text/plain; charset=utf-8');
+        echo 'Forbidden';
+        exit;
+    }
+    if (!ff_garage_ready()) {
+        http_response_code(503);
+        header('Content-Type: text/plain; charset=utf-8');
+        echo 'Garage not configured';
+        exit;
+    }
+    $sid = trim((string) ($_GET['social_account_id'] ?? ''));
+    $rel = trim((string) ($_GET['key'] ?? ''));
+    if ($sid === '' || $rel === '') {
+        http_response_code(400);
+        header('Content-Type: text/plain; charset=utf-8');
+        echo 'Bad request';
+        exit;
+    }
+    if (ff_pb_owned_social_account($authHeader, $sid) === null) {
+        http_response_code(403);
+        header('Content-Type: text/plain; charset=utf-8');
+        echo 'Forbidden';
+        exit;
+    }
+    $fullKey = ff_garage_social_object_key($sid, $rel);
+    $pref = ff_garage_social_key_prefix($sid);
+    if ($fullKey === '' || $pref === '' || !str_starts_with($fullKey, $pref)) {
+        http_response_code(400);
+        header('Content-Type: text/plain; charset=utf-8');
+        echo 'Bad key';
+        exit;
+    }
+    $r = ff_garage_s3_request('GET', $fullKey, [], '');
+    if (!$r['ok']) {
+        http_response_code($r['code'] >= 400 ? $r['code'] : 502);
+        header('Content-Type: application/json; charset=utf-8');
+        echo json_encode(['error' => ff_garage_s3_xml_error($r['body']) ?: ('HTTP ' . $r['code'])]);
+        exit;
+    }
+    $maxBytes = 40 * 1024 * 1024;
+    if (strlen($r['body']) > $maxBytes) {
+        http_response_code(413);
+        header('Content-Type: application/json; charset=utf-8');
+        echo json_encode(['error' => 'Object too large for download (max 40 MiB).']);
+        exit;
+    }
+    $fn = preg_replace('/[^a-zA-Z0-9._-]/', '_', basename(str_replace('\\', '/', $rel))) ?: 'file';
+    $inline = (string) ($_GET['inline'] ?? '') === '1';
+    header('Content-Type: ' . ($r['content_type'] !== '' ? $r['content_type'] : 'application/octet-stream'));
+    header('Content-Disposition: ' . ($inline ? 'inline' : 'attachment') . '; filename="' . $fn . '"');
+    header('X-Content-Type-Options: nosniff');
+    if ($inline) {
+        header('Cache-Control: private, max-age=300');
+    }
+    echo $r['body'];
+    exit;
+}
+
+/** Garage S3: download object created by this app under generated/users/{your_pb_user_id}/… */
+if ($_SERVER['REQUEST_METHOD'] === 'GET' && ($_GET['action'] ?? '') === 'garage_generated_download') {
+    header('Cache-Control: no-store');
+    if (!ff_gate_session_ok()) {
+        http_response_code(403);
+        header('Content-Type: text/plain; charset=utf-8');
+        echo 'Forbidden';
+        exit;
+    }
+    if (!ff_garage_ready()) {
+        http_response_code(503);
+        header('Content-Type: text/plain; charset=utf-8');
+        echo 'Garage not configured';
+        exit;
+    }
+    $uid = ff_session_pb_user_id();
+    if ($uid === '') {
+        http_response_code(400);
+        header('Content-Type: text/plain; charset=utf-8');
+        echo 'Bad request';
+        exit;
+    }
+    $rel = trim((string) ($_GET['key'] ?? ''));
+    if ($rel === '') {
+        http_response_code(400);
+        header('Content-Type: text/plain; charset=utf-8');
+        echo 'Bad request';
+        exit;
+    }
+    $fullKey = ff_garage_generated_object_key($uid, $rel);
+    $pref = ff_garage_generated_user_prefix($uid);
+    if ($fullKey === '' || $pref === '' || !str_starts_with($fullKey, $pref)) {
+        http_response_code(400);
+        header('Content-Type: text/plain; charset=utf-8');
+        echo 'Bad key';
+        exit;
+    }
+    $r = ff_garage_s3_request('GET', $fullKey, [], '');
+    if (!$r['ok']) {
+        http_response_code($r['code'] >= 400 ? $r['code'] : 502);
+        header('Content-Type: application/json; charset=utf-8');
+        echo json_encode(['error' => ff_garage_s3_xml_error($r['body']) ?: ('HTTP ' . $r['code'])]);
+        exit;
+    }
+    $maxBytes = 40 * 1024 * 1024;
+    if (strlen($r['body']) > $maxBytes) {
+        http_response_code(413);
+        header('Content-Type: application/json; charset=utf-8');
+        echo json_encode(['error' => 'Object too large for download (max 40 MiB).']);
+        exit;
+    }
+    $fn = preg_replace('/[^a-zA-Z0-9._-]/', '_', basename(str_replace('\\', '/', $rel))) ?: 'file';
+    $inline = (string) ($_GET['inline'] ?? '') === '1';
+    header('Content-Type: ' . ($r['content_type'] !== '' ? $r['content_type'] : 'application/octet-stream'));
+    header('Content-Disposition: ' . ($inline ? 'inline' : 'attachment') . '; filename="' . $fn . '"');
+    header('X-Content-Type-Options: nosniff');
+    if ($inline) {
+        header('Cache-Control: private, max-age=300');
+    }
+    echo $r['body'];
+    exit;
+}
+
+/** Garage S3: upload file for one social_accounts row. POST multipart ?action=garage_upload (social_account_id, file) */
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_GET['action'] ?? '') === 'garage_upload') {
+    header('Content-Type: application/json; charset=utf-8');
+    header('Cache-Control: no-store');
+    if (!ff_gate_session_ok()) {
+        http_response_code(403);
+        echo json_encode(['error' => 'Sign in required.']);
+        exit;
+    }
+    if (!ff_garage_ready()) {
+        http_response_code(503);
+        echo json_encode(['error' => 'Garage S3 not configured.']);
+        exit;
+    }
+    $sid = trim((string) ($_POST['social_account_id'] ?? ''));
+    if ($sid === '') {
+        http_response_code(400);
+        echo json_encode(['error' => 'Missing social_account_id']);
+        exit;
+    }
+    if (ff_pb_owned_social_account($authHeader, $sid) === null) {
+        http_response_code(403);
+        echo json_encode(['error' => 'Unknown or inaccessible social account.']);
+        exit;
+    }
+    if (empty($_FILES['file']['tmp_name']) || !is_uploaded_file((string) $_FILES['file']['tmp_name'])) {
+        http_response_code(400);
+        echo json_encode(['error' => 'Missing file upload (field name: file)']);
+        exit;
+    }
+    $tmp = (string) $_FILES['file']['tmp_name'];
+    $orig = isset($_FILES['file']['name']) ? (string) $_FILES['file']['name'] : 'upload';
+    $maxBytes = min(40 * 1024 * 1024, (int) (ff_ini_size_bytes((string) ini_get('upload_max_filesize')) ?: (40 * 1024 * 1024)));
+    $sz = @filesize($tmp);
+    if ($sz === false || $sz > $maxBytes) {
+        http_response_code(400);
+        echo json_encode(['error' => 'File too large']);
+        exit;
+    }
+    $bytes = @file_get_contents($tmp);
+    if ($bytes === false || $bytes === '') {
+        http_response_code(400);
+        echo json_encode(['error' => 'Empty or unreadable file']);
+        exit;
+    }
+    $rel = basename(str_replace('\\', '/', $orig));
+    $rel = preg_replace('/[^a-zA-Z0-9._-]/', '_', $rel);
+    if ($rel === '' || $rel === '.' || $rel === '..') {
+        $rel = 'upload.bin';
+    }
+    $objectKey = ff_garage_social_object_key($sid, $rel);
+    if ($objectKey === '') {
+        http_response_code(400);
+        echo json_encode(['error' => 'Invalid object path']);
+        exit;
+    }
+    $finfo = new finfo(FILEINFO_MIME_TYPE);
+    $mime = $finfo->file($tmp);
+    $ct = is_string($mime) && $mime !== '' ? $mime : 'application/octet-stream';
+    $put = ff_garage_put_object($objectKey, $bytes, $ct);
+    if (!$put['ok']) {
+        http_response_code(502);
+        echo json_encode(['error' => $put['error']]);
+        exit;
+    }
+    $pref = ff_garage_social_key_prefix($sid);
+    $relOut = $pref !== '' && str_starts_with($objectKey, $pref) ? substr($objectKey, strlen($pref)) : $objectKey;
+    echo json_encode([
+        'ok' => true,
+        'key' => $objectKey,
+        'rel' => $relOut,
+        'size' => strlen($bytes),
+        'content_type' => $ct,
+    ], JSON_UNESCAPED_UNICODE);
+    exit;
+}
+
+/** Garage S3: delete object. POST ?action=garage_delete JSON { social_account_id, key } — key is relative to the account prefix */
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_GET['action'] ?? '') === 'garage_delete') {
+    header('Content-Type: application/json; charset=utf-8');
+    header('Cache-Control: no-store');
+    if (!ff_gate_session_ok()) {
+        http_response_code(403);
+        echo json_encode(['error' => 'Sign in required.']);
+        exit;
+    }
+    if (!ff_garage_ready()) {
+        http_response_code(503);
+        echo json_encode(['error' => 'Garage S3 not configured.']);
+        exit;
+    }
+    $raw = file_get_contents('php://input') ?: '';
+    $data = json_decode($raw, true);
+    $sid = is_array($data) ? trim((string) ($data['social_account_id'] ?? '')) : '';
+    $rel = is_array($data) ? trim((string) ($data['key'] ?? '')) : '';
+    if ($sid === '' || $rel === '') {
+        http_response_code(400);
+        echo json_encode(['error' => 'JSON must include social_account_id and key (relative path)']);
+        exit;
+    }
+    if (ff_pb_owned_social_account($authHeader, $sid) === null) {
+        http_response_code(403);
+        echo json_encode(['error' => 'Unknown or inaccessible social account.']);
+        exit;
+    }
+    $fullKey = ff_garage_social_object_key($sid, $rel);
+    $pref = ff_garage_social_key_prefix($sid);
+    if ($fullKey === '' || $pref === '' || !str_starts_with($fullKey, $pref)) {
+        http_response_code(400);
+        echo json_encode(['error' => 'Invalid key']);
+        exit;
+    }
+    $del = ff_garage_delete_object($fullKey);
+    if (!$del['ok']) {
+        http_response_code(502);
+        echo json_encode(['error' => $del['error']]);
+        exit;
+    }
+    echo json_encode(['ok' => true], JSON_UNESCAPED_UNICODE);
+    exit;
+}
+
+/** Redirect to PocketBase file URL with auth token (for <img>/<video>/<audio> previews). GET ?action=media_file */
+if ($_SERVER['REQUEST_METHOD'] === 'GET' && ($_GET['action'] ?? '') === 'media_file') {
+    header('Cache-Control: no-store');
+    if (!ff_gate_session_ok()) {
+        http_response_code(403);
+        header('Content-Type: text/plain; charset=utf-8');
+        echo 'Forbidden';
+        exit;
+    }
+    $cfg = $GLOBALS['CONFIG'];
+    $colWant = trim((string) ($_GET['collection'] ?? ''));
+    $inpCol = (string) ($cfg['input_media_collection'] ?? 'input_media');
+    $outCol = (string) ($cfg['output_media_collection'] ?? 'output_media');
+    if ($colWant === '' || ($colWant !== $inpCol && $colWant !== $outCol)) {
         http_response_code(400);
         header('Content-Type: text/plain; charset=utf-8');
         echo 'Bad collection';
         exit;
     }
-    $rid = (string) ($_GET['id'] ?? '');
-    if ($rid === '' || !preg_match('/^[a-zA-Z0-9_-]{1,128}$/', $rid)) {
+    $rid = trim((string) ($_GET['record_id'] ?? ''));
+    $fn = basename(str_replace('\\', '/', (string) ($_GET['filename'] ?? '')));
+    if ($rid === '' || $fn === '' || str_contains($fn, '..')) {
         http_response_code(400);
         header('Content-Type: text/plain; charset=utf-8');
-        echo 'Bad record id';
+        echo 'Bad request';
         exit;
     }
-    $fn = rawurldecode((string) ($_GET['n'] ?? ''));
-    ff_pb_proxy_file_download($col, $rid, $fn, (string) $authHeader);
+    $recR = pb_request('GET', '/api/collections/' . rawurlencode($colWant) . '/records/' . rawurlencode($rid), null, $authHeader);
+    if (($recR['code'] ?? 0) !== 200) {
+        http_response_code(404);
+        header('Content-Type: text/plain; charset=utf-8');
+        echo 'Not found';
+        exit;
+    }
+    $rec = ff_pb_normalize_api_record($recR['body']);
+    if (!is_array($rec) || !ff_pb_record_has_filename($rec, $fn)) {
+        http_response_code(403);
+        header('Content-Type: text/plain; charset=utf-8');
+        echo 'Forbidden';
+        exit;
+    }
+    $tok = (string) ($_SESSION['pb_token'] ?? '');
+    $url = ff_pb_build_files_token_url($colWant, $rid, $fn, $tok);
+    if ($url === '') {
+        http_response_code(503);
+        header('Content-Type: text/plain; charset=utf-8');
+        echo 'PocketBase file URL not available';
+        exit;
+    }
+    header('Referrer-Policy: no-referrer');
+    header('Location: ' . $url, true, 302);
+    exit;
+}
+
+/**
+ * Public HTTPS image for Instagram (signed URL, no session). GET ?action=ig_public_image&c=input_media&id=…&f=…&exp=…&sig=…
+ * Streams bytes from PocketBase using FF_CRON_PB_TOKEN (must be able to read the file).
+ */
+if ($_SERVER['REQUEST_METHOD'] === 'GET' && ($_GET['action'] ?? '') === 'ig_public_image') {
+    $cfg = $GLOBALS['CONFIG'];
+    $inpCol = (string) ($cfg['input_media_collection'] ?? 'input_media');
+    $c = trim((string) ($_GET['c'] ?? ''));
+    $rid = trim((string) ($_GET['id'] ?? ''));
+    $fn = basename(str_replace('\\', '/', (string) ($_GET['f'] ?? '')));
+    $exp = (int) ($_GET['exp'] ?? 0);
+    $sig = trim((string) ($_GET['sig'] ?? ''));
+    if ($c !== $inpCol || $rid === '' || $fn === '' || str_contains($fn, '..') || $exp < 1 || $sig === '') {
+        http_response_code(400);
+        header('Content-Type: text/plain; charset=utf-8');
+        echo 'Bad request';
+        exit;
+    }
+    if (time() > $exp) {
+        http_response_code(410);
+        header('Content-Type: text/plain; charset=utf-8');
+        echo 'Expired';
+        exit;
+    }
+    $secret = ff_ig_hmac_secret();
+    if ($secret === '') {
+        http_response_code(503);
+        header('Content-Type: text/plain; charset=utf-8');
+        echo 'Signing not configured';
+        exit;
+    }
+    $want = hash_hmac('sha256', "ig_pub|$c|$rid|$fn|$exp", $secret);
+    if (!hash_equals($want, $sig)) {
+        http_response_code(403);
+        header('Content-Type: text/plain; charset=utf-8');
+        echo 'Forbidden';
+        exit;
+    }
+    $cronTok = trim((string) (getenv('FF_CRON_PB_TOKEN') ?: ''));
+    if ($cronTok === '') {
+        http_response_code(503);
+        header('Content-Type: text/plain; charset=utf-8');
+        echo 'Cron token not configured';
+        exit;
+    }
+    $got = ff_pb_file_get_bytes($c, $rid, $fn, $cronTok);
+    if (!$got['ok']) {
+        http_response_code(502);
+        header('Content-Type: text/plain; charset=utf-8');
+        echo 'Upstream error';
+        exit;
+    }
+    $disp = preg_replace('/[^a-zA-Z0-9._-]/', '_', $fn) ?: 'image';
+    header('Content-Type: ' . ($got['content_type'] !== '' ? $got['content_type'] : 'application/octet-stream'));
+    header('Content-Disposition: inline; filename="' . $disp . '"');
+    header('X-Content-Type-Options: nosniff');
+    header('Cache-Control: public, max-age=3600');
+    echo $got['bytes'];
+    exit;
+}
+
+/** Combined PocketBase + Garage media for the Media tab. GET ?action=media_library&social_account_id=optional */
+if ($_SERVER['REQUEST_METHOD'] === 'GET' && ($_GET['action'] ?? '') === 'media_library') {
+    header('Content-Type: application/json; charset=utf-8');
+    header('Cache-Control: no-store');
+    if (!ff_gate_session_ok()) {
+        http_response_code(403);
+        echo json_encode(['error' => 'Sign in required.']);
+        exit;
+    }
+    try {
+        $cfg = $GLOBALS['CONFIG'];
+        $script = ff_app_script_path();
+        $inpCol = (string) ($cfg['input_media_collection'] ?? 'input_media');
+        $outCol = (string) ($cfg['output_media_collection'] ?? 'output_media');
+        $q = http_build_query(['sort' => '-@rowid', 'perPage' => 80]);
+        $sid = trim((string) ($_GET['social_account_id'] ?? ''));
+        $inputBlocks = [];
+        $inputErr = '';
+        $garagePayload = ['prefix' => '', 'items' => []];
+        $socAcc = null;
+        if (ff_garage_ready() && $sid !== '') {
+            $socAcc = ff_pb_owned_social_account($authHeader, $sid);
+        }
+        $useGarageForInput = $socAcc !== null;
+        if ($useGarageForInput) {
+            try {
+                $prefix = ff_garage_social_key_prefix($sid);
+                if ($prefix === '') {
+                    $msg = 'Invalid Garage scope for this account.';
+                    $garagePayload = ['prefix' => '', 'items' => [], 'error' => $msg];
+                    $inputErr = $msg;
+                } else {
+                    $list = ff_garage_list_under_prefix($prefix, 200);
+                    if ($list['ok']) {
+                        $itemsG = [];
+                        $entries = [];
+                        foreach ($list['items'] as $it) {
+                            if (!is_array($it)) {
+                                continue;
+                            }
+                            $rel = (string) ($it['rel'] ?? '');
+                            $fullKey = ff_garage_social_object_key($sid, $rel);
+                            $pubUrl = $fullKey !== '' ? ff_garage_public_https_url_for_object_key($fullKey) : '';
+                            $row = array_merge($it, [
+                                'preview_url' => $script . '?action=garage_download&inline=1&social_account_id=' . rawurlencode($sid) . '&key=' . rawurlencode($rel),
+                                'download_url' => $script . '?action=garage_download&social_account_id=' . rawurlencode($sid) . '&key=' . rawurlencode($rel),
+                                'public_url' => $pubUrl,
+                            ]);
+                            $itemsG[] = $row;
+                            $entries[] = [
+                                'kind' => (string) ($it['kind'] ?? 'file'),
+                                'label' => $rel,
+                                'url' => $row['preview_url'],
+                                'external' => false,
+                            ];
+                        }
+                        $garagePayload = ['prefix' => $prefix, 'items' => $itemsG];
+                        if ($entries !== []) {
+                            $uname = is_array($socAcc) ? trim((string) ($socAcc['username'] ?? '')) : '';
+                            $inputTitle = $uname !== '' ? ('@' . $uname) : 'Input (Garage)';
+                            $inputBlocks[] = [
+                                'record_id' => 'garage:' . $sid,
+                                'title' => $inputTitle,
+                                'source_url' => '',
+                                'entries' => $entries,
+                                'source' => 'garage',
+                            ];
+                        }
+                    } else {
+                        $err = $list['error'];
+                        $garagePayload = ['prefix' => $prefix, 'items' => [], 'error' => $err];
+                        $inputErr = $err;
+                    }
+                }
+            } catch (Throwable $e) {
+                error_log('FormatForge media_library garage input: ' . $e->getMessage() . ' @ ' . $e->getFile() . ':' . $e->getLine());
+                $garagePayload = [
+                    'prefix' => $sid !== '' ? ff_garage_social_key_prefix($sid) : '',
+                    'items' => [],
+                    'error' => $e->getMessage(),
+                ];
+                $inputErr = $e->getMessage();
+            }
+        } else {
+            try {
+                $ir = pb_request('GET', '/api/collections/' . rawurlencode($inpCol) . '/records?' . $q, null, $authHeader);
+                foreach (ff_pb_list_items($ir) as $it) {
+                    if (!is_array($it)) {
+                        continue;
+                    }
+                    $entries = ff_media_entries_from_pb_record($it, $inpCol, $script);
+                    if ($entries === []) {
+                        continue;
+                    }
+                    $title = trim((string) ($it['title'] ?? ''));
+                    $srcUrl = trim((string) ($it['url'] ?? $it['input_url'] ?? ''));
+                    $inputBlocks[] = [
+                        'record_id' => (string) ($it['id'] ?? ''),
+                        'title' => $title !== '' ? $title : ($srcUrl !== '' ? $srcUrl : (string) ($it['id'] ?? '')),
+                        'source_url' => $srcUrl,
+                        'entries' => $entries,
+                        'source' => 'pocketbase',
+                    ];
+                }
+            } catch (Throwable $e) {
+                error_log('FormatForge media_library input_media: ' . $e->getMessage() . ' @ ' . $e->getFile() . ':' . $e->getLine());
+                $inputErr = $e->getMessage();
+            }
+        }
+        $outputBlocks = [];
+        $outputErr = '';
+        try {
+            $or = pb_request('GET', '/api/collections/' . rawurlencode($outCol) . '/records?' . $q, null, $authHeader);
+            foreach (ff_pb_list_items($or) as $it) {
+                if (!is_array($it)) {
+                    continue;
+                }
+                $entries = ff_media_entries_from_pb_record($it, $outCol, $script);
+                if ($entries === []) {
+                    continue;
+                }
+                $title = trim((string) ($it['title'] ?? ''));
+                $outputBlocks[] = [
+                    'record_id' => (string) ($it['id'] ?? ''),
+                    'title' => $title !== '' ? $title : (string) ($it['id'] ?? ''),
+                    'entries' => $entries,
+                ];
+            }
+        } catch (Throwable $e) {
+            error_log('FormatForge media_library output_media: ' . $e->getMessage() . ' @ ' . $e->getFile() . ':' . $e->getLine());
+            $outputErr = $e->getMessage();
+        }
+
+        $errors = [];
+        if ($inputErr !== '') {
+            $errors['input_media'] = $inputErr;
+        }
+        if ($outputErr !== '') {
+            $errors['output_media'] = $outputErr;
+        }
+        $payload = [
+            'ok' => true,
+            'input_media' => $inputBlocks,
+            'output_media' => $outputBlocks,
+            'garage' => $garagePayload,
+        ];
+        if ($errors !== []) {
+            $payload['errors'] = $errors;
+        }
+        $jsonFlags = JSON_UNESCAPED_UNICODE | JSON_INVALID_UTF8_SUBSTITUTE;
+        if (defined('JSON_PARTIAL_OUTPUT_ON_ERROR')) {
+            $jsonFlags |= JSON_PARTIAL_OUTPUT_ON_ERROR;
+        }
+        $out = json_encode($payload, $jsonFlags);
+        if ($out === false) {
+            http_response_code(500);
+            echo json_encode(['ok' => false, 'error' => 'Could not encode media_library JSON']);
+            exit;
+        }
+        echo $out;
+    } catch (Throwable $e) {
+        error_log('FormatForge media_library uncaught: ' . $e->getMessage() . ' @ ' . $e->getFile() . ':' . $e->getLine());
+        http_response_code(500);
+        $err = [
+            'ok' => false,
+            'error' => 'Media library failed (see PHP / web server error log for details).',
+        ];
+        if (trim((string) (getenv('FF_DEBUG_MEDIA') ?: '')) === '1') {
+            $err['detail'] = $e->getMessage();
+        }
+        echo json_encode($err, JSON_UNESCAPED_UNICODE);
+    }
+    exit;
+}
+
+/** POST ?action=schedule_instagram_carousel — queue carousel for Instagram (public HTTPS image URLs per slide). */
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_GET['action'] ?? '') === 'schedule_instagram_carousel') {
+    header('Content-Type: application/json; charset=utf-8');
+    header('Cache-Control: no-store');
+    if (!ff_gate_session_ok()) {
+        http_response_code(403);
+        echo json_encode(['error' => 'Sign in required.'], JSON_UNESCAPED_UNICODE);
+        exit;
+    }
+    $raw = file_get_contents('php://input') ?: '';
+    $data = json_decode($raw, true);
+    if (!is_array($data)) {
+        http_response_code(400);
+        echo json_encode(['error' => 'Invalid JSON body.'], JSON_UNESCAPED_UNICODE);
+        exit;
+    }
+    $sid = trim((string) ($data['social_account_id'] ?? ''));
+    $caption = trim((string) ($data['caption'] ?? ''));
+    $scheduledAt = trim((string) ($data['scheduled_at'] ?? ''));
+    $doc = $data['doc'] ?? null;
+    if ($sid === '' || $scheduledAt === '') {
+        http_response_code(400);
+        echo json_encode(['error' => 'social_account_id and scheduled_at (ISO 8601) are required.'], JSON_UNESCAPED_UNICODE);
+        exit;
+    }
+    if (!is_array($doc)) {
+        http_response_code(400);
+        echo json_encode(['error' => 'doc must be the carousel JSON (slides, config).'], JSON_UNESCAPED_UNICODE);
+        exit;
+    }
+    $ts = strtotime($scheduledAt);
+    if ($ts === false || $ts < time() + 60) {
+        http_response_code(400);
+        echo json_encode(['error' => 'scheduled_at must be at least ~1 minute in the future.'], JSON_UNESCAPED_UNICODE);
+        exit;
+    }
+    global $authHeader, $user;
+    if ($authHeader === null || trim((string) $authHeader) === '') {
+        http_response_code(403);
+        echo json_encode(['error' => 'Session token missing.'], JSON_UNESCAPED_UNICODE);
+        exit;
+    }
+    if (ff_pb_owned_social_account($authHeader, $sid) === null) {
+        http_response_code(403);
+        echo json_encode(['error' => 'Instagram account not found or not accessible.'], JSON_UNESCAPED_UNICODE);
+        exit;
+    }
+    $uidSchedule = ff_session_pb_user_id();
+    $res = ff_carousel_doc_resolve_ig_image_urls_for_schedule($doc, $authHeader, $uidSchedule !== '' ? $uidSchedule : null);
+    if (!$res['ok']) {
+        http_response_code(400);
+        echo json_encode(['error' => $res['error'] !== '' ? $res['error'] : 'Could not resolve image URLs for Instagram.'], JSON_UNESCAPED_UNICODE);
+        exit;
+    }
+    $urls = $res['urls'];
+    $cfg = $GLOBALS['CONFIG'];
+    $outCol = (string) ($cfg['output_media_collection'] ?? 'output_media');
+    $userEmail = is_array($user) ? trim((string) ($user['email'] ?? '')) : '';
+    $meta = [
+        'user_email' => $userEmail,
+        'caption' => $caption,
+        'image_urls' => $urls,
+        'pb_user_id' => $uidSchedule,
+    ];
+    $enc = json_encode($doc, JSON_UNESCAPED_UNICODE);
+    if (is_string($enc) && strlen($enc) < 400000) {
+        $meta['carousel_doc'] = $doc;
+    }
+    $scheduledIso = gmdate('Y-m-d\TH:i:s.000\Z', $ts);
+    $payload = [
+        'type' => 'ig_carousel_schedule',
+        'title' => $caption !== '' ? mb_substr($caption, 0, 200) : 'Instagram carousel',
+        'prompt' => '',
+        'status' => 'scheduled',
+        'social_account_id' => $sid,
+        'scheduled_publish_at' => $scheduledIso,
+        'metadata' => $meta,
+    ];
+    $r = pb_request('POST', '/api/collections/' . rawurlencode($outCol) . '/records', $payload, $authHeader);
+    if (($r['code'] ?? 0) < 200 || ($r['code'] ?? 0) >= 300) {
+        $msg = ff_pb_extract_error_message($r['body'] ?? []) ?: ('HTTP ' . ($r['code'] ?? 0));
+        http_response_code(502);
+        echo json_encode(['error' => $msg], JSON_UNESCAPED_UNICODE);
+        exit;
+    }
+    $rec = ff_pb_normalize_api_record($r['body']);
+    echo json_encode(['ok' => true, 'id' => (string) ($rec['id'] ?? ''), 'image_count' => count($urls)], JSON_UNESCAPED_UNICODE);
+    exit;
+}
+
+/** GET ?action=list_instagram_schedules — scheduled Instagram posts for the signed-in user. */
+if ($_SERVER['REQUEST_METHOD'] === 'GET' && ($_GET['action'] ?? '') === 'list_instagram_schedules') {
+    header('Content-Type: application/json; charset=utf-8');
+    header('Cache-Control: no-store');
+    if (!ff_gate_session_ok()) {
+        http_response_code(403);
+        echo json_encode(['error' => 'Sign in required.'], JSON_UNESCAPED_UNICODE);
+        exit;
+    }
+    global $authHeader, $user;
+    if ($authHeader === null || trim((string) $authHeader) === '') {
+        http_response_code(403);
+        echo json_encode(['error' => 'Session token missing.'], JSON_UNESCAPED_UNICODE);
+        exit;
+    }
+    $cfg = $GLOBALS['CONFIG'];
+    $outCol = (string) ($cfg['output_media_collection'] ?? 'output_media');
+    $email = trim((string) ($user['email'] ?? ''));
+    $q = http_build_query([
+        'filter' => 'type = "ig_carousel_schedule" && status = "scheduled"',
+        'perPage' => 50,
+        'sort' => 'scheduled_publish_at',
+    ]);
+    $r = pb_request('GET', '/api/collections/' . rawurlencode($outCol) . '/records?' . $q, null, $authHeader);
+    if (($r['code'] ?? 0) !== 200) {
+        http_response_code(502);
+        echo json_encode(['error' => 'Could not list schedules.'], JSON_UNESCAPED_UNICODE);
+        exit;
+    }
+    $items = ff_pb_list_items($r);
+    $out = [];
+    foreach ($items as $it) {
+        if (!is_array($it)) {
+            continue;
+        }
+        $meta = $it['metadata'] ?? [];
+        if (is_string($meta)) {
+            $meta = json_decode($meta, true) ?: [];
+        }
+        if (!is_array($meta)) {
+            $meta = [];
+        }
+        if (($meta['user_email'] ?? '') !== $email) {
+            continue;
+        }
+        $out[] = [
+            'id' => (string) ($it['id'] ?? ''),
+            'scheduled_publish_at' => (string) ($it['scheduled_publish_at'] ?? ''),
+            'social_account_id' => (string) ($it['social_account_id'] ?? ''),
+            'caption' => (string) ($meta['caption'] ?? ''),
+            'image_count' => is_array($meta['image_urls'] ?? null) ? count($meta['image_urls']) : 0,
+        ];
+    }
+    echo json_encode(['ok' => true, 'items' => $out], JSON_UNESCAPED_UNICODE);
+    exit;
+}
+
+/** POST ?action=cancel_instagram_schedule — cancel a queued post (body: {"id":"…"}). */
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_GET['action'] ?? '') === 'cancel_instagram_schedule') {
+    header('Content-Type: application/json; charset=utf-8');
+    header('Cache-Control: no-store');
+    if (!ff_gate_session_ok()) {
+        http_response_code(403);
+        echo json_encode(['error' => 'Sign in required.'], JSON_UNESCAPED_UNICODE);
+        exit;
+    }
+    $raw = file_get_contents('php://input') ?: '';
+    $data = json_decode($raw, true);
+    $id = is_array($data) ? trim((string) ($data['id'] ?? '')) : '';
+    if ($id === '') {
+        http_response_code(400);
+        echo json_encode(['error' => 'JSON must include id.'], JSON_UNESCAPED_UNICODE);
+        exit;
+    }
+    global $authHeader, $user;
+    if ($authHeader === null || trim((string) $authHeader) === '') {
+        http_response_code(403);
+        echo json_encode(['error' => 'Session token missing.'], JSON_UNESCAPED_UNICODE);
+        exit;
+    }
+    $cfg = $GLOBALS['CONFIG'];
+    $outCol = (string) ($cfg['output_media_collection'] ?? 'output_media');
+    $gr = pb_request('GET', '/api/collections/' . rawurlencode($outCol) . '/records/' . rawurlencode($id), null, $authHeader);
+    if (($gr['code'] ?? 0) !== 200) {
+        http_response_code(404);
+        echo json_encode(['error' => 'Schedule not found.'], JSON_UNESCAPED_UNICODE);
+        exit;
+    }
+    $rec = ff_pb_normalize_api_record($gr['body']);
+    if (($rec['type'] ?? '') !== 'ig_carousel_schedule' || ($rec['status'] ?? '') !== 'scheduled') {
+        http_response_code(400);
+        echo json_encode(['error' => 'Not a cancellable scheduled post.'], JSON_UNESCAPED_UNICODE);
+        exit;
+    }
+    $meta = $rec['metadata'] ?? [];
+    if (is_string($meta)) {
+        $meta = json_decode($meta, true) ?: [];
+    }
+    if (!is_array($meta)) {
+        $meta = [];
+    }
+    $email = trim((string) ($user['email'] ?? ''));
+    if (($meta['user_email'] ?? '') !== $email) {
+        http_response_code(403);
+        echo json_encode(['error' => 'Not your schedule.'], JSON_UNESCAPED_UNICODE);
+        exit;
+    }
+    $patch = ['status' => 'cancelled'];
+    $pr = pb_request('PATCH', '/api/collections/' . rawurlencode($outCol) . '/records/' . rawurlencode($id), $patch, $authHeader);
+    if (($pr['code'] ?? 0) < 200 || ($pr['code'] ?? 0) >= 300) {
+        http_response_code(502);
+        echo json_encode(['error' => 'Could not cancel.'], JSON_UNESCAPED_UNICODE);
+        exit;
+    }
+    echo json_encode(['ok' => true], JSON_UNESCAPED_UNICODE);
+    exit;
+}
+
+/** GET ?action=process_instagram_schedules&cron_secret=… — publish due posts (cron; requires FF_CRON_PB_TOKEN). */
+if ($_SERVER['REQUEST_METHOD'] === 'GET' && ($_GET['action'] ?? '') === 'process_instagram_schedules') {
+    header('Content-Type: application/json; charset=utf-8');
+    header('Cache-Control: no-store');
+    $cronSecret = trim((string) (getenv('CRON_SECRET') ?: ''));
+    $got = trim((string) ($_GET['cron_secret'] ?? ''));
+    $pbCron = trim((string) (getenv('FF_CRON_PB_TOKEN') ?: ''));
+    if ($cronSecret === '' || $got !== $cronSecret || $pbCron === '') {
+        http_response_code(403);
+        echo json_encode(['error' => 'Cron not configured (CRON_SECRET + FF_CRON_PB_TOKEN).'], JSON_UNESCAPED_UNICODE);
+        exit;
+    }
+    $cfg = $GLOBALS['CONFIG'];
+    $outCol = (string) ($cfg['output_media_collection'] ?? 'output_media');
+    $q = http_build_query([
+        'filter' => 'type = "ig_carousel_schedule" && status = "scheduled"',
+        'perPage' => 30,
+        'sort' => 'scheduled_publish_at',
+    ]);
+    $r = pb_request('GET', '/api/collections/' . rawurlencode($outCol) . '/records?' . $q, null, $pbCron);
+    if (($r['code'] ?? 0) !== 200) {
+        http_response_code(502);
+        echo json_encode(['error' => 'Could not list schedules.'], JSON_UNESCAPED_UNICODE);
+        exit;
+    }
+    $items = ff_pb_list_items($r);
+    $now = time();
+    $processed = [];
+    foreach ($items as $it) {
+        if (!is_array($it)) {
+            continue;
+        }
+        $rid = (string) ($it['id'] ?? '');
+        if ($rid === '') {
+            continue;
+        }
+        $when = $it['scheduled_publish_at'] ?? '';
+        if (!is_string($when) || $when === '') {
+            continue;
+        }
+        $wt = strtotime($when);
+        if ($wt === false || $wt > $now) {
+            continue;
+        }
+        $sid = trim((string) ($it['social_account_id'] ?? ''));
+        $meta = $it['metadata'] ?? [];
+        if (is_string($meta)) {
+            $meta = json_decode($meta, true) ?: [];
+        }
+        if (!is_array($meta)) {
+            $meta = [];
+        }
+        $caption = (string) ($meta['caption'] ?? '');
+        $urls = $meta['image_urls'] ?? [];
+        if (!is_array($urls)) {
+            $urls = [];
+        }
+        $soc = pb_request('GET', '/api/collections/social_accounts/records/' . rawurlencode($sid), null, $pbCron);
+        if (($soc['code'] ?? 0) !== 200) {
+            $failMeta = array_merge($meta, ['schedule_error' => 'social_accounts record missing']);
+            pb_request('PATCH', '/api/collections/' . rawurlencode($outCol) . '/records/' . rawurlencode($rid), [
+                'status' => 'failed',
+                'metadata' => $failMeta,
+            ], $pbCron);
+            $processed[] = ['id' => $rid, 'ok' => false, 'error' => 'no_social_account'];
+            continue;
+        }
+        $srec = ff_pb_normalize_api_record($soc['body']);
+        $igUserId = trim((string) ($srec['instagram_user_id'] ?? ''));
+        $token = trim((string) ($srec['access_token'] ?? ''));
+        if ($igUserId === '' || $token === '') {
+            $failMeta = array_merge($meta, ['schedule_error' => 'Missing instagram_user_id or access_token']);
+            pb_request('PATCH', '/api/collections/' . rawurlencode($outCol) . '/records/' . rawurlencode($rid), [
+                'status' => 'failed',
+                'metadata' => $failMeta,
+            ], $pbCron);
+            $processed[] = ['id' => $rid, 'ok' => false, 'error' => 'bad_token'];
+            continue;
+        }
+        $pbUidCron = trim((string) ($meta['pb_user_id'] ?? ''));
+        $pub = ff_ig_publish_carousel_or_single($igUserId, $token, $urls, $caption, $pbUidCron !== '' ? $pbUidCron : null);
+        if (!$pub['ok']) {
+            $failMeta = array_merge($meta, ['schedule_error' => $pub['error']]);
+            pb_request('PATCH', '/api/collections/' . rawurlencode($outCol) . '/records/' . rawurlencode($rid), [
+                'status' => 'failed',
+                'metadata' => $failMeta,
+            ], $pbCron);
+            $processed[] = ['id' => $rid, 'ok' => false, 'error' => $pub['error']];
+            continue;
+        }
+        $okMeta = array_merge($meta, [
+            'published_ig_media_id' => $pub['media_id'],
+            'published_at' => gmdate('c'),
+        ]);
+        pb_request('PATCH', '/api/collections/' . rawurlencode($outCol) . '/records/' . rawurlencode($rid), [
+            'status' => 'published',
+            'published_at' => gmdate('Y-m-d\TH:i:s.000\Z'),
+            'metadata' => $okMeta,
+        ], $pbCron);
+        $processed[] = ['id' => $rid, 'ok' => true, 'ig_media_id' => $pub['media_id']];
+    }
+    echo json_encode(['ok' => true, 'processed' => $processed], JSON_UNESCAPED_UNICODE);
     exit;
 }
 
@@ -2063,7 +3606,7 @@ if (isset($_GET['instagram_oauth']) && $user) {
     }
     $oauthState = ['user_id' => $user['id'] ?? '', 'nonce' => $stateNonce];
     $_SESSION['instagram_oauth_state'] = $oauthState;
-    $scope = (string) ($cfg['instagram_oauth_scope'] ?? 'instagram_basic,instagram_content_publish,pages_show_list,pages_read_engagement,business_management');
+    $scope = (string) ($cfg['instagram_oauth_scope'] ?? $defaultIgScope);
     $params = [
         'client_id' => $appId,
         'redirect_uri' => $redirect,
@@ -2118,7 +3661,6 @@ if ($isInstagramCallback && isset($_GET['code']) && $user) {
     $data = json_decode($res ?: '{}', true) ?? [];
     $fbToken = $data['access_token'] ?? null;
     if (!$fbToken) {
-        $err = $data['error']['message'] ?? json_encode($data);
         ff_redirect_url('/?ig_error=1');
     }
 
@@ -2135,7 +3677,6 @@ if ($isInstagramCallback && isset($_GET['code']) && $user) {
     $seenIgUsers = [];
     foreach ($pages as $page) {
         $pageId = $page['id'] ?? '';
-        $pageName = $page['name'] ?? '';
         $pageToken = trim((string) ($page['access_token'] ?? ''));
         if ($pageToken === '') {
             $pageToken = (string) $fbToken;
@@ -2144,9 +3685,7 @@ if ($isInstagramCallback && isset($_GET['code']) && $user) {
             continue;
         }
         $igBiz = $page['instagram_business_account'] ?? null;
-        $igSource = 'expanded';
         if (!$igBiz || empty($igBiz['id'])) {
-            $igSource = 'page_lookup';
             foreach ([$fbToken, $pageToken] as $tryToken) {
                 $ch3 = curl_init("https://graph.facebook.com/v18.0/{$pageId}?fields=instagram_business_account{id,username}&access_token=" . urlencode((string) $tryToken));
                 curl_setopt($ch3, CURLOPT_RETURNTRANSFER, true);
@@ -2196,23 +3735,557 @@ if ($isInstagramCallback && isset($_GET['code']) && $user) {
     if ($saved > 0) {
         ff_redirect_url('/?ig_ok=1');
     }
-    if (!empty($pages)) {
-        ff_redirect_url('/?ig_error=1');
-    }
     ff_redirect_url('/?ig_error=1');
 }
 
-$siteName = htmlspecialchars((string) ($CONFIG['site_name'] ?? 'FormatForge'), ENT_QUOTES | ENT_HTML5, 'UTF-8');
-$appVersion = htmlspecialchars((string) ($CONFIG['app_version'] ?? ''), ENT_QUOTES | ENT_HTML5, 'UTF-8');
-$pbAdmin = htmlspecialchars((string) ($CONFIG['pocketbase_admin_url'] ?? ''), ENT_QUOTES | ENT_HTML5, 'UTF-8');
-$pbPublicRaw = rtrim((string) ($CONFIG['pocketbase_public_url'] ?? ''), '/');
-$fetchImCol = (string) ($CONFIG['input_media_collection'] ?? 'input_media');
-$fetchPrCol = (string) ($CONFIG['prompts_collection'] ?? 'prompts');
-$fetchGeminiConfigured = trim((string) (getenv('GEMINI_API_KEY') ?: '')) !== '';
-$fetchOpenRouterConfigured = trim((string) (getenv('OPENROUTER_API_KEY') ?: '')) !== '';
-$fetchGeminiModelUi = htmlspecialchars(trim((string) (getenv('GEMINI_EMBED_MODEL') ?: 'gemini-embedding-2-preview')), ENT_QUOTES | ENT_HTML5, 'UTF-8');
-$fbConfigured = trim((string) ($CONFIG['fb_app_id'] ?? '')) !== '' && trim((string) ($CONFIG['fb_app_secret'] ?? '')) !== '';
+/** Replicate HTTP JSON helper. */
+function ff_replicate_api_json(string $method, string $url, string $token, ?string $jsonBody, int $timeoutSec = 120): array
+{
+    $ch = curl_init($url);
+    $headers = [
+        'Authorization: Bearer ' . $token,
+        'Accept: application/json',
+    ];
+    if ($jsonBody !== null) {
+        $headers[] = 'Content-Type: application/json';
+    }
+    curl_setopt_array($ch, [
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_CUSTOMREQUEST => $method,
+        CURLOPT_HTTPHEADER => $headers,
+        CURLOPT_TIMEOUT => $timeoutSec,
+    ]);
+    if ($jsonBody !== null) {
+        curl_setopt($ch, CURLOPT_POSTFIELDS, $jsonBody);
+    }
+    $res = curl_exec($ch);
+    $code = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    curl_close($ch);
 
+    return ['code' => $code, 'body' => json_decode($res ?: '{}', true) ?? [], 'raw' => $res ?: ''];
+}
+
+/**
+ * Upload bytes to Replicate Files API; returns HTTPS URL for image_input.
+ *
+ * @return array{ok: bool, url: string, error: string}
+ */
+function ff_replicate_upload_file(string $token, string $binary, string $basename, string $mime): array
+{
+    $out = ['ok' => false, 'url' => '', 'error' => ''];
+    if (!class_exists(CURLFile::class)) {
+        $out['error'] = 'PHP CURLFile not available';
+
+        return $out;
+    }
+    $safeBase = preg_replace('/[^a-zA-Z0-9._-]/', '', $basename) ?: 'context.jpg';
+    $tmp = sys_get_temp_dir() . '/ffrep_' . bin2hex(random_bytes(8)) . '_' . $safeBase;
+    if (@file_put_contents($tmp, $binary) === false) {
+        $out['error'] = 'Could not write temp file for upload';
+
+        return $out;
+    }
+    $mime = $mime !== '' ? $mime : 'application/octet-stream';
+    $cf = new CURLFile($tmp, $mime, $safeBase);
+    $ch = curl_init('https://api.replicate.com/v1/files');
+    curl_setopt_array($ch, [
+        CURLOPT_POST => true,
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_HTTPHEADER => [
+            'Authorization: Bearer ' . $token,
+        ],
+        CURLOPT_POSTFIELDS => ['content' => $cf],
+        CURLOPT_TIMEOUT => 120,
+    ]);
+    $res = curl_exec($ch);
+    $code = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    curl_close($ch);
+    @unlink($tmp);
+    $body = json_decode($res ?: '{}', true) ?? [];
+    if ($code < 200 || $code >= 300) {
+        $out['error'] = is_array($body) ? (string) ($body['detail'] ?? $body['message'] ?? 'File upload failed') : 'File upload failed';
+
+        return $out;
+    }
+    $u = '';
+    if (isset($body['urls']['get']) && is_string($body['urls']['get'])) {
+        $u = $body['urls']['get'];
+    } elseif (isset($body['url']) && is_string($body['url'])) {
+        $u = $body['url'];
+    }
+    $u = trim($u);
+    if ($u === '' || !str_starts_with($u, 'http')) {
+        $out['error'] = 'File upload response missing URL';
+
+        return $out;
+    }
+    $out['ok'] = true;
+    $out['url'] = $u;
+
+    return $out;
+}
+
+/**
+ * Run google/nano-banana-pro; polls until terminal state.
+ *
+ * @param list<string> $imageInput
+ * @return array{ok: bool, output_url: string, error: string}
+ */
+function ff_replicate_nano_banana_pro(string $token, string $prompt, array $imageInput, string $resolution, string $aspectRatio, string $outputFormat, bool $allowFallback): array
+{
+    $out = ['ok' => false, 'output_url' => '', 'error' => ''];
+    $input = [
+        'prompt' => $prompt,
+        'image_input' => array_values($imageInput),
+        'resolution' => $resolution,
+        'aspect_ratio' => $aspectRatio,
+        'output_format' => $outputFormat,
+        'safety_filter_level' => 'block_only_high',
+        'allow_fallback_model' => $allowFallback,
+    ];
+    $payload = json_encode([
+        'version' => 'google/nano-banana-pro',
+        'input' => $input,
+    ], JSON_UNESCAPED_UNICODE);
+    if ($payload === false) {
+        $out['error'] = 'Could not encode Replicate request';
+
+        return $out;
+    }
+    $ch = curl_init('https://api.replicate.com/v1/predictions');
+    curl_setopt_array($ch, [
+        CURLOPT_POST => true,
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_HTTPHEADER => [
+            'Authorization: Bearer ' . $token,
+            'Content-Type: application/json',
+            'Accept: application/json',
+            'Prefer: wait=60',
+        ],
+        CURLOPT_POSTFIELDS => $payload,
+        CURLOPT_TIMEOUT => 130,
+    ]);
+    $res = curl_exec($ch);
+    $code = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    curl_close($ch);
+    $body = json_decode($res ?: '{}', true) ?? [];
+    if ($code < 200 || $code >= 300) {
+        $out['error'] = is_array($body) ? (string) ($body['detail'] ?? $body['message'] ?? json_encode($body)) : 'Replicate create failed';
+
+        return $out;
+    }
+    $getUrl = '';
+    if (isset($body['urls']['get']) && is_string($body['urls']['get'])) {
+        $getUrl = trim($body['urls']['get']);
+    }
+    if ($getUrl === '') {
+        $out['error'] = 'Replicate response missing prediction URL';
+
+        return $out;
+    }
+    $status = (string) ($body['status'] ?? '');
+    $deadline = time() + 240;
+    while (in_array($status, ['starting', 'processing'], true) && time() < $deadline) {
+        usleep(600000);
+        $g = ff_replicate_api_json('GET', $getUrl, $token, null, 60);
+        $body = is_array($g['body']) ? $g['body'] : [];
+        $status = (string) ($body['status'] ?? '');
+    }
+    if ($status !== 'succeeded') {
+        $err = (string) ($body['error'] ?? '');
+        $out['error'] = $err !== '' ? $err : ('Prediction status: ' . ($status !== '' ? $status : 'unknown'));
+
+        return $out;
+    }
+    $output = $body['output'] ?? null;
+    $urlOut = '';
+    if (is_string($output)) {
+        $urlOut = trim($output);
+    }
+    if ($urlOut === '' || !str_starts_with($urlOut, 'http')) {
+        $out['error'] = 'Replicate output was not an image URL';
+
+        return $out;
+    }
+    $out['ok'] = true;
+    $out['output_url'] = $urlOut;
+
+    return $out;
+}
+
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && ff_request_action() === 'generate') {
+    header('Content-Type: application/json; charset=utf-8');
+    if (!ff_gate_session_ok()) {
+        http_response_code(403);
+        echo json_encode(['error' => 'Sign in required.']);
+        exit;
+    }
+
+    $raw = file_get_contents('php://input');
+    $data = json_decode($raw ?? '', true);
+    if (!is_array($data) || !isset($data['prompt']) || !is_string($data['prompt'])) {
+        http_response_code(400);
+        echo json_encode(['error' => 'JSON body must include string "prompt"']);
+        exit;
+    }
+
+    $prompt = trim($data['prompt']);
+    if ($prompt === '') {
+        http_response_code(400);
+        echo json_encode(['error' => 'Prompt is empty']);
+        exit;
+    }
+
+    $openrouterKey = cg_env('OPENROUTER_API_KEY');
+    if ($openrouterKey === false) {
+        http_response_code(503);
+        echo json_encode(['error' => 'Slide generation requires OPENROUTER_API_KEY in .env. Gemini and OpenAI are not used for slides.']);
+        exit;
+    }
+
+    $system = <<<'SYS'
+You output only valid JSON (no markdown). Shape: {"slides":[{"elements":[{"type":"Title"|"Subtitle"|"Description","text":"..."}]}]}.
+Rules:
+- 8-15 slides; each slide has 2-3 elements mixing Title, Subtitle, Description.
+- Text under ~70% of typical limits: title/subtitle max ~110 chars; descriptions shorter.
+- Add tasteful emojis in text. No slide numbers in copy.
+- Elements on a slide share one idea; adapt the user topic for LinkedIn-style carousels.
+SYS;
+
+    $orModel = (string) cg_env('OPENROUTER_MODEL', 'openai/gpt-4o-mini');
+    $orModel = preg_replace('/[^a-zA-Z0-9._\-\/]/', '', $orModel) ?: 'openai/gpt-4o-mini';
+    $payload = [
+        'model' => $orModel,
+        'temperature' => 0,
+        'messages' => [
+            ['role' => 'system', 'content' => $system],
+            ['role' => 'user', 'content' => $prompt],
+        ],
+        'response_format' => ['type' => 'json_object'],
+    ];
+    $body = json_encode($payload);
+    if ($body === false) {
+        http_response_code(500);
+        echo json_encode(['error' => 'Could not encode request']);
+        exit;
+    }
+    $referer = (string) cg_env('OPENROUTER_HTTP_REFERER', 'https://127.0.0.1');
+    $ctx = stream_context_create([
+        'http' => [
+            'method' => 'POST',
+            'header' => implode("\r\n", [
+                'Content-Type: application/json',
+                'Authorization: Bearer ' . $openrouterKey,
+                'Referer: ' . $referer,
+                'X-Title: Carousel Generator',
+            ]),
+            'content' => $body,
+            'timeout' => 120,
+            'ignore_errors' => true,
+        ],
+    ]);
+    $rawResponse = @file_get_contents('https://openrouter.ai/api/v1/chat/completions', false, $ctx);
+    $httpCode = 0;
+    if (isset($http_response_header[0]) && preg_match('/\s(\d{3})\s/', $http_response_header[0], $m)) {
+        $httpCode = (int) $m[1];
+    }
+    if ($rawResponse === false || $rawResponse === '') {
+        http_response_code(502);
+        echo json_encode(['error' => 'OpenRouter request failed (no response)']);
+        exit;
+    }
+    $decoded = json_decode($rawResponse, true);
+    if (!is_array($decoded)) {
+        http_response_code(502);
+        echo json_encode(['error' => 'Invalid OpenRouter response']);
+        exit;
+    }
+    if ($httpCode >= 400) {
+        $msg = $decoded['error']['message'] ?? (is_string($decoded['error'] ?? null) ? $decoded['error'] : 'OpenRouter error');
+        http_response_code(502);
+        echo json_encode(['error' => $msg]);
+        exit;
+    }
+    $modelText = (string) ($decoded['choices'][0]['message']['content'] ?? '');
+
+    $slides = cg_parse_slides_json($modelText);
+    if ($slides === null) {
+        http_response_code(502);
+        echo json_encode(['error' => 'Model did not return valid slides JSON']);
+        exit;
+    }
+
+    $resp = ['slides' => $slides];
+    if (ff_should_save_generated_to_garage()) {
+        $uid = ff_session_pb_user_id();
+        if ($uid !== '') {
+            $relFile = 'openrouter-' . gmdate('Ymd\THis\Z') . '-' . bin2hex(random_bytes(4)) . '.json';
+            $relUser = 'slides/' . $relFile;
+            $blob = json_encode([
+                'kind' => 'slide_generation',
+                'prompt' => $prompt,
+                'slides' => $slides,
+                'saved_at' => gmdate('c'),
+                'model' => $orModel,
+            ], JSON_UNESCAPED_UNICODE | JSON_INVALID_UTF8_SUBSTITUTE);
+            if ($blob !== false) {
+                $socialSid = trim((string) ($data['social_account_id'] ?? ''));
+                $saveSoc = $socialSid !== '' && ff_pb_owned_social_account($authHeader, $socialSid) !== null;
+                $relScoped = $saveSoc ? ('ai/slides/' . $relFile) : $relUser;
+                $objKey = $saveSoc
+                    ? ff_garage_social_object_key($socialSid, $relScoped)
+                    : ff_garage_generated_object_key($uid, $relUser);
+                if ($objKey !== '') {
+                    $put = ff_garage_put_object($objKey, $blob, 'application/json; charset=utf-8');
+                    $script = $_SERVER['SCRIPT_NAME'] ?? '/index.php';
+                    $g = ['saved' => $put['ok'], 'key' => $relScoped, 'scope' => $saveSoc ? 'social_account' : 'user'];
+                    if ($saveSoc) {
+                        $g['social_account_id'] = $socialSid;
+                    }
+                    if ($put['ok']) {
+                        $g['download_url'] = $saveSoc
+                            ? ($script . '?action=garage_download&key=' . rawurlencode($relScoped) . '&social_account_id=' . rawurlencode($socialSid))
+                            : ($script . '?action=garage_generated_download&key=' . rawurlencode($relUser));
+                        $pub = ff_garage_public_https_url_for_object_key($objKey);
+                        if ($pub !== '') {
+                            $g['public_url'] = $pub;
+                        }
+                    } else {
+                        $g['error'] = $put['error'];
+                    }
+                    $resp['garage'] = $g;
+                }
+            }
+        }
+    }
+
+    echo json_encode($resp, JSON_UNESCAPED_UNICODE);
+    exit;
+}
+
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && ff_request_action() === 'generate_image') {
+    header('Content-Type: application/json; charset=utf-8');
+    if (!ff_gate_session_ok()) {
+        http_response_code(403);
+        echo json_encode(['error' => 'Sign in required.']);
+        exit;
+    }
+    $repTok = trim((string) (getenv('REPLICATE_API_TOKEN') ?: ''));
+    if ($repTok === '') {
+        http_response_code(503);
+        echo json_encode(['error' => 'REPLICATE_API_TOKEN not set']);
+        exit;
+    }
+    $raw = file_get_contents('php://input');
+    $data = json_decode($raw ?? '', true);
+    if (!is_array($data) || !isset($data['prompt']) || !is_string($data['prompt'])) {
+        http_response_code(400);
+        echo json_encode(['error' => 'JSON body must include string "prompt"']);
+        exit;
+    }
+    $prompt = trim($data['prompt']);
+    if ($prompt === '') {
+        http_response_code(400);
+        echo json_encode(['error' => 'Prompt is empty']);
+        exit;
+    }
+    $imageInput = [];
+    $imageUrl = trim((string) ($data['image_url'] ?? ''));
+    if ($imageUrl !== '' && preg_match('#^https?://#i', $imageUrl)) {
+        $imageInput[] = $imageUrl;
+    }
+    $b64raw = $data['image_base64'] ?? null;
+    if (is_string($b64raw) && $b64raw !== '') {
+        $b64clean = preg_replace('/\s+/', '', $b64raw);
+        $bin = base64_decode($b64clean, true);
+        if ($bin !== false && strlen($bin) > 16) {
+            $maxBytes = 12 * 1024 * 1024;
+            if (strlen($bin) > $maxBytes) {
+                http_response_code(400);
+                echo json_encode(['error' => 'Context image too large (max 12 MB)']);
+                exit;
+            }
+            $mime = strtolower(trim((string) ($data['image_mime'] ?? 'image/jpeg')));
+            $mime = preg_replace('/[^a-z0-9.\/+=-]/i', '', $mime) ?: 'image/jpeg';
+            if (!str_starts_with($mime, 'image/')) {
+                $mime = 'image/jpeg';
+            }
+            $ext = 'jpg';
+            if (str_contains($mime, 'png')) {
+                $ext = 'png';
+            } elseif (str_contains($mime, 'webp')) {
+                $ext = 'webp';
+            } elseif (str_contains($mime, 'gif')) {
+                $ext = 'gif';
+            }
+            if (strlen($bin) <= 245760) {
+                $imageInput[] = 'data:' . $mime . ';base64,' . base64_encode($bin);
+            } else {
+                $up = ff_replicate_upload_file($repTok, $bin, 'context.' . $ext, $mime);
+                if (!$up['ok']) {
+                    http_response_code(502);
+                    echo json_encode(['error' => 'Could not upload context image to Replicate: ' . $up['error']]);
+                    exit;
+                }
+                $imageInput[] = $up['url'];
+            }
+        }
+    }
+    if (count($imageInput) > 14) {
+        http_response_code(400);
+        echo json_encode(['error' => 'Too many context images (max 14)']);
+        exit;
+    }
+    $aspect = trim((string) ($data['aspect_ratio'] ?? ''));
+    $allowedAspect = ['match_input_image', '1:1', '2:3', '3:2', '3:4', '4:3', '4:5', '5:4', '9:16', '16:9', '21:9'];
+    if ($aspect === '' || !in_array($aspect, $allowedAspect, true)) {
+        $aspect = count($imageInput) > 0 ? 'match_input_image' : '4:5';
+    }
+    if ($aspect === 'match_input_image' && $imageInput === []) {
+        $aspect = '4:5';
+    }
+    $resolution = trim((string) ($data['resolution'] ?? ''));
+    if ($resolution === '') {
+        $resolution = trim((string) (getenv('REPLICATE_NANO_RESOLUTION') ?: '2K'));
+    }
+    if (!in_array($resolution, ['1K', '2K', '4K'], true)) {
+        $resolution = '2K';
+    }
+    $outputFormat = strtolower(trim((string) ($data['output_format'] ?? '')));
+    if ($outputFormat === '') {
+        $outputFormat = strtolower(trim((string) (getenv('REPLICATE_NANO_OUTPUT_FORMAT') ?: 'png')));
+    }
+    if (!in_array($outputFormat, ['jpg', 'jpeg', 'png', 'webp'], true)) {
+        $outputFormat = 'png';
+    }
+    if ($outputFormat === 'jpeg') {
+        $outputFormat = 'jpg';
+    }
+    $allowFallback = filter_var($data['allow_fallback_model'] ?? true, FILTER_VALIDATE_BOOL);
+
+    $run = ff_replicate_nano_banana_pro($repTok, $prompt, $imageInput, $resolution, $aspect, $outputFormat, $allowFallback);
+    if (!$run['ok']) {
+        http_response_code(502);
+        echo json_encode(['error' => $run['error']]);
+        exit;
+    }
+    $imageUrlOut = $run['output_url'];
+    $resp = ['ok' => true, 'image_url' => $imageUrlOut];
+    if (ff_should_save_generated_to_garage()) {
+        $uid = ff_session_pb_user_id();
+        if ($uid !== '') {
+            $fetch = ff_http_get_bytes($run['output_url'], 40 * 1024 * 1024, 130);
+            if ($fetch['ok']) {
+                $ext = $outputFormat === 'jpeg' ? 'jpg' : $outputFormat;
+                $relFile = 'replicate-' . gmdate('Ymd\THis\Z') . '-' . bin2hex(random_bytes(4)) . '.' . $ext;
+                $relUser = 'images/' . $relFile;
+                $mime = strtolower((string) $fetch['content_type']);
+                if ($mime === '' || !str_starts_with($mime, 'image/')) {
+                    $mime = ff_mime_for_image_ext($ext);
+                }
+                $socialSid = trim((string) ($data['social_account_id'] ?? ''));
+                $saveSoc = $socialSid !== '' && ff_pb_owned_social_account($authHeader, $socialSid) !== null;
+                $relScoped = $saveSoc ? ('ai/images/' . $relFile) : $relUser;
+                $objKey = $saveSoc
+                    ? ff_garage_social_object_key($socialSid, $relScoped)
+                    : ff_garage_generated_object_key($uid, $relUser);
+                if ($objKey !== '') {
+                    $put = ff_garage_put_object($objKey, $fetch['bytes'], $mime);
+                    $script = $_SERVER['SCRIPT_NAME'] ?? '/index.php';
+                    if ($put['ok']) {
+                        $imageUrlOut = $saveSoc
+                            ? ($script . '?action=garage_download&inline=1&key=' . rawurlencode($relScoped) . '&social_account_id=' . rawurlencode($socialSid))
+                            : ($script . '?action=garage_generated_download&inline=1&key=' . rawurlencode($relUser));
+                        $resp['image_url'] = $imageUrlOut;
+                        $pubImg = ff_garage_public_https_url_for_object_key($objKey);
+                        if ($pubImg !== '') {
+                            $resp['public_image_url'] = $pubImg;
+                        }
+                        $g = ['saved' => true, 'key' => $relScoped, 'scope' => $saveSoc ? 'social_account' : 'user'];
+                        if ($saveSoc) {
+                            $g['social_account_id'] = $socialSid;
+                        }
+                        $resp['garage'] = $g;
+                    } else {
+                        $resp['garage'] = [
+                            'saved' => false,
+                            'key' => $relScoped,
+                            'scope' => $saveSoc ? 'social_account' : 'user',
+                            'error' => $put['error'],
+                        ];
+                    }
+                }
+            } else {
+                $resp['garage'] = ['saved' => false, 'error' => $fetch['error'] !== '' ? $fetch['error'] : 'Could not fetch image from provider'];
+            }
+        }
+    }
+    echo json_encode($resp, JSON_UNESCAPED_UNICODE);
+    exit;
+}
+
+if (!ff_gate_session_ok()) {
+    header('Content-Type: text/html; charset=utf-8');
+    header('Cache-Control: no-store');
+    $cfg = $GLOBALS['CONFIG'];
+    $gateTitle = htmlspecialchars((string) ($cfg['site_name'] ?? 'Sign in'), ENT_QUOTES | ENT_HTML5, 'UTF-8');
+    $gateLoginErr = isset($_GET['login_error']) ? (int) $_GET['login_error'] : 0;
+    $gateFormAction = htmlspecialchars($_SERVER['SCRIPT_NAME'] ?? '/', ENT_QUOTES | ENT_HTML5, 'UTF-8');
+    ?>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Sign in · <?php echo $gateTitle; ?></title>
+    <style>
+        :root { --bg: #0f1115; --panel: #181b21; --border: #2a2f3a; --text: #e8eaed; --muted: #8b929e; --accent: #3b82f6; }
+        * { box-sizing: border-box; }
+        body { margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 1.5rem;
+            font-family: system-ui, -apple-system, sans-serif; background: var(--bg); color: var(--text); }
+        .card { width: 100%; max-width: 22rem; background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 1.5rem; }
+        h1 { margin: 0 0 0.35rem; font-size: 1.15rem; font-weight: 600; }
+        p.sub { margin: 0 0 1rem; font-size: 0.8rem; color: var(--muted); line-height: 1.45; }
+        label { display: block; font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted); margin-bottom: 0.25rem; }
+        input { width: 100%; padding: 0.5rem 0.6rem; border-radius: 8px; border: 1px solid var(--border); background: #12151a; color: var(--text); font: inherit; margin-bottom: 0.75rem; }
+        button { width: 100%; padding: 0.55rem; border-radius: 8px; border: none; background: var(--accent); color: #fff; font: inherit; font-weight: 600; cursor: pointer; }
+        button:hover { filter: brightness(1.06); }
+        .flash { font-size: 0.85rem; padding: 0.5rem 0.65rem; border-radius: 8px; margin-bottom: 1rem; }
+        .flash.bad { background: rgba(248, 113, 113, 0.12); color: #fca5a5; border: 1px solid rgba(248, 113, 113, 0.35); }
+    </style>
+</head>
+<body>
+    <div class="card">
+        <h1><?php echo $gateTitle; ?></h1>
+        <p class="sub">Sign in with your PocketBase account. Access is limited to approved email addresses.</p>
+        <?php if ($gateLoginErr === 1): ?>
+            <div class="flash bad">Invalid email or password.</div>
+        <?php elseif ($gateLoginErr === 2): ?>
+            <div class="flash bad">This account is not authorized to use this app.</div>
+        <?php endif; ?>
+        <form method="post" action="<?php echo $gateFormAction; ?>">
+            <input type="hidden" name="action" value="login">
+            <label for="gate-email">Email</label>
+            <input id="gate-email" type="email" name="email" required autocomplete="username" autofocus>
+            <label for="gate-pass">Password</label>
+            <input id="gate-pass" type="password" name="password" required autocomplete="current-password">
+            <button type="submit">Sign in</button>
+        </form>
+    </div>
+</body>
+</html>
+    <?php
+    exit;
+}
+
+$CONFIG = $GLOBALS['CONFIG'];
+$htmlSiteName = htmlspecialchars((string) ($CONFIG['site_name'] ?? 'Carousel'), ENT_QUOTES | ENT_HTML5, 'UTF-8');
+$htmlAppVersion = htmlspecialchars((string) ($CONFIG['app_version'] ?? ''), ENT_QUOTES | ENT_HTML5, 'UTF-8');
+$userEmail = htmlspecialchars((string) ($user['email'] ?? ''), ENT_QUOTES | ENT_HTML5, 'UTF-8');
+$flashIgOk = isset($_GET['ig_ok']);
+$flashIgErr = isset($_GET['ig_error']);
+$flashLoginErr = isset($_GET['login_error']);
+$fbConfigured = trim((string) ($CONFIG['fb_app_id'] ?? '')) !== '' && trim((string) ($CONFIG['fb_app_secret'] ?? '')) !== '';
 $igAccountsList = [];
 if ($authHeader) {
     $qAccounts = http_build_query([
@@ -2235,444 +4308,3257 @@ if ($authHeader) {
         }
     }
 }
+$htmlPbAdmin = htmlspecialchars((string) ($CONFIG['pocketbase_admin_url'] ?? ''), ENT_QUOTES | ENT_HTML5, 'UTF-8');
+$htmlInputMediaCol = htmlspecialchars((string) ($CONFIG['input_media_collection'] ?? 'input_media'), ENT_QUOTES | ENT_HTML5, 'UTF-8');
+$slideAiEnabled = cg_env('OPENROUTER_API_KEY') !== false;
 
-$userEmail = htmlspecialchars((string) ($user['email'] ?? ''), ENT_QUOTES | ENT_HTML5, 'UTF-8');
-$flashIgOk = isset($_GET['ig_ok']);
-$flashIgErr = isset($_GET['ig_error']);
-$flashLoginErr = isset($_GET['login_error']);
-$flashFetchOk = isset($_GET['fetch_ok']);
-$flashFetchErr = isset($_GET['fetch_err']);
-$fetchFlash = $_SESSION['fetch_flash'] ?? null;
-if (is_array($fetchFlash)) {
-    unset($_SESSION['fetch_flash']);
-} else {
-    $fetchFlash = null;
-}
-$fetchFlashRecord = is_array($fetchFlash) && !empty($fetchFlash['ok']) && !empty($fetchFlash['record_id'])
-    ? (string) $fetchFlash['record_id'] : '';
-$fetchRecordRows = ($flashFetchOk && is_array($fetchFlash) && !empty($fetchFlash['record_rows']) && is_array($fetchFlash['record_rows']))
-    ? $fetchFlash['record_rows'] : [];
-$fetchPbFiles = ($flashFetchOk && is_array($fetchFlash) && !empty($fetchFlash['pb_files']) && is_array($fetchFlash['pb_files']))
-    ? $fetchFlash['pb_files'] : [];
+$replicateImageEnabled = trim((string) (getenv('REPLICATE_API_TOKEN') ?: '')) !== '';
+$aiTabHasAny = $slideAiEnabled || $replicateImageEnabled;
 
-if (isset($_GET['privacy'])) {
-    header('Content-Type: text/html; charset=utf-8');
-    echo '<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><title>Privacy</title></head><body><h1>Privacy</h1><p>Add your policy text here.</p><p><a href="/">Home</a></p></body></html>';
-    exit;
-}
+$generateUrl = ($_SERVER['SCRIPT_NAME'] ?? '/index.php') . '?action=generate';
+$generateImageUrl = ($_SERVER['SCRIPT_NAME'] ?? '/index.php') . '?action=generate_image';
+$garageReady = ff_garage_ready();
+$jsonIgAccounts = json_encode($igAccountsList, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+$jsonFfScript = json_encode($_SERVER['SCRIPT_NAME'] ?? '/index.php', JSON_UNESCAPED_SLASHES);
 
-header('Content-Type: text/html; charset=utf-8');
+$paletteNames = ['black', 'light', 'dracula', 'nord', 'night', 'forest'];
+$paletteSwatches = [
+    'black' => '#000000',
+    'light' => '#ffffff',
+    'dracula' => '#282a36',
+    'nord' => '#eceff4',
+    'night' => '#0f172a',
+    'forest' => '#171212',
+];
+$fontPairsTitle = [
+    ['DM_Serif_Display', 'DM Serif Display'],
+    ['DM_Sans', 'DM Sans'],
+    ['Inter', 'Inter'],
+    ['Montserrat', 'Montserrat'],
+    ['Roboto', 'Roboto'],
+    ['Roboto_Condensed', 'Roboto Condensed'],
+    ['PT_Serif', 'PT Serif'],
+    ['Syne', 'Syne'],
+    ['ArchivoBlack', 'Archivo Black'],
+    ['Ultra', 'Ultra'],
+];
+$fontPairsBody = [
+    ['DM_Sans', 'DM Sans'],
+    ['DM_Serif_Display', 'DM Serif Display'],
+    ['Inter', 'Inter'],
+    ['Montserrat', 'Montserrat'],
+    ['Roboto', 'Roboto'],
+    ['Roboto_Condensed', 'Roboto Condensed'],
+    ['PT_Serif', 'PT Serif'],
+    ['Syne', 'Syne'],
+    ['ArchivoBlack', 'Archivo Black'],
+    ['Ultra', 'Ultra'],
+];
 ?>
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title><?php echo $siteName; ?></title>
-    <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.14.8/dist/cdn.min.js"></script>
+    <title><?php echo $htmlSiteName; ?></title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Archivo+Black&family=DM+Sans:ital,opsz,wght@0,9..40,400;0,9..40,600;1,9..40,400&family=DM+Serif+Display&family=Inter:wght@400;600&family=Montserrat:wght@400;600&family=PT+Serif&family=Roboto:wght@400;500&family=Roboto+Condensed:wght@400;700&family=Syne:wght@400;700&family=Ultra&display=swap" rel="stylesheet">
     <style>
-        :root { font-family: system-ui, sans-serif; background: #0f1419; color: #e6edf3; }
-        body { margin: 0; min-height: 100vh; padding: 1.5rem; box-sizing: border-box; }
-        .wrap { max-width: 36rem; margin: 0 auto; display: flex; flex-direction: column; gap: 1rem; }
-        .card { width: 100%; background: #161b22; border: 1px solid #30363d; border-radius: 12px; padding: 1.5rem; box-shadow: 0 8px 24px rgba(0,0,0,.35); }
-        h1 { margin: 0 0 .5rem; font-size: 1.25rem; font-weight: 600; }
-        h2 { margin: 0 0 .75rem; font-size: 1rem; font-weight: 600; color: #c9d1d9; }
-        p { margin: .5rem 0; color: #8b949e; font-size: .875rem; line-height: 1.5; }
-        .row { display: flex; align-items: center; justify-content: space-between; gap: .75rem; flex-wrap: wrap; margin-top: 1rem; }
-        .pill { font-size: .75rem; padding: .2rem .5rem; border-radius: 999px; background: #21262d; color: #8b949e; display: inline-block; }
-        .ok { color: #3fb950; }
-        .bad { color: #f85149; }
-        a { color: #58a6ff; text-decoration: none; }
-        a:hover { text-decoration: underline; }
-        button, .btn { font: inherit; cursor: pointer; border: 1px solid #30363d; background: #21262d; color: #e6edf3; padding: .4rem .75rem; border-radius: 8px; display: inline-block; text-align: center; }
-        button:hover, .btn:hover { background: #30363d; }
-        .btn-primary { background: #238636; border-color: #238636; }
-        .btn-primary:hover { background: #2ea043; }
-        input { width: 100%; box-sizing: border-box; padding: .5rem .65rem; border-radius: 8px; border: 1px solid #30363d; background: #0d1117; color: #e6edf3; margin: .35rem 0 .75rem; font: inherit; }
-        label { font-size: .8rem; color: #8b949e; }
-        ul.ig { list-style: none; padding: 0; margin: .5rem 0 0; }
-        ul.ig li { padding: .35rem 0; border-bottom: 1px solid #21262d; font-size: .875rem; }
-        ul.ig li:last-child { border-bottom: none; }
-        .flash { font-size: .85rem; margin: .5rem 0; padding: .5rem .65rem; border-radius: 8px; }
-        .flash.ok { background: #23863622; color: #3fb950; border: 1px solid #23863655; }
-        .flash.bad { background: #f8514922; color: #f85149; border: 1px solid #f8514955; }
-        .ig-head { display: flex; align-items: center; justify-content: space-between; gap: 0.75rem; flex-wrap: wrap; margin: 0.75rem 0 0; }
-        .ig-head span { font-size: 0.875rem; font-weight: 600; color: #c9d1d9; }
-        .btn:disabled { opacity: 0.45; cursor: not-allowed; }
-        .account-bar { display: flex; align-items: center; justify-content: space-between; gap: 0.75rem; flex-wrap: wrap; margin-top: 0.5rem; }
-        select.fetch-tool { width: 100%; box-sizing: border-box; padding: .5rem .65rem; border-radius: 8px; border: 1px solid #30363d; background: #0d1117; color: #e6edf3; margin: .35rem 0 .75rem; font: inherit; }
-        ul.fetch-files { list-style: none; padding: 0; margin: .5rem 0 0; max-height: min(78vh, 44rem); overflow: auto; font-size: .8125rem; }
-        ul.fetch-files li { padding: .25rem 0; border-bottom: 1px solid #21262d; word-break: break-all; }
-        ul.fetch-files li:last-child { border-bottom: none; }
-        pre.fetch-err { margin: .5rem 0 0; padding: .65rem; background: #0d1117; border: 1px solid #f8514955; border-radius: 8px; color: #f85149; font-size: .75rem; white-space: pre-wrap; word-break: break-word; max-height: 16rem; overflow: auto; }
-        .fetch-prompt-wrap { margin: .5rem 0 0; font-size: .75rem; }
-        .fetch-prompt-wrap summary { cursor: pointer; color: #58a6ff; font-weight: 600; }
-        .fetch-prompt-instruction { margin: .35rem 0 0; color: #8b949e; line-height: 1.45; }
-        pre.fetch-prompt { margin: .4rem 0 0; padding: .65rem; background: #0d1117; border: 1px solid #30363d; border-radius: 8px; color: #c9d1d9; font-size: .75rem; white-space: pre-wrap; word-break: break-word; max-height: 18rem; overflow: auto; }
-        .fetch-prompt-err { margin: .35rem 0 0; font-size: .75rem; color: #f85149; }
-        .fetch-flow-intro { margin: .5rem 0 .75rem; padding: .65rem .75rem; background: #0d1117; border: 1px solid #30363d; border-radius: 8px; font-size: .75rem; color: #8b949e; line-height: 1.55; }
-        .fetch-flow-intro ol { margin: .35rem 0 0 1.1rem; padding: 0; }
-        .fetch-flow-intro li { margin: .2rem 0; }
-        .fetch-flow-intro code { color: #79c0ff; font-size: .72rem; }
-        ul.fetch-files li.fetch-row-li { padding: .65rem 0; }
-        .fetch-row-head { display: flex; align-items: flex-start; gap: .75rem; flex-wrap: wrap; }
-        .fetch-thumb { width: 120px; height: 120px; object-fit: cover; border-radius: 8px; border: 1px solid #30363d; flex-shrink: 0; background: #161b22; }
-        .fetch-row-main { flex: 1; min-width: 0; }
-        .fetch-links { margin: .35rem 0 0; font-size: .72rem; color: #8b949e; line-height: 1.5; word-break: break-all; }
-        .fetch-links a { color: #58a6ff; }
-        .fetch-api-line { display: block; margin-top: .2rem; font-family: ui-monospace, monospace; font-size: .68rem; color: #6e7681; }
-        .fetch-pipeline-wrap { margin: .5rem 0 0; font-size: .75rem; }
-        .fetch-pipeline-wrap > summary { cursor: pointer; color: #58a6ff; font-weight: 600; }
-        .fetch-pipeline-ol { margin: .4rem 0 0; padding-left: 1.15rem; }
-        .fetch-step-li { margin: .45rem 0; padding-bottom: .45rem; border-bottom: 1px solid #21262d; list-style: decimal; }
-        .fetch-step-li:last-child { border-bottom: none; }
-        .fetch-step-head { display: flex; align-items: baseline; gap: .5rem; flex-wrap: wrap; margin-bottom: .2rem; }
-        .fetch-step-title { font-weight: 600; color: #c9d1d9; }
-        .fetch-step-badge { font-size: .65rem; text-transform: uppercase; letter-spacing: .04em; padding: .1rem .35rem; border-radius: 4px; background: #21262d; color: #8b949e; }
-        .fetch-step-ok .fetch-step-badge { background: #23863633; color: #3fb950; }
-        .fetch-step-warn .fetch-step-badge { background: #9e6a0333; color: #d29922; }
-        .fetch-step-err .fetch-step-badge { background: #f8514933; color: #f85149; }
-        .fetch-step-skip .fetch-step-badge { background: #30363d; color: #6e7681; }
-        .fetch-step-detail { color: #8b949e; line-height: 1.45; font-size: .72rem; }
-        .fetch-emb-block { margin: .5rem 0 0; padding: .5rem; background: #010409; border: 1px solid #21262d; border-radius: 6px; }
-        .fetch-emb-label { margin: 0 0 .25rem; font-size: .68rem; font-weight: 600; color: #c9d1d9; }
-        pre.fetch-emb-mono { margin: 0; padding: 0; background: transparent; border: none; font-size: .68rem; color: #8b949e; white-space: pre-wrap; word-break: break-word; max-height: 10rem; overflow: auto; line-height: 1.4; }
-        textarea.debug-console { width: 100%; box-sizing: border-box; margin-top: .75rem; padding: .65rem; border-radius: 8px; border: 1px solid #30363d; background: #0d1117; color: #8b949e; font-size: .75rem; font-family: ui-monospace, monospace; line-height: 1.45; resize: vertical; min-height: 12rem; }
+:root {
+  --cg-shell: #0f1115;
+  --cg-panel: #181b21;
+  --cg-border: #2a2f3a;
+  --cg-muted: #8b929e;
+  --cg-accent: #3b82f6;
+  --cg-text: #e8eaed;
+}
+*, *::before, *::after { box-sizing: border-box; }
+body {
+  margin: 0;
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+  background: var(--cg-shell);
+  color: var(--cg-text);
+  line-height: 1.5;
+}
+a { color: var(--cg-accent); }
+.app-header {
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 1rem;
+  padding: 0.75rem 1.25rem;
+  border-bottom: 1px solid var(--cg-border);
+  background: var(--cg-panel);
+  flex-wrap: wrap;
+}
+.app-header h1 { margin: 0; font-size: 1.1rem; font-weight: 600; }
+.app-header-left { display: flex; flex-direction: column; gap: 0.15rem; min-width: 0; }
+.flash-banner {
+  padding: 0.5rem 1.25rem;
+  font-size: 0.85rem;
+  border-bottom: 1px solid var(--cg-border);
+}
+.flash-banner.ok { background: rgba(34, 197, 94, 0.12); color: #86efac; }
+.flash-banner.bad { background: rgba(248, 113, 113, 0.12); color: #fca5a5; }
+.layout {
+  flex: 1;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: minmax(240px, 300px) minmax(0, 1fr) minmax(260px, 340px);
+  grid-template-areas:
+    "edit preview sources"
+    "scrub scrub scrub";
+  grid-template-rows: minmax(0, 1fr) auto;
+  gap: 0;
+}
+.layout > .panel,
+.layout > .main,
+.layout > .sidebar-right {
+  min-height: 0;
+}
+@media (max-width: 1180px) {
+  .layout {
+    grid-template-columns: 1fr;
+    grid-template-areas:
+      "edit"
+      "preview"
+      "sources"
+      "scrub";
+    grid-template-rows: auto auto auto auto;
+  }
+}
+.panel {
+  grid-area: edit;
+  border-right: 1px solid var(--cg-border);
+  background: #12151a;
+  display: flex;
+  flex-direction: column;
+  max-height: none;
+  min-height: 0;
+  height: 100%;
+  overflow: hidden;
+  min-width: 0;
+}
+.panel > .tabs {
+  flex-shrink: 0;
+}
+@media (max-width: 1180px) {
+  .panel {
+    border-right: none;
+    border-bottom: 1px solid var(--cg-border);
+    max-height: none;
+  }
+}
+.sidebar-right {
+  grid-area: sources;
+  border-left: 1px solid var(--cg-border);
+  background: #12151a;
+  display: flex;
+  flex-direction: column;
+  max-height: none;
+  height: 100%;
+  min-width: 0;
+  overflow: hidden;
+}
+@media (max-width: 1180px) {
+  .sidebar-right {
+    border-left: none;
+    border-top: 1px solid var(--cg-border);
+    max-height: none;
+  }
+}
+.sidebar-right > .tabs {
+  flex-shrink: 0;
+}
+.sidebar-right .tabs button {
+  font-size: 0.7rem;
+  padding: 0.55rem 0.28rem;
+}
+.sidebar-inner {
+  padding: 0;
+  overflow-y: auto;
+  flex: 1;
+  min-height: 0;
+}
+.sidebar-tab-panel {
+  padding: 0.75rem 1rem 1rem;
+}
+.sidebar-section {
+  padding: 0;
+  margin: 0;
+  border-bottom: none;
+}
+.sidebar-section + .sidebar-section {
+  margin-top: 0.85rem;
+  padding-top: 0.85rem;
+  border-top: 1px solid var(--cg-border);
+}
+.sidebar-heading {
+  margin: 0 0 0.5rem;
+  font-size: 0.7rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--cg-muted);
+}
+.sidebar-section .hint { font-size: 0.78rem; line-height: 1.45; }
+.sidebar-section .field { margin-bottom: 0.65rem; }
+.sidebar-section .field:last-child { margin-bottom: 0; }
+.sidebar-ig-list {
+  list-style: none;
+  padding: 0;
+  margin: 0.35rem 0 0;
+  font-size: 0.82rem;
+}
+.sidebar-ig-list li {
+  padding: 0.35rem 0;
+  border-bottom: 1px solid var(--cg-border);
+}
+.sidebar-ig-list li:last-child { border-bottom: none; }
+.slide-kind-badge {
+  opacity: 0.72;
+  font-size: 0.72em;
+  font-weight: 400;
+}
+.media-subhead {
+  margin: 0.85rem 0 0.4rem;
+  font-size: 0.68rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--cg-muted);
+}
+.media-subhead:first-child { margin-top: 0.35rem; }
+.media-record-card {
+  border: 1px solid var(--cg-border);
+  border-radius: 8px;
+  padding: 0.45rem 0.5rem;
+  margin-bottom: 0.5rem;
+  background: rgba(0,0,0,0.15);
+}
+.media-record-title {
+  margin: 0 0 0.35rem;
+  font-size: 0.72rem;
+  font-weight: 600;
+  line-height: 1.35;
+  word-break: break-word;
+}
+.media-entry {
+  margin-top: 0.4rem;
+}
+.media-entry:first-of-type { margin-top: 0; }
+.media-thumb {
+  display: block;
+  max-width: 100%;
+  max-height: 140px;
+  width: auto;
+  height: auto;
+  border-radius: 6px;
+  object-fit: contain;
+  background: #0a0c10;
+}
+.media-video {
+  display: block;
+  max-width: 100%;
+  max-height: 160px;
+  border-radius: 6px;
+  background: #000;
+}
+.media-audio {
+  display: block;
+  width: 100%;
+  margin: 0.15rem 0 0;
+}
+.media-file-row {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  flex-wrap: wrap;
+  font-size: 0.72rem;
+}
+.media-scroll {
+  max-height: 22rem;
+  overflow-y: auto;
+  margin-top: 0.35rem;
+  padding-right: 0.15rem;
+}
+.tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0;
+  border-bottom: 1px solid var(--cg-border);
+}
+.tabs button {
+  flex: 1;
+  min-width: 0;
+  padding: 0.6rem 0.5rem;
+  border: none;
+  background: transparent;
+  color: var(--cg-muted);
+  font-size: 0.8rem;
+  cursor: pointer;
+}
+.tabs button.active {
+  color: var(--cg-text);
+  box-shadow: inset 0 -2px 0 var(--cg-accent);
+}
+.panel-body {
+  padding: 1rem;
+  overflow-y: auto;
+  overflow-x: hidden;
+  flex: 1;
+  min-height: 0;
+  -webkit-overflow-scrolling: touch;
+}
+.field { margin-bottom: 0.85rem; }
+.field label {
+  display: block;
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--cg-muted);
+  margin-bottom: 0.25rem;
+}
+input[type='text'], input[type='email'], input[type='password'], input[type='file'], select, textarea {
+  width: 100%;
+  padding: 0.45rem 0.55rem;
+  border-radius: 6px;
+  border: 1px solid var(--cg-border);
+  background: var(--cg-panel);
+  color: var(--cg-text);
+  font-size: 0.9rem;
+}
+textarea { min-height: 72px; resize: vertical; }
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.35rem;
+  padding: 0.45rem 0.75rem;
+  border-radius: 6px;
+  border: 1px solid var(--cg-border);
+  background: var(--cg-panel);
+  color: var(--cg-text);
+  font-size: 0.85rem;
+  cursor: pointer;
+}
+.btn:hover { border-color: #3d4554; }
+.btn-primary {
+  background: var(--cg-accent);
+  border-color: #2563eb;
+  color: #fff;
+}
+.btn-primary:hover { filter: brightness(1.05); }
+.btn-primary:disabled { opacity: 0.5; cursor: not-allowed; }
+.btn-small { padding: 0.25rem 0.45rem; font-size: 0.75rem; }
+.slide-list { list-style: none; margin: 0; padding: 0; }
+.slide-list li {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  padding: 0.4rem 0;
+  border-bottom: 1px solid var(--cg-border);
+}
+.slide-list li.active {
+  background: rgba(59, 130, 246, 0.08);
+  margin: 0 -1rem;
+  padding-left: 1rem;
+  padding-right: 1rem;
+}
+.slide-list button.ghost {
+  border: none;
+  background: none;
+  color: var(--cg-text);
+  cursor: pointer;
+  text-align: left;
+  flex: 1;
+  font-size: 0.88rem;
+}
+.palette-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 0.4rem;
+}
+.palette-grid button {
+  height: 36px;
+  border-radius: 6px;
+  border: 2px solid transparent;
+  cursor: pointer;
+}
+.palette-grid button.sel { border-color: var(--cg-accent); }
+.add-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+  margin-top: 0.75rem;
+}
+.main {
+  grid-area: preview;
+  padding: 1rem;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 1rem;
+  overflow: auto;
+  min-width: 0;
+  background: var(--cg-shell);
+}
+.pager {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  font-size: 0.9rem;
+  color: var(--cg-muted);
+}
+.preview-frame {
+  width: min(100%, 420px);
+  aspect-ratio: 1080 / 1350;
+  border-radius: 12px;
+  overflow: hidden;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.45);
+  border: 1px solid var(--cg-border);
+  position: relative;
+}
+.preview-inner {
+  width: 100%;
+  height: 100%;
+  padding: 8%;
+  display: flex;
+  flex-direction: column;
+}
+.preview-brand {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-bottom: 1rem;
+  font-size: 0.75rem;
+  opacity: 0.85;
+}
+.preview-brand .avatar {
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  background: rgba(0, 0, 0, 0.15);
+  object-fit: cover;
+}
+.preview-elements {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  justify-content: center;
+}
+.preview-text-editable {
+  cursor: text;
+  outline: none;
+  border-radius: 4px;
+  min-height: 1.15em;
+  word-wrap: break-word;
+  transition: box-shadow 0.12s ease;
+}
+.preview-text-editable:focus {
+  box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.45);
+}
+.preview-placeholder {
+  padding: 1rem;
+  border: 1px dashed rgba(0, 0, 0, 0.2);
+  border-radius: 8px;
+  font-size: 0.8rem;
+  opacity: 0.7;
+}
+.page-num {
+  position: absolute;
+  bottom: 6%;
+  right: 8%;
+  font-size: 0.75rem;
+  opacity: 0.6;
+}
+.carousel-scrubber-bar {
+  grid-area: scrub;
+  border-top: 1px solid var(--cg-border);
+  background: #12151a;
+  flex-shrink: 0;
+}
+.carousel-scrubber-inner {
+  width: 100%;
+  max-width: none;
+  box-sizing: border-box;
+  padding: 0.55rem 1rem 0.65rem;
+}
+@media (min-width: 1181px) {
+  .carousel-scrubber-inner {
+    padding-left: 1.25rem;
+    padding-right: 1.25rem;
+  }
+}
+.carousel-scrubber-wrap {
+  width: 100%;
+  margin: 0;
+  flex-shrink: 0;
+}
+.carousel-scrubber-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: center;
+  gap: 0.5rem 0.75rem;
+  margin-bottom: 0.45rem;
+  font-size: 0.78rem;
+  color: var(--cg-muted);
+}
+.carousel-scrubber-time {
+  font-variant-numeric: tabular-nums;
+  color: var(--cg-text, #e8eaed);
+  font-weight: 500;
+  min-width: 7.5rem;
+  text-align: center;
+}
+.carousel-scrubber-track-wrap {
+  position: relative;
+  width: 100%;
+  padding: 0.35rem 0 0.15rem;
+}
+.carousel-scrubber-ticks {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 50%;
+  height: 0;
+  pointer-events: none;
+  transform: translateY(-50%);
+}
+.carousel-scrub-tick {
+  position: absolute;
+  width: 1px;
+  height: 10px;
+  margin-top: -5px;
+  background: rgba(139, 146, 158, 0.55);
+  transform: translateX(-50%);
+}
+.carousel-scrubber-range {
+  width: 100%;
+  height: 8px;
+  margin: 0;
+  cursor: pointer;
+  accent-color: var(--cg-accent, #3b82f6);
+  -webkit-appearance: none;
+  appearance: none;
+  background: transparent;
+}
+.carousel-scrubber-range::-webkit-slider-runnable-track {
+  height: 6px;
+  border-radius: 3px;
+  background: linear-gradient(
+    90deg,
+    var(--cg-accent, #3b82f6) 0%,
+    var(--cg-accent, #3b82f6) var(--carousel-fill-pct, 0%),
+    rgba(255, 255, 255, 0.12) var(--carousel-fill-pct, 0%),
+    rgba(255, 255, 255, 0.12) 100%
+  );
+}
+.carousel-scrubber-range::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 14px;
+  height: 14px;
+  margin-top: -4px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.45);
+  border: 1px solid var(--cg-border);
+}
+.carousel-scrubber-range::-moz-range-track {
+  height: 6px;
+  border-radius: 3px;
+  background: rgba(255, 255, 255, 0.12);
+}
+.carousel-scrubber-range::-moz-range-progress {
+  height: 6px;
+  border-radius: 3px;
+  background: var(--cg-accent, #3b82f6);
+}
+.carousel-scrubber-range::-moz-range-thumb {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: #fff;
+  border: 1px solid var(--cg-border);
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.45);
+}
+.carousel-scrubber-hint {
+  width: 100%;
+  text-align: center;
+  font-size: 0.68rem;
+  color: var(--cg-muted);
+  margin: 0.35rem 0 0;
+  line-height: 1.35;
+}
+.carousel-still-music {
+  width: 100%;
+}
+.carousel-still-music-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem 0.75rem;
+  justify-content: center;
+}
+.carousel-still-label {
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--cg-muted);
+  margin: 0;
+  flex: 0 0 auto;
+}
+.carousel-still-input {
+  flex: 1 1 220px;
+  min-width: 0;
+  max-width: 36rem;
+  padding: 0.45rem 0.55rem;
+  border-radius: 6px;
+  border: 1px solid var(--cg-border);
+  background: var(--cg-panel);
+  color: var(--cg-text);
+  font: inherit;
+}
+.err { color: #f87171; font-size: 0.85rem; margin-top: 0.35rem; }
+.hint { font-size: 0.8rem; color: var(--cg-muted); margin-top: 0.25rem; }
+.pipeline-snippet {
+  margin-top: 0.75rem;
+  padding: 0.65rem;
+  border-radius: 6px;
+  border: 1px solid var(--cg-border);
+  background: #0d0f14;
+  color: #c9d1d9;
+  font-size: 0.7rem;
+  line-height: 1.45;
+  overflow-x: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.pipeline-snippet code { font-family: ui-monospace, monospace; }
+.ai-section-divider {
+  margin: 1rem 0;
+  border: none;
+  border-top: 1px solid var(--cg-border);
+}
+.ai-subhead {
+  margin: 0 0 0.5rem;
+  font-size: 0.8rem;
+  font-weight: 600;
+  color: var(--cg-text);
+}
+.img-gen-preview {
+  margin-top: 0.65rem;
+  border-radius: 8px;
+  border: 1px solid var(--cg-border);
+  max-width: 100%;
+  height: auto;
+  display: block;
+  cursor: grab;
+}
+.img-gen-preview:active {
+  cursor: grabbing;
+}
+.preview-frame.preview-drop-active {
+  box-shadow: 0 0 0 3px var(--cg-accent), 0 12px 40px rgba(0, 0, 0, 0.45);
+}
+/* Let drops hit the frame (not contenteditable / nested nodes) while dragging in from AI */
+.preview-frame.preview-drop-active .preview-inner,
+.preview-frame.preview-drop-active .preview-inner * {
+  pointer-events: none;
+}
+.slide-template-drop {
+  border-radius: 8px;
+  transition: box-shadow 0.15s ease, background 0.15s ease;
+}
+.slide-template-drop.slide-template-drop--over {
+  box-shadow: 0 0 0 2px var(--cg-accent);
+  background: rgba(59, 130, 246, 0.08);
+}
+.slide-templates-visual {
+  margin: 0 0 0.75rem;
+}
+.slide-template-thumb-row {
+  display: flex;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+  align-items: flex-start;
+}
+.slide-template-thumb-cell {
+  flex: 1 1 calc(50% - 0.35rem);
+  min-width: 112px;
+  max-width: 100%;
+}
+.slide-template-thumb-label {
+  font-size: 0.65rem;
+  font-weight: 600;
+  color: var(--cg-muted);
+  margin: 0 0 0.25rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.slide-template-thumb {
+  border-radius: 8px;
+  border: 1px solid var(--cg-border);
+  overflow: hidden;
+  aspect-ratio: 4 / 5;
+  max-height: 200px;
+  display: flex;
+  flex-direction: column;
+  pointer-events: none;
+  user-select: none;
+}
+.slide-template-thumb-inner {
+  padding: 0.35rem 0.45rem 0.45rem;
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.slide-template-thumb .preview-brand {
+  display: flex;
+  align-items: center;
+  gap: 0.25rem;
+  margin-bottom: 0.2rem;
+  font-size: 0.45rem;
+  line-height: 1.15;
+}
+.slide-template-thumb .avatar {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  object-fit: cover;
+  flex-shrink: 0;
+  background: rgba(128, 128, 128, 0.25);
+}
+.slide-template-thumb .preview-elements {
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  gap: 0.12rem;
+}
+.slide-template-thumb .thumb-text-readonly {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  word-break: break-word;
+}
+.slide-template-thumb .preview-content-img-outer {
+  max-height: 42px;
+  min-height: 0;
+  margin: 0.1rem 0 0;
+}
+.slide-template-thumb .preview-content-img {
+  max-height: 38px;
+}
+.slide-template-thumb-empty {
+  border: 1px dashed var(--cg-border);
+  border-radius: 8px;
+  aspect-ratio: 4 / 5;
+  max-height: 200px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  padding: 0.5rem;
+  font-size: 0.65rem;
+  color: var(--cg-muted);
+  line-height: 1.3;
+}
+.preview-content-img-outer {
+  overflow: hidden;
+  border-radius: 8px;
+  width: 100%;
+  min-height: 56px;
+  max-height: 42%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin: 0.15rem 0;
+}
+.preview-content-img-inner {
+  touch-action: none;
+  cursor: grab;
+}
+.preview-content-img-inner:active {
+  cursor: grabbing;
+}
+.preview-content-img {
+  max-width: 100%;
+  max-height: 140px;
+  width: auto;
+  height: auto;
+  object-fit: cover;
+  display: block;
+  user-select: none;
+  -webkit-user-drag: none;
+}
+.preview-content-img-block {
+  width: 100%;
+}
+.preview-content-img-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  flex-wrap: wrap;
+  margin-top: 0.4rem;
+  padding: 0.35rem 0.4rem;
+  border-radius: 6px;
+  background: rgba(0, 0, 0, 0.2);
+  border: 1px solid var(--cg-border);
+  pointer-events: auto;
+}
+.preview-frame.preview-drop-active .preview-inner .preview-content-img-toolbar {
+  pointer-events: auto;
+}
+.preview-content-img-size-label {
+  font-size: 0.65rem;
+  font-weight: 600;
+  color: var(--cg-muted);
+  white-space: nowrap;
+}
+.preview-content-img-range {
+  flex: 1 1 100px;
+  min-width: 72px;
+  accent-color: var(--cg-accent, #3b82f6);
+}
+.preview-content-img-size-val {
+  font-size: 0.65rem;
+  font-variant-numeric: tabular-nums;
+  min-width: 2.5rem;
+  color: var(--cg-text);
+}
+.preview-content-img-quick {
+  display: flex;
+  gap: 0.25rem;
+}
+.content-img-transform-fields {
+  margin-top: 0.45rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  font-size: 0.72rem;
+  color: var(--cg-muted);
+}
+.content-img-transform-fields label {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+}
+.content-img-transform-fields input[type="range"] {
+  width: 100%;
+}
+[x-cloak] { display: none !important; }
     </style>
 </head>
 <body>
-    <div class="wrap">
-        <div class="card" x-data="ffHealth()" x-init="checkHealth()">
-            <h1><?php echo $siteName; ?></h1>
-            <p class="pill"><?php echo $appVersion; ?></p>
-            <p>
-                <span x-show="loading">…</span>
-                <span x-show="!loading && healthOk" class="ok" x-text="healthMsg"></span>
-                <span x-show="!loading && !healthOk" class="bad" x-text="healthMsg"></span>
-            </p>
-            <div class="row">
-                <a href="<?php echo $pbAdmin; ?>" target="_blank" rel="noopener">Admin</a>
-                <button type="button" @click="checkHealth()">Retry</button>
+    <header class="app-header">
+        <div class="app-header-left">
+            <h1><?php echo $htmlSiteName; ?></h1>
+            <span class="hint" style="margin:0;">Edit slides in the left column · sources &amp; account on the right<?php if ($htmlAppVersion !== ''): ?> · <?php echo $htmlAppVersion; ?><?php endif; ?></span>
+        </div>
+    </header>
+    <?php if ($flashLoginErr): ?><div class="flash-banner bad">Sign-in failed.</div><?php endif; ?>
+    <?php if ($flashIgOk): ?><div class="flash-banner ok">Instagram account linked.</div><?php endif; ?>
+    <?php if ($flashIgErr): ?><div class="flash-banner bad">Instagram connection failed.</div><?php endif; ?>
+
+    <div class="layout" x-data="carouselApp()">
+        <aside class="panel">
+            <div class="tabs">
+                <button type="button" :class="{ active: tab === 'slides' }" @click="tab = 'slides'">Slides</button>
+                <button type="button" :class="{ active: tab === 'settings' }" @click="tab = 'settings'">Settings</button>
+                <button type="button" :class="{ active: tab === 'ai' }" @click="tab = 'ai'">AI</button>
+                <button type="button" :class="{ active: tab === 'data' }" @click="tab = 'data'">Data</button>
+                <button type="button" :class="{ active: tab === 'video' }" @click="tab = 'video'">Video</button>
             </div>
-        </div>
 
-        <div class="card">
-            <h2>Account</h2>
-            <?php if ($flashLoginErr): ?>
-                <p class="flash bad">Failed</p>
-            <?php endif; ?>
-            <?php if ($user): ?>
-                <div class="account-bar">
-                    <p style="color:#c9d1d9;margin:0;flex:1;min-width:0;"><strong><?php echo $userEmail !== '' ? $userEmail : 'user'; ?></strong></p>
-                    <form method="post" action="/" style="margin:0;">
-                        <input type="hidden" name="action" value="logout">
-                        <button type="submit" class="btn">Log out</button>
-                    </form>
+            <div class="panel-body" x-show="tab === 'slides'" x-cloak>
+                <div class="field" x-show="igAccounts.length" style="margin-bottom:0.65rem;">
+                    <label>Instagram scope (templates &amp; Garage)</label>
+                    <select x-model="garageIgId" @change="onGarageIgScopeChange()" style="width:100%;">
+                        <template x-for="a in igAccounts" :key="a.id">
+                            <option :value="a.id" x-text="'@' + (a.username || a.instagram_user_id || a.id)"></option>
+                        </template>
+                    </select>
+                    <p class="hint" style="margin:0.35rem 0 0;">Intro/outro templates are saved <strong>per account</strong>. Drag an image from <strong>Media</strong> (right) onto the Intro or Outro boxes below. Thumbnails use your current <strong>Settings</strong> theme.</p>
                 </div>
-            <?php else: ?>
-                <form method="post" action="/">
-                    <input type="hidden" name="action" value="login">
-                    <label for="email">Email</label>
-                    <input id="email" name="email" type="email" autocomplete="username" required>
-                    <label for="password">Password</label>
-                    <input id="password" name="password" type="password" autocomplete="current-password" required>
-                    <button type="submit" class="btn btn-primary" style="width:100%;margin-top:.25rem;">Log in</button>
-                </form>
-            <?php endif; ?>
-        </div>
+                <p class="hint" x-show="!igAccounts.length" style="margin-bottom:0.65rem;">Link Instagram in <strong>Socials</strong> to scope intro/outro templates per account.</p>
 
-        <div class="card">
-            <h2>Instagram</h2>
-            <?php if ($flashIgOk): ?>
-                <p class="flash ok">Connected</p>
-            <?php endif; ?>
-            <?php if ($flashIgErr): ?>
-                <p class="flash bad">Failed</p>
-            <?php endif; ?>
-            <?php if (!$fbConfigured): ?>
-                <p class="bad" style="font-size:.85rem;">Not configured</p>
-            <?php endif; ?>
-            <?php if (!$user): ?>
-                <p>Sign in</p>
-            <?php else: ?>
-                <div>
-                    <div class="ig-head">
-                        <span>Accounts</span>
-                        <?php if ($fbConfigured): ?>
-                            <a class="btn btn-primary" href="/?instagram_oauth=1"><?php echo count($igAccountsList) > 0 ? 'Add' : 'Connect'; ?></a>
-                        <?php else: ?>
-                            <button type="button" class="btn" disabled>Connect</button>
-                        <?php endif; ?>
-                    </div>
-                    <?php if ($igAccountsList !== []): ?>
-                        <ul class="ig">
-                            <?php foreach ($igAccountsList as $a): ?>
-                                <li>
-                                    @<?php echo htmlspecialchars((string) ($a['username'] ?: $a['instagram_user_id']), ENT_QUOTES | ENT_HTML5, 'UTF-8'); ?>
-                                    <span class="pill" style="margin-left:.5rem;"><?php echo !empty($a['is_active']) ? 'on' : 'off'; ?></span>
-                                </li>
-                            <?php endforeach; ?>
-                        </ul>
-                    <?php endif; ?>
-                </div>
-            <?php endif; ?>
-        </div>
-
-        <div class="card">
-            <h2>Fetch</h2>
-            <div class="fetch-flow-intro">
-                <strong style="color:#c9d1d9;">What happens per file (in order)</strong>
-                <ol>
-                    <li><strong>Download</strong> — <code>gallery-dl</code> or <code>yt-dlp</code> saves a file on this server.</li>
-                    <li><strong>PocketBase upload</strong> — one <code><?php echo htmlspecialchars($fetchImCol, ENT_QUOTES | ENT_HTML5, 'UTF-8'); ?></code> row per file (<code>fetched_files</code>).</li>
-                    <li><strong>Image embedding (Gemini)</strong> — if <code>GEMINI_API_KEY</code> is set, the raster is sent to <code><?php echo $fetchGeminiModelUi; ?></code>; the vector is written to <code>input_media.embedding</code> and model name to <code>embedding_model</code>.<?php if (!$fetchGeminiConfigured): ?> <em>Currently off (no API key).</em><?php endif; ?></li>
-                    <li><strong>Vision prompt (OpenRouter)</strong> — if <code>OPENROUTER_API_KEY</code> is set, the same file is described; text goes to <code>metadata.image_recreation_prompt</code>.<?php if (!$fetchOpenRouterConfigured): ?> <em>Currently off.</em><?php endif; ?></li>
-                    <li><strong>Prompt embedding + prompts row</strong> — after a successful vision prompt, if <code>GEMINI_API_KEY</code> is set, the prompt text is embedded and a <code><?php echo htmlspecialchars($fetchPrCol, ENT_QUOTES | ENT_HTML5, 'UTF-8'); ?></code> record is created (<code>prompt_text</code>, <code>prompt_embedding</code>, <code>prompt_original_media</code>); <code>metadata.prompts_record_id</code> is set on the input row.</li>
-                </ol>
-                <p style="margin:.5rem 0 0;">PocketBase admin: <a href="<?php echo htmlspecialchars($pbAdmin, ENT_QUOTES | ENT_HTML5, 'UTF-8'); ?>" target="_blank" rel="noopener">open dashboard</a><?php if ($pbPublicRaw !== ''): ?> · public API base <code style="color:#8b949e;"><?php echo htmlspecialchars($pbPublicRaw, ENT_QUOTES | ENT_HTML5, 'UTF-8'); ?></code><?php endif; ?></p>
-            </div>
-            <?php if ($flashFetchOk): ?>
-                <p class="flash ok"><?php
-                    if (is_array($fetchFlash) && !empty($fetchFlash['ok'])) {
-                        echo 'Saved ' . (int) ($fetchFlash['n'] ?? 0) . ' file(s)';
-                        if (!empty($fetchFlash['via'])) {
-                            echo ' via ' . htmlspecialchars((string) $fetchFlash['via'], ENT_QUOTES | ENT_HTML5, 'UTF-8');
-                        }
-                        echo '.';
-                    } else {
-                        echo 'Saved.';
-                    }
-                ?></p>
-                <?php if ($fetchRecordRows !== []): ?>
-                    <p style="font-size:.8125rem;margin:.25rem 0 0;">Saved rows (thumbnail, pipeline, embeddings, links):</p>
-                    <ul class="fetch-files">
-                        <?php
-                        $fetchPipelineDetailsOpen = count($fetchRecordRows) === 1 ? ' open' : '';
-                        foreach ($fetchRecordRows as $row):
-                            $rid = (string) ($row['id'] ?? '');
-                            $pfn = (string) ($row['file'] ?? '');
-                            $lbl = (string) ($row['label'] ?? $pfn);
-                            if ($rid === '' || $pfn === '') {
-                                continue;
-                            }
-                            $fileHref = '/?ff_pb_file=1&amp;c=' . rawurlencode($fetchImCol) . '&amp;id=' . rawurlencode($rid) . '&amp;n=' . rawurlencode($pfn);
-                            $isRaster = !empty($row['is_raster']);
-                            $mimeR = (string) ($row['mime'] ?? '');
-                            $pipeline = is_array($row['pipeline'] ?? null) ? $row['pipeline'] : [];
-                            $inPrev = (string) ($row['input_embedding_preview'] ?? '');
-                            $inDims = (int) ($row['input_embedding_dims'] ?? 0);
-                            $inStored = !empty($row['input_embedding_stored']);
-                            $inErr = (string) ($row['input_embedding_error'] ?? '');
-                            $prid = (string) ($row['prompt_record_id'] ?? '');
-                            $pprev = (string) ($row['prompt_embedding_preview'] ?? '');
-                            $pdims = (int) ($row['prompt_embedding_dims'] ?? 0);
-                            $pStored = !empty($row['prompt_embedding_stored']);
-                            $embMod = (string) ($row['embed_model'] ?? '');
-                            $apiInput = $pbPublicRaw !== '' ? ($pbPublicRaw . '/api/collections/' . rawurlencode($fetchImCol) . '/records/' . rawurlencode($rid)) : '';
-                            $apiPrompt = ($pbPublicRaw !== '' && $prid !== '') ? ($pbPublicRaw . '/api/collections/' . rawurlencode($fetchPrCol) . '/records/' . rawurlencode($prid)) : '';
-                            $ip = (string) ($row['image_prompt'] ?? '');
-                            $ipe = (string) ($row['image_prompt_error'] ?? '');
-                            ?>
-                            <li class="fetch-row-li">
-                                <div class="fetch-row-head">
-                                    <?php if ($isRaster && str_starts_with($mimeR, 'image/')): ?>
-                                        <img class="fetch-thumb" src="<?php echo htmlspecialchars($fileHref, ENT_QUOTES | ENT_HTML5, 'UTF-8'); ?>" alt="" width="120" height="120" loading="lazy" decoding="async">
-                                    <?php endif; ?>
-                                    <div class="fetch-row-main">
-                                        <a href="<?php echo htmlspecialchars($fileHref, ENT_QUOTES | ENT_HTML5, 'UTF-8'); ?>"><strong><?php echo htmlspecialchars($lbl, ENT_QUOTES | ENT_HTML5, 'UTF-8'); ?></strong></a>
-                                        <span style="font-size:.72rem;color:#6e7681;margin-left:.35rem;">(<?php echo htmlspecialchars($pfn, ENT_QUOTES | ENT_HTML5, 'UTF-8'); ?>)</span>
-                                        <div class="fetch-links">
-                                            <span><strong>input_media</strong> id <code style="color:#79c0ff;"><?php echo htmlspecialchars($rid, ENT_QUOTES | ENT_HTML5, 'UTF-8'); ?></code></span>
-                                            <?php if ($prid !== ''): ?>
-                                                · <strong>prompts</strong> id <code style="color:#79c0ff;"><?php echo htmlspecialchars($prid, ENT_QUOTES | ENT_HTML5, 'UTF-8'); ?></code>
-                                            <?php endif; ?>
-                                            <br>
-                                            <a href="<?php echo htmlspecialchars($pbAdmin, ENT_QUOTES | ENT_HTML5, 'UTF-8'); ?>" target="_blank" rel="noopener">PocketBase admin</a>
-                                            <?php if ($apiInput !== ''): ?>
-                                                <span class="fetch-api-line">GET <span style="color:#8b949e;"><?php echo htmlspecialchars($apiInput, ENT_QUOTES | ENT_HTML5, 'UTF-8'); ?></span> <span style="color:#6e7681;">(with auth)</span></span>
-                                            <?php endif; ?>
-                                            <?php if ($apiPrompt !== ''): ?>
-                                                <span class="fetch-api-line">GET <span style="color:#8b949e;"><?php echo htmlspecialchars($apiPrompt, ENT_QUOTES | ENT_HTML5, 'UTF-8'); ?></span></span>
-                                            <?php endif; ?>
-                                            <span class="fetch-api-line">Proxy file URL (this app, your session): <span style="color:#8b949e;"><?php echo htmlspecialchars($fileHref, ENT_QUOTES | ENT_HTML5, 'UTF-8'); ?></span></span>
+                <div class="slide-templates-visual" x-show="garageIgId && igAccounts.length" x-cloak>
+                    <p class="hint" style="margin:0 0 0.45rem;">Templates for <strong x-text="igAccountScopeLabel()"></strong> — drag an image from <strong>Media</strong> here.</p>
+                    <div class="slide-template-thumb-row">
+                        <div class="slide-template-thumb-cell slide-template-drop"
+                            :class="{ 'slide-template-drop--over': draggingOverTpl === 'intro' }"
+                            @dragenter.prevent="draggingOverTpl = 'intro'"
+                            @dragover.prevent="$event.dataTransfer.dropEffect = 'copy'"
+                            @drop.prevent="draggingOverTpl = ''; onTemplateImageDrop($event, 'intro')">
+                            <div class="slide-template-thumb-label">Intro</div>
+                            <template x-if="slideTemplates.intro">
+                                <div class="slide-template-thumb" :style="previewStyle()">
+                                    <div class="slide-template-thumb-inner">
+                                        <div class="preview-brand" :style="{ color: doc.config.theme.primary }">
+                                            <template x-if="doc.config.brand.avatar.source.src">
+                                                <img class="avatar" :src="doc.config.brand.avatar.source.src" alt="">
+                                            </template>
+                                            <template x-if="!doc.config.brand.avatar.source.src">
+                                                <div class="avatar"></div>
+                                            </template>
+                                            <div>
+                                                <div x-text="doc.config.brand.name" style="font-weight:600;"></div>
+                                                <div x-text="doc.config.brand.handle" style="opacity:0.75;font-size:0.85em;"></div>
+                                            </div>
+                                        </div>
+                                        <div class="preview-elements" :style="{ color: doc.config.theme.primary }">
+                                            <template x-for="(el, ei) in (slideTemplates.intro.elements || [])" :key="'intro-tpl-' + ei">
+                                                <div>
+                                                    <template x-if="el.type === 'Title' || el.type === 'Subtitle' || el.type === 'Description'">
+                                                        <div class="thumb-text-readonly" :style="elementStyleThumb(el)" x-text="el.text"></div>
+                                                    </template>
+                                                    <template x-if="(el.type === 'ContentImage' || el.type === 'Image') && el.source && el.source.src">
+                                                        <div class="preview-content-img-outer" x-init="ensureContentImageStyle(el)">
+                                                            <div class="preview-content-img-inner" :style="contentImageTransformStyle(el)">
+                                                                <img class="preview-content-img" :src="el.source.src" alt="" draggable="false">
+                                                            </div>
+                                                        </div>
+                                                    </template>
+                                                    <template x-if="(el.type === 'ContentImage' || el.type === 'Image') && (!el.source || !el.source.src)">
+                                                        <div class="preview-placeholder" style="font-size:0.45rem;padding:0.2rem;">No image</div>
+                                                    </template>
+                                                </div>
+                                            </template>
                                         </div>
                                     </div>
                                 </div>
-                                <?php if ($pipeline !== []): ?>
-                                    <details class="fetch-pipeline-wrap"<?php echo $fetchPipelineDetailsOpen; ?>>
-                                        <summary>Step-by-step pipeline &amp; status</summary>
-                                        <ol class="fetch-pipeline-ol">
-                                            <?php foreach ($pipeline as $step): ?>
-                                                <?php
-                                                $st = (string) ($step['state'] ?? 'skip');
-                                                $liClass = 'fetch-step-li fetch-step-skip';
-                                                if ($st === 'ok') {
-                                                    $liClass = 'fetch-step-li fetch-step-ok';
-                                                } elseif ($st === 'warn') {
-                                                    $liClass = 'fetch-step-li fetch-step-warn';
-                                                } elseif ($st === 'err') {
-                                                    $liClass = 'fetch-step-li fetch-step-err';
-                                                }
-                                                ?>
-                                                <li class="<?php echo htmlspecialchars($liClass, ENT_QUOTES | ENT_HTML5, 'UTF-8'); ?>">
-                                                    <div class="fetch-step-head">
-                                                        <span class="fetch-step-title"><?php echo htmlspecialchars((string) ($step['title'] ?? ''), ENT_QUOTES | ENT_HTML5, 'UTF-8'); ?></span>
-                                                        <span class="fetch-step-badge"><?php echo htmlspecialchars($st, ENT_QUOTES | ENT_HTML5, 'UTF-8'); ?></span>
-                                                    </div>
-                                                    <div class="fetch-step-detail"><?php echo nl2br(htmlspecialchars((string) ($step['detail'] ?? ''), ENT_QUOTES | ENT_HTML5, 'UTF-8')); ?></div>
-                                                </li>
-                                            <?php endforeach; ?>
-                                        </ol>
-                                        <?php if ($inPrev !== '' || $inDims > 0 || $inErr !== ''): ?>
-                                            <div class="fetch-emb-block">
-                                                <p class="fetch-emb-label">input_media.embedding<?php if ($embMod !== ''): ?> <span style="font-weight:400;color:#6e7681;">(<?php echo htmlspecialchars($embMod, ENT_QUOTES | ENT_HTML5, 'UTF-8'); ?>)</span><?php endif; ?></p>
-                                                <?php if ($inErr !== ''): ?>
-                                                    <p class="fetch-prompt-err" style="margin:0 0 .35rem;"><?php echo htmlspecialchars($inErr, ENT_QUOTES | ENT_HTML5, 'UTF-8'); ?></p>
-                                                <?php endif; ?>
-                                                <?php if ($inPrev !== ''): ?>
-                                                    <pre class="fetch-emb-mono"><?php echo htmlspecialchars($inPrev, ENT_QUOTES | ENT_HTML5, 'UTF-8'); ?></pre>
-                                                    <p style="margin:.35rem 0 0;font-size:.65rem;color:#6e7681;">Stored on row: <?php echo $inStored ? 'yes' : 'no'; ?><?php if ($inDims > 0): ?> · <?php echo (int) $inDims; ?> dimensions<?php endif; ?></p>
-                                                <?php elseif ($inDims === 0 && $inErr === ''): ?>
-                                                    <p style="margin:0;font-size:.7rem;color:#6e7681;">No preview (step skipped).</p>
-                                                <?php endif; ?>
+                            </template>
+                            <template x-if="!slideTemplates.intro">
+                                <div class="slide-template-thumb-empty">Drop an image from Media (right)</div>
+                            </template>
+                        </div>
+                        <div class="slide-template-thumb-cell slide-template-drop"
+                            :class="{ 'slide-template-drop--over': draggingOverTpl === 'outro' }"
+                            @dragenter.prevent="draggingOverTpl = 'outro'"
+                            @dragover.prevent="$event.dataTransfer.dropEffect = 'copy'"
+                            @drop.prevent="draggingOverTpl = ''; onTemplateImageDrop($event, 'outro')">
+                            <div class="slide-template-thumb-label">Outro</div>
+                            <template x-if="slideTemplates.outro">
+                                <div class="slide-template-thumb" :style="previewStyle()">
+                                    <div class="slide-template-thumb-inner">
+                                        <div class="preview-brand" :style="{ color: doc.config.theme.primary }">
+                                            <template x-if="doc.config.brand.avatar.source.src">
+                                                <img class="avatar" :src="doc.config.brand.avatar.source.src" alt="">
+                                            </template>
+                                            <template x-if="!doc.config.brand.avatar.source.src">
+                                                <div class="avatar"></div>
+                                            </template>
+                                            <div>
+                                                <div x-text="doc.config.brand.name" style="font-weight:600;"></div>
+                                                <div x-text="doc.config.brand.handle" style="opacity:0.75;font-size:0.85em;"></div>
                                             </div>
-                                        <?php endif; ?>
-                                        <?php if ($pprev !== '' || $pdims > 0 || $prid !== ''): ?>
-                                            <div class="fetch-emb-block">
-                                                <p class="fetch-emb-label">prompts.prompt_embedding</p>
-                                                <?php if ($pprev !== ''): ?>
-                                                    <pre class="fetch-emb-mono"><?php echo htmlspecialchars($pprev, ENT_QUOTES | ENT_HTML5, 'UTF-8'); ?></pre>
-                                                <?php endif; ?>
-                                                <p style="margin:.35rem 0 0;font-size:.65rem;color:#6e7681;">Record: <?php echo $prid !== '' ? htmlspecialchars($prid, ENT_QUOTES | ENT_HTML5, 'UTF-8') : '—'; ?> · vector on row: <?php echo $pStored ? 'yes' : 'no'; ?><?php if ($pdims > 0): ?> · <?php echo (int) $pdims; ?> dimensions<?php endif; ?></p>
-                                            </div>
-                                        <?php endif; ?>
-                                    </details>
-                                <?php endif; ?>
-                                <?php if ($ip !== '' || $ipe !== ''): ?>
-                                    <details class="fetch-prompt-wrap"<?php echo $fetchPipelineDetailsOpen; ?>>
-                                        <summary>Vision output (OpenRouter) — full prompt text</summary>
-                                        <p class="fetch-prompt-instruction"><strong>Instruction sent:</strong> <?php echo htmlspecialchars(FF_OPENROUTER_IMAGE_RECREATION_INSTRUCTION, ENT_QUOTES | ENT_HTML5, 'UTF-8'); ?></p>
-                                        <?php if ($ipe !== ''): ?>
-                                            <p class="fetch-prompt-err"><?php echo htmlspecialchars($ipe, ENT_QUOTES | ENT_HTML5, 'UTF-8'); ?></p>
-                                        <?php endif; ?>
-                                        <?php if ($ip !== ''): ?>
-                                            <pre class="fetch-prompt"><?php echo htmlspecialchars($ip, ENT_QUOTES | ENT_HTML5, 'UTF-8'); ?></pre>
-                                        <?php endif; ?>
-                                    </details>
-                                <?php endif; ?>
-                            </li>
-                        <?php endforeach; ?>
-                    </ul>
-                <?php elseif ($fetchPbFiles !== [] && $fetchFlashRecord !== ''): ?>
-                    <p style="font-size:.8125rem;margin:.25rem 0 0;">Download (from PocketBase):</p>
-                    <ul class="fetch-files">
-                        <?php foreach ($fetchPbFiles as $pfn): ?>
-                            <li>
-                                <a href="/?ff_pb_file=1&amp;c=<?php echo rawurlencode((string) ($CONFIG['input_media_collection'] ?? 'input_media')); ?>&amp;id=<?php echo rawurlencode($fetchFlashRecord); ?>&amp;n=<?php echo rawurlencode((string) $pfn); ?>"><?php echo htmlspecialchars((string) $pfn, ENT_QUOTES | ENT_HTML5, 'UTF-8'); ?></a>
-                            </li>
-                        <?php endforeach; ?>
-                    </ul>
-                <?php endif; ?>
-            <?php endif; ?>
-            <?php if ($flashFetchErr): ?>
-                <p class="flash bad">Failed</p>
-                <?php if (is_array($fetchFlash) && empty($fetchFlash['ok']) && !empty($fetchFlash['error'])): ?>
-                    <pre class="fetch-err"><?php echo htmlspecialchars((string) $fetchFlash['error'], ENT_QUOTES | ENT_HTML5, 'UTF-8'); ?></pre>
-                <?php endif; ?>
-            <?php endif; ?>
-            <?php if (!$user): ?>
-                <p>Sign in</p>
-            <?php else: ?>
-                <form method="post" action="/">
-                    <input type="hidden" name="action" value="fetch_media">
-                    <label for="fetch_url">URL</label>
-                    <input id="fetch_url" name="url" type="text" inputmode="url" required autocomplete="off" placeholder="https://…">
-                    <label for="fetch_tool">Tool</label>
-                    <select class="fetch-tool" id="fetch_tool" name="tool">
-                        <option value="auto" selected>Auto</option>
-                        <option value="gallery-dl">gallery-dl</option>
-                        <option value="yt-dlp">yt-dlp</option>
-                    </select>
-                    <button type="submit" class="btn btn-primary" style="width:100%;">Fetch</button>
-                </form>
-            <?php endif; ?>
-        </div>
+                                        </div>
+                                        <div class="preview-elements" :style="{ color: doc.config.theme.primary }">
+                                            <template x-for="(el, ei) in (slideTemplates.outro.elements || [])" :key="'outro-tpl-' + ei">
+                                                <div>
+                                                    <template x-if="el.type === 'Title' || el.type === 'Subtitle' || el.type === 'Description'">
+                                                        <div class="thumb-text-readonly" :style="elementStyleThumb(el)" x-text="el.text"></div>
+                                                    </template>
+                                                    <template x-if="(el.type === 'ContentImage' || el.type === 'Image') && el.source && el.source.src">
+                                                        <div class="preview-content-img-outer" x-init="ensureContentImageStyle(el)">
+                                                            <div class="preview-content-img-inner" :style="contentImageTransformStyle(el)">
+                                                                <img class="preview-content-img" :src="el.source.src" alt="" draggable="false">
+                                                            </div>
+                                                        </div>
+                                                    </template>
+                                                    <template x-if="(el.type === 'ContentImage' || el.type === 'Image') && (!el.source || !el.source.src)">
+                                                        <div class="preview-placeholder" style="font-size:0.45rem;padding:0.2rem;">No image</div>
+                                                    </template>
+                                                </div>
+                                            </template>
+                                        </div>
+                                    </div>
+                                </div>
+                            </template>
+                            <template x-if="!slideTemplates.outro">
+                                <div class="slide-template-thumb-empty">Drop an image from Media (right)</div>
+                            </template>
+                        </div>
+                    </div>
+                    <p class="hint" x-show="templateMsg" x-text="templateMsg" style="margin:0.45rem 0 0;color:#86efac;"></p>
+                </div>
 
-        <?php if ($user): ?>
-        <div class="card" x-data="ffDebug()">
-            <h2>Debug console</h2>
-            <p style="font-size:.8125rem;color:#8b949e;">Server-side diagnostics (no secrets, no cookie file contents). Load, then copy and paste into support.</p>
-            <div class="row" style="margin-top:0;">
-                <button type="button" class="btn btn-primary" @click="load()" :disabled="loading">Load</button>
-                <button type="button" class="btn" @click="copy()" x-show="text">Copy</button>
+                <p class="hint">Select a slide, edit text, reorder or add.</p>
+                <ul class="slide-list">
+                    <template x-for="(s, i) in doc.slides" :key="i">
+                        <li :class="{ active: currentIndex === i }">
+                            <button type="button" class="ghost" @click="goToSlide(i)">
+                                <span x-text="'Slide ' + (i + 1)"></span><span class="slide-kind-badge"
+                                    x-text="s.mediaKind === 'video' ? ' · video' : ' · still'"></span>
+                            </button>
+                            <button type="button" class="btn btn-small" @click="moveSlide(i, -1)" title="Up">↑</button>
+                            <button type="button" class="btn btn-small" @click="moveSlide(i, 1)" title="Down">↓</button>
+                            <button type="button" class="btn btn-small" @click="removeSlide(i)" title="Remove">×</button>
+                        </li>
+                    </template>
+                </ul>
+                <div class="add-row">
+                    <button type="button" class="btn btn-small" @click="addSlide('intro')">+ Intro</button>
+                    <button type="button" class="btn btn-small" @click="addSlide('common')">+ Common</button>
+                    <button type="button" class="btn btn-small" @click="addSlide('content')">+ Content</button>
+                    <button type="button" class="btn btn-small" @click="addSlide('outro')">+ Outro</button>
+                </div>
+                <template x-if="slide">
+                    <div style="margin-top:1rem;">
+                        <div class="field">
+                            <label>Slide type</label>
+                            <select x-model="slide.mediaKind" @change="carouselStop()">
+                                <option value="still">Still (image hold + optional music)</option>
+                                <option value="video">Video segment (per-slide scrubber)</option>
+                            </select>
+                            <p class="hint" style="margin:0.35rem 0 0;">Stills use per-slide music; video slides use the bottom scrubber for <strong>this slide’s</strong> segment only.</p>
+                        </div>
+                        <div class="field" x-show="slide.mediaKind === 'still'">
+                            <label>Music for this slide</label>
+                            <input type="text" x-model="slide.musicPath" placeholder="./music/track.mp3 or https://…">
+                        </div>
+                        <div class="add-row" style="margin:0.35rem 0 0.5rem;align-items:center;">
+                            <button type="button" class="btn btn-small" @click="addContentImageElement()" title="Append empty content image block">+ Content image</button>
+                            <span class="hint" style="margin:0;">Adds an empty block — paste URL, or drop onto the center preview.</span>
+                        </div>
+                        <template x-for="(el, ei) in slide.elements" :key="ei">
+                            <div class="field">
+                                <template x-if="el.type === 'Title' || el.type === 'Subtitle' || el.type === 'Description'">
+                                    <label x-text="el.type"></label>
+                                </template>
+                                <template x-if="el.type === 'ContentImage' || el.type === 'Image'">
+                                    <div style="display:flex;align-items:center;justify-content:space-between;gap:0.5rem;flex-wrap:wrap;margin-bottom:0.25rem;">
+                                        <label x-text="el.type" style="margin:0;"></label>
+                                        <button type="button" class="btn btn-small" @click="removeContentImageElementAt(ei)" title="Remove this content image block">×</button>
+                                    </div>
+                                </template>
+                                <template x-if="el.type === 'Title' || el.type === 'Subtitle' || el.type === 'Description'">
+                                    <textarea x-model="el.text" rows="3"></textarea>
+                                </template>
+                                <template x-if="el.type === 'ContentImage' || el.type === 'Image'">
+                                    <div>
+                                        <div style="display:flex;gap:0.35rem;align-items:center;flex-wrap:wrap;">
+                                            <input type="text" style="flex:1;min-width:8rem;" x-model="el.source.src" placeholder="Image URL (optional)">
+                                            <button type="button" class="btn btn-small" x-show="el.source && el.source.src"
+                                                @click="clearContentImage(el)">Clear URL</button>
+                                        </div>
+                                        <template x-if="(el.type === 'ContentImage' || el.type === 'Image') && el.source && el.source.src">
+                                            <div class="content-img-transform-fields" x-init="ensureContentImageStyle(el)">
+                                                <label>Size (scale) <span x-text="Math.round(Number(el.style.imgScale) || 100) + '%'"></span>
+                                                    <input type="range" min="25" max="400" step="1"
+                                                        x-model.number="el.style.imgScale">
+                                                </label>
+                                                <label>Rotate <span x-text="(Number(el.style.imgRotateDeg) || 0) + '°'"></span>
+                                                    <input type="range" min="-180" max="180" step="1"
+                                                        x-model.number="el.style.imgRotateDeg">
+                                                </label>
+                                                <button type="button" class="btn btn-small" style="align-self:flex-start;margin-top:0.15rem;"
+                                                    @click="resetContentImageTransform(el)">Reset placement</button>
+                                            </div>
+                                        </template>
+                                    </div>
+                                </template>
+                            </div>
+                        </template>
+                    </div>
+                </template>
             </div>
-            <p x-show="loading" style="margin:.5rem 0 0;font-size:.8125rem;">Loading…</p>
-            <p x-show="err" class="bad" style="margin:.5rem 0 0;font-size:.8125rem;" x-text="err"></p>
-            <textarea class="debug-console" x-show="text" x-model="text" readonly rows="14" placeholder="Click Load…"></textarea>
+
+            <div class="panel-body" x-show="tab === 'settings'" x-cloak>
+                <div class="field">
+                    <label>File name</label>
+                    <input type="text" x-model="doc.filename">
+                </div>
+                <div class="field">
+                    <label>Brand name</label>
+                    <input type="text" x-model="doc.config.brand.name">
+                </div>
+                <div class="field">
+                    <label>Handle</label>
+                    <input type="text" x-model="doc.config.brand.handle">
+                </div>
+                <div class="field">
+                    <label>Avatar image URL</label>
+                    <input type="text" x-model="doc.config.brand.avatar.source.src" placeholder="https://…">
+                </div>
+                <div class="field">
+                    <label>Theme preset</label>
+                    <div class="palette-grid">
+                        <?php foreach ($paletteNames as $name): ?>
+                        <button type="button"
+                            :class="{ sel: doc.config.theme.pallette === '<?= htmlspecialchars($name, ENT_QUOTES) ?>' && !doc.config.theme.isCustom }"
+                            @click="setPalette('<?= htmlspecialchars($name, ENT_QUOTES) ?>')"
+                            title="<?= htmlspecialchars($name) ?>"
+                            style="background: <?= htmlspecialchars($paletteSwatches[$name] ?? '#333', ENT_QUOTES) ?>"></button>
+                        <?php endforeach; ?>
+                    </div>
+                    <button type="button" class="btn btn-small" style="margin-top:0.5rem;" @click="setCustomMode()">Custom colors</button>
+                </div>
+                <template x-if="doc.config.theme.isCustom">
+                    <div>
+                        <div class="field">
+                            <label>Primary (text)</label>
+                            <input type="text" x-model="doc.config.theme.primary">
+                        </div>
+                        <div class="field">
+                            <label>Secondary</label>
+                            <input type="text" x-model="doc.config.theme.secondary">
+                        </div>
+                        <div class="field">
+                            <label>Background</label>
+                            <input type="text" x-model="doc.config.theme.background">
+                        </div>
+                    </div>
+                </template>
+                <div class="field">
+                    <label>Title font</label>
+                    <select x-model="doc.config.fonts.font1">
+                        <?php foreach ($fontPairsTitle as [$fid, $flabel]): ?>
+                        <option value="<?= htmlspecialchars($fid, ENT_QUOTES) ?>"><?= htmlspecialchars($flabel) ?></option>
+                        <?php endforeach; ?>
+                    </select>
+                </div>
+                <div class="field">
+                    <label>Body font</label>
+                    <select x-model="doc.config.fonts.font2">
+                        <?php foreach ($fontPairsBody as [$fid, $flabel]): ?>
+                        <option value="<?= htmlspecialchars($fid, ENT_QUOTES) ?>"><?= htmlspecialchars($flabel) ?></option>
+                        <?php endforeach; ?>
+                    </select>
+                </div>
+                <div class="field">
+                    <label>
+                        <input type="checkbox" x-model="doc.config.pageNumber.showNumbers">
+                        Show slide numbers on preview
+                    </label>
+                </div>
+            </div>
+
+            <div class="panel-body" x-show="tab === 'ai'" x-cloak>
+                <?php if (!$aiTabHasAny): ?>
+                <p class="hint">Set <code>OPENROUTER_API_KEY</code> for slide text (OpenRouter only), and/or <code>REPLICATE_API_TOKEN</code> for images (Nano Banana Pro).</p>
+                <?php else: ?>
+                <?php if ($slideAiEnabled): ?>
+                <p class="ai-subhead">Slide copy</p>
+                <div class="field">
+                    <label>Topic or outline</label>
+                    <textarea x-model="aiPrompt" rows="5" placeholder="e.g. 5 tips for better LinkedIn posts…"></textarea>
+                </div>
+                <button type="button" class="btn btn-primary" @click="generateAi()" :disabled="aiLoading">
+                    <span x-show="!aiLoading">Generate slides</span>
+                    <span x-show="aiLoading">Working…</span>
+                </button>
+                <p class="err" x-show="aiError" x-text="aiError"></p>
+                <p class="hint">Replaces all slides with AI output. You can edit after.</p>
+                <?php endif; ?>
+
+                <?php if ($replicateImageEnabled): ?>
+                <?php if ($slideAiEnabled): ?><hr class="ai-section-divider"><?php endif; ?>
+                <p class="ai-subhead">Image (Replicate · Nano Banana Pro)</p>
+                <p class="hint" style="margin-top:0;">Describe the image; optionally add a reference photo or URL so the model can match or edit from it.</p>
+                <div class="field">
+                    <label>Image prompt</label>
+                    <textarea x-model="imgGenPrompt" rows="4" placeholder="e.g. LinkedIn carousel slide with bold title…"></textarea>
+                </div>
+                <div class="field">
+                    <label>Context image (optional)</label>
+                    <input type="file" accept="image/jpeg,image/png,image/webp,image/gif" x-ref="imgGenFile" @change="onImgGenFile($event)">
+                    <p class="hint" style="margin:0.35rem 0 0;">Or paste a public <code>https://</code> image URL:</p>
+                    <input type="text" style="margin-top:0.35rem;" x-model="imgGenUrl" placeholder="https://…">
+                </div>
+                <div class="field">
+                    <label>Aspect ratio</label>
+                    <select x-model="imgGenAspect">
+                        <option value="4:5">4:5 (carousel)</option>
+                        <option value="1:1">1:1</option>
+                        <option value="9:16">9:16</option>
+                        <option value="16:9">16:9</option>
+                        <option value="4:3">4:3</option>
+                        <option value="3:4">3:4</option>
+                        <option value="match_input_image">Match context image</option>
+                    </select>
+                </div>
+                <div class="field">
+                    <label>Resolution</label>
+                    <select x-model="imgGenResolution">
+                        <option value="1K">1K</option>
+                        <option value="2K">2K</option>
+                        <option value="4K">4K</option>
+                    </select>
+                </div>
+                <button type="button" class="btn btn-primary" @click="generateImageAi()" :disabled="imgGenLoading">
+                    <span x-show="!imgGenLoading">Generate image</span>
+                    <span x-show="imgGenLoading">Generating…</span>
+                </button>
+                <p class="err" x-show="imgGenError" x-text="imgGenError"></p>
+                <template x-if="imgGenResultUrl">
+                    <div style="margin-top:0.65rem;">
+                        <img class="img-gen-preview" :src="imgGenResultUrl" alt="Generated"
+                            draggable="true"
+                            @dragstart="onImgGenDragStart($event)"
+                            @dragend="onImgGenDragEnd($event)">
+                        <p class="hint" style="margin:0.35rem 0 0;">Drag onto the <strong>slide preview</strong> (center) or use the button.</p>
+                        <div class="add-row" style="margin-top:0.5rem;">
+                            <button type="button" class="btn btn-small" @click="applyImgGenToCurrentSlide()">Set as current slide content image</button>
+                            <a class="btn btn-small" :href="imgGenResultUrl" target="_blank" rel="noopener noreferrer">Open</a>
+                        </div>
+                    </div>
+                </template>
+                <?php endif; ?>
+                <?php endif; ?>
+            </div>
+
+            <div class="panel-body" x-show="tab === 'data'" x-cloak>
+                <button type="button" class="btn btn-primary" @click="exportJson()">Export JSON</button>
+                <div class="field" style="margin-top:1rem;">
+                    <label>Import JSON</label>
+                    <input type="file" accept="application/json,.json" @change="onImportFile($event)">
+                </div>
+                <p class="err" x-show="importError" x-text="importError"></p>
+                <p class="hint">Document is also saved automatically in your browser (localStorage).</p>
+            </div>
+
+            <div class="panel-body" x-show="tab === 'video'" x-cloak>
+                <p class="hint"><strong>Video pipeline</strong> (local): <strong>Playwright</strong> screenshots each slide at 1080×1350, then <strong>FFmpeg</strong> builds an MP4. Optional music is muxed with <code>-shortest</code> (video or audio ends first).</p>
+                <div class="field">
+                    <label>Seconds per slide (hold duration)</label>
+                    <input type="number" min="0.5" max="120" step="0.5" x-model.number="videoSeconds">
+                    <p class="hint" style="margin:0.35rem 0 0;">Each slide occupies this long in the exported MP4. The preview scrubber (video slides) spans <strong>one slide at a time</strong> using this duration.</p>
+                </div>
+                <div class="field">
+                    <label>Default music path (optional)</label>
+                    <input type="text" x-model="videoMusicPath" placeholder="./music/your-track.mp3">
+                    <p class="hint" style="margin:0.35rem 0 0;"><strong>Still</strong> slides can set their own music in the bottom bar or Slides tab (<code>musicPath</code> in exported JSON). This field is the pipeline <code>--music</code> default when you run the script below.</p>
+                </div>
+                <div class="field">
+                    <label>Output video path</label>
+                    <input type="text" x-model="videoOutPath" placeholder="../out/carousel.mp4">
+                </div>
+                <button type="button" class="btn btn-primary" @click="exportJson()">Export JSON</button>
+                <p class="hint">Save the file as <code>carousel-doc.json</code> in the project root (next to <code>video-pipeline/</code>), or change the path in the script below.</p>
+                <button type="button" class="btn btn-primary" style="margin-top:0.5rem" @click="copyPipelineCommand()">Copy terminal commands</button>
+                <p class="hint" x-show="pipelineCopyOk" x-text="pipelineCopyOk"></p>
+                <pre class="pipeline-snippet"><code x-text="pipelineShellScript()"></code></pre>
+                <p class="hint">Requires Node.js, <code>npm</code>, <code>ffmpeg</code> on your PATH, and network access for Google Fonts while rendering.</p>
+            </div>
+        </aside>
+
+        <main class="main">
+            <div class="pager">
+                <button type="button" class="btn btn-small" @click="carouselGoPrev()">Prev</button>
+                <span x-text="(currentIndex + 1) + ' / ' + doc.slides.length"></span>
+                <button type="button" class="btn btn-small" @click="carouselGoNext()">Next</button>
+            </div>
+            <p class="hint" style="margin:0.35rem 0 0.65rem;font-size:0.72rem;"><strong>Center card</strong> is a live layout preview (brand, text, content image). <strong>Schedule to Instagram</strong> sends only the <code>https://</code> image files linked in your JSON (content + background URLs)—not a flattened JPEG of this card. For full-frame exports matching this layout, run the <strong>Video</strong> pipeline. Click text on the card to edit; use the <strong>Slides</strong> tab for images and structure.</p>
+
+            <div class="preview-frame"
+                :class="{ 'preview-drop-active': previewDropActive }"
+                :style="previewStyle()"
+                @dragenter.prevent="onPreviewDragEnter($event)"
+                @dragleave.prevent="onPreviewDragLeave($event)">
+                <div class="preview-inner">
+                    <div class="preview-brand" :style="{ color: doc.config.theme.primary }">
+                        <template x-if="doc.config.brand.avatar.source.src">
+                            <img class="avatar" :src="doc.config.brand.avatar.source.src" alt="">
+                        </template>
+                        <template x-if="!doc.config.brand.avatar.source.src">
+                            <div class="avatar"></div>
+                        </template>
+                        <div>
+                            <div x-text="doc.config.brand.name" style="font-weight:600;"></div>
+                            <div x-text="doc.config.brand.handle" style="opacity:0.75;font-size:0.85em;"></div>
+                        </div>
+                    </div>
+                    <div class="preview-elements" :style="{ color: doc.config.theme.primary }">
+                        <template x-for="(el, ei) in slide.elements" :key="ei">
+                            <div>
+                                <template x-if="el.type === 'Title' || el.type === 'Subtitle' || el.type === 'Description'">
+                                    <div
+                                        class="preview-text-editable"
+                                        contenteditable="true"
+                                        spellcheck="true"
+                                        role="textbox"
+                                        :data-preview-type="el.type"
+                                        :style="elementStyle(el)"
+                                        :aria-label="'Edit ' + el.type"
+                                        @input="el.text = $event.target.textContent"
+                                        @blur="el.text = ($event.target.textContent || '').trim()"
+                                        @keydown.escape.prevent="$event.target.blur()"
+                                        @paste.prevent="(function(ev, el){ var t = (ev.clipboardData || window.clipboardData).getData('text/plain'); document.execCommand('insertText', false, t); el.text = ev.target.textContent; })($event, el)"
+                                        x-effect="if (document.activeElement !== $el) { var s = el.text == null ? '' : String(el.text); if ($el.textContent !== s) { $el.textContent = s; } }"
+                                    ></div>
+                                </template>
+                                <template x-if="(el.type === 'ContentImage' || el.type === 'Image') && el.source && el.source.src">
+                                    <div class="preview-content-img-block">
+                                        <div class="preview-content-img-outer"
+                                            @wheel.prevent="onContentImgWheel(ei, $event)">
+                                            <div class="preview-content-img-inner"
+                                                :style="contentImageTransformStyle(el)"
+                                                @pointerdown="contentImgPointerDown(ei, $event)">
+                                                <img class="preview-content-img" :src="el.source.src" alt="" draggable="false">
+                                            </div>
+                                        </div>
+                                        <div class="preview-content-img-toolbar" x-init="ensureContentImageStyle(el)">
+                                            <span class="preview-content-img-size-label">Resize</span>
+                                            <input type="range" class="preview-content-img-range" min="25" max="400" step="1"
+                                                x-model.number="el.style.imgScale"
+                                                @input="ensureContentImageStyle(el)"
+                                                title="Image size">
+                                            <span class="preview-content-img-size-val" x-text="Math.round(Number(el.style.imgScale) || 100) + '%'"></span>
+                                            <div class="preview-content-img-quick">
+                                                <button type="button" class="btn btn-small" @click="nudgeContentImgScale(el, -10)" title="Smaller">−</button>
+                                                <button type="button" class="btn btn-small" @click="nudgeContentImgScale(el, 10)" title="Larger">+</button>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </template>
+                                <template x-if="(el.type === 'ContentImage' || el.type === 'Image') && (!el.source || !el.source.src)">
+                                    <div class="preview-placeholder">Content image — drop from AI pane or set in <strong>Slides</strong> (left)</div>
+                                </template>
+                            </div>
+                        </template>
+                    </div>
+                    <p class="hint" style="margin:0.35rem 0 0;font-size:0.65rem;" x-show="slideHasContentImageWithSrc()">
+                        Content image: use <strong>Resize</strong> below, or wheel = scale · drag = pan · Shift+wheel = rotate. Slides tab has the same controls.
+                    </p>
+                </div>
+                <div class="page-num" x-show="doc.config.pageNumber.showNumbers"
+                    :style="{ color: doc.config.theme.primary }"
+                    x-text="(currentIndex + 1) + ' / ' + doc.slides.length"></div>
+            </div>
+        </main>
+
+        <aside class="sidebar-right" aria-label="External sources, account, and APIs">
+            <div class="tabs">
+                <button type="button" :class="{ active: rightTab === 'account' }" @click="rightTab = 'account'">Account</button>
+                <button type="button" :class="{ active: rightTab === 'socials' }" @click="rightTab = 'socials'">Socials</button>
+                <button type="button" :class="{ active: rightTab === 'media' }" @click="rightTab = 'media'">Media</button>
+                <button type="button" :class="{ active: rightTab === 'debug' }" @click="rightTab = 'debug'">Debug</button>
+            </div>
+            <div class="sidebar-inner">
+                <div class="sidebar-tab-panel" x-show="rightTab === 'account'" x-cloak>
+                    <section class="sidebar-section">
+                        <h3 class="sidebar-heading">Account</h3>
+                        <?php if ($user): ?>
+                        <p class="hint" style="margin:0 0 0.5rem;word-break:break-all;"><strong><?php echo $userEmail !== '' ? $userEmail : 'Signed in'; ?></strong></p>
+                        <form method="post" class="field" style="margin:0;">
+                            <input type="hidden" name="action" value="logout">
+                            <button type="submit" class="btn btn-small" style="width:100%;">Log out</button>
+                        </form>
+                        <?php else: ?>
+                        <p class="hint" style="margin-top:0;">PocketBase user — sign in to use Instagram linking and Garage-backed media.</p>
+                        <form method="post">
+                            <input type="hidden" name="action" value="login">
+                            <div class="field">
+                                <label>Email</label>
+                                <input type="email" name="email" required autocomplete="username">
+                            </div>
+                            <div class="field">
+                                <label>Password</label>
+                                <input type="password" name="password" required autocomplete="current-password">
+                            </div>
+                            <button type="submit" class="btn btn-primary" style="width:100%;">Sign in</button>
+                        </form>
+                        <?php endif; ?>
+                    </section>
+                </div>
+
+                <div class="sidebar-tab-panel" x-show="rightTab === 'socials'" x-cloak>
+                    <section class="sidebar-section">
+                        <h3 class="sidebar-heading">Socials</h3>
+                        <?php if (!$user): ?>
+                        <p class="hint" style="margin:0;">Connect Meta/Instagram after you sign in. Tokens and usernames are stored in PocketBase <code>social_accounts</code>.</p>
+                        <?php else: ?>
+                            <?php if ($fbConfigured): ?>
+                            <p class="hint" style="margin-top:0;">
+                                <a class="btn btn-small btn-primary" style="display:inline-flex;width:100%;justify-content:center;box-sizing:border-box;" href="/?instagram_oauth=1"><?php echo count($igAccountsList) > 0 ? 'Add or refresh Instagram' : 'Connect Instagram'; ?></a>
+                            </p>
+                            <?php else: ?>
+                            <p class="hint" style="margin-top:0;">Set <code>FB_APP_ID</code> and <code>FB_APP_SECRET</code> in <code>.env</code> to enable OAuth.</p>
+                            <?php endif; ?>
+                            <?php if ($igAccountsList !== []): ?>
+                            <p class="hint" style="margin:0.5rem 0 0.15rem;">Linked accounts</p>
+                            <ul class="sidebar-ig-list">
+                                <?php foreach ($igAccountsList as $a): ?>
+                                <li>
+                                    @<?php echo htmlspecialchars((string) ($a['username'] ?: $a['instagram_user_id']), ENT_QUOTES | ENT_HTML5, 'UTF-8'); ?>
+                                    <?php if (empty($a['is_active'])): ?><span class="hint"> · inactive</span><?php endif; ?>
+                                </li>
+                                <?php endforeach; ?>
+                            </ul>
+                            <?php elseif ($fbConfigured): ?>
+                            <p class="hint" style="margin:0.5rem 0 0;">No Instagram accounts linked yet.</p>
+                            <?php endif; ?>
+                            <?php if ($igAccountsList !== []): ?>
+                            <div class="sidebar-ig-schedule" style="margin-top:0.85rem;padding-top:0.75rem;border-top:1px solid rgba(255,255,255,0.08);">
+                                <p class="hint" style="margin:0 0 0.45rem;font-weight:600;">Schedule this carousel</p>
+                                <p class="hint" style="margin:0 0 0.5rem;font-size:0.72rem;">Queues the <strong>current document</strong> for the selected linked account. Meta fetches each resolved <code>https://</code> image (JPEG/PNG/etc. per their API)—it is <strong>not</strong> auto-generated from the on-screen slide layout. Non-public URLs are copied to PocketBase as signed links (needs <code>CRON_SECRET</code> + <code>FF_CRON_PB_TOKEN</code>), or use <code>GARAGE_PUBLIC_URL</code> / external <code>https://</code> links. Cron must call <code>process_instagram_schedules</code> — see <code>.env.example</code>.</p>
+                                <div class="field" style="margin-bottom:0.5rem;">
+                                    <label>Instagram account</label>
+                                    <select x-model="garageIgId" @change="refreshInstagramSchedules()" style="width:100%;">
+                                        <template x-for="a in igAccounts" :key="a.id">
+                                            <option :value="a.id" x-text="'@' + (a.username || a.instagram_user_id || a.id)"></option>
+                                        </template>
+                                    </select>
+                                </div>
+                                <div class="field" style="margin-bottom:0.5rem;">
+                                    <label>Caption (optional, max 2200)</label>
+                                    <textarea x-model="igScheduleCaption" rows="3" maxlength="2200" placeholder="Post caption…" style="width:100%;box-sizing:border-box;"></textarea>
+                                </div>
+                                <div class="field" style="margin-bottom:0.5rem;">
+                                    <label>Publish at</label>
+                                    <input type="datetime-local" x-model="igScheduleAt" style="width:100%;box-sizing:border-box;">
+                                </div>
+                                <button type="button" class="btn btn-primary" style="width:100%;" @click="scheduleInstagramCarousel()" :disabled="igScheduleLoading || !garageIgId">
+                                    <span x-show="!igScheduleLoading">Schedule to Instagram</span>
+                                    <span x-show="igScheduleLoading">Working…</span>
+                                </button>
+                                <p class="err" style="margin:0.45rem 0 0;" x-show="igScheduleErr" x-text="igScheduleErr"></p>
+                                <p class="hint" style="margin:0.35rem 0 0;color:var(--cg-accent);" x-show="igScheduleMsg" x-text="igScheduleMsg"></p>
+                                <p class="hint" style="margin:0.65rem 0 0.35rem;font-weight:600;">Upcoming</p>
+                                <div style="display:flex;gap:0.35rem;align-items:center;margin-bottom:0.45rem;">
+                                    <button type="button" class="btn btn-small" @click="refreshInstagramSchedules()" :disabled="igScheduleLoading">Refresh list</button>
+                                    <span class="hint" style="margin:0;" x-show="igScheduleLoading">Loading…</span>
+                                </div>
+                                <template x-if="!igSchedules.length && !igScheduleLoading">
+                                    <p class="hint" style="margin:0;">No scheduled posts.</p>
+                                </template>
+                                <ul class="sidebar-ig-list" style="margin:0;padding-left:0;list-style:none;">
+                                    <template x-for="row in igSchedules" :key="row.id">
+                                        <li style="margin-bottom:0.55rem;padding:0.45rem;border-radius:6px;background:rgba(0,0,0,0.2);">
+                                            <div style="font-size:0.75rem;" x-text="formatIgScheduleWhen(row.scheduled_publish_at)"></div>
+                                            <div class="hint" style="margin:0.2rem 0 0;font-size:0.68rem;" x-text="igScheduleAccountLabel(row.social_account_id) + ' · ' + row.image_count + ' img' + (row.caption ? ' · ' + row.caption.slice(0, 48) + (row.caption.length > 48 ? '…' : '') : '')"></div>
+                                            <button type="button" class="btn btn-small" style="margin-top:0.35rem;" @click="cancelInstagramSchedule(row.id)" :disabled="igScheduleLoading">Cancel</button>
+                                        </li>
+                                    </template>
+                                </ul>
+                            </div>
+                            <?php endif; ?>
+                            <details class="hint" style="margin-top:0.65rem;font-size:0.72rem;">
+                                <summary style="cursor:pointer;color:var(--cg-accent);">OAuth scope sent to Meta</summary>
+                                <p style="margin:0.35rem 0 0;word-break:break-all;"><code><?php echo htmlspecialchars((string) ($CONFIG['instagram_oauth_scope'] ?? ''), ENT_QUOTES | ENT_HTML5, 'UTF-8'); ?></code></p>
+                            </details>
+                        <?php endif; ?>
+                    </section>
+                </div>
+
+                <div class="sidebar-tab-panel" x-show="rightTab === 'media'" x-cloak>
+                    <section class="sidebar-section">
+                        <h3 class="sidebar-heading">Media &amp; downloads</h3>
+                        <p class="hint" style="margin-top:0;">Carousel JSON stays in the browser. <strong>Input</strong> previews use Garage objects under <code>social_accounts/{PocketBase id}/…</code> in your configured bucket (e.g. <code>my-bucket</code>) when you pick a linked Instagram account; otherwise they use PocketBase <code><?php echo $htmlInputMediaCol; ?></code>. <strong>Output</strong> still uses <code>output_media</code> in PocketBase.</p>
+                        <?php if ($htmlPbAdmin !== ''): ?>
+                        <p class="hint" style="margin:0.5rem 0 0;">
+                            <a class="btn btn-small" style="display:inline-flex;width:100%;justify-content:center;box-sizing:border-box;" href="<?php echo $htmlPbAdmin; ?>" target="_blank" rel="noopener noreferrer">Open PocketBase admin</a>
+                        </p>
+                        <?php endif; ?>
+                        <?php if ($user): ?>
+                        <div class="field" style="margin-top:0.65rem;display:flex;gap:0.35rem;flex-wrap:wrap;align-items:center;">
+                            <button type="button" class="btn btn-small" @click="refreshMediaLibrary()" :disabled="mediaLoading">Refresh media</button>
+                            <span class="hint" style="margin:0;" x-show="mediaLoading">Loading…</span>
+                        </div>
+                        <p class="hint" style="margin:0.35rem 0;color:#f87171;" x-show="mediaErr" x-text="mediaErr"></p>
+                        <div class="media-scroll">
+                            <?php if ($garageReady && $igAccountsList !== []): ?>
+                            <p class="media-subhead">Input media (Garage)</p>
+                            <p class="hint" style="margin:0 0 0.5rem;">Drag thumbnails onto <strong>Intro / Outro</strong> in the Slides tab. Everything for the selected account stays in one bucket (<code><?php echo htmlspecialchars((string) ($CONFIG['garage_social_content_bucket'] ?? ''), ENT_QUOTES | ENT_HTML5, 'UTF-8'); ?></code>) under <code>social_accounts/&lt;id&gt;/…</code>. AI slide/image saves use <code>ai/slides/</code> and <code>ai/images/</code> under that same prefix when an Instagram account is selected in this tab.</p>
+                            <div class="field" style="margin-bottom:0.5rem;">
+                                <label>Linked account</label>
+                                <select x-model="garageIgId" @change="onGarageIgScopeChange()" style="width:100%;">
+                                    <template x-for="a in igAccounts" :key="a.id">
+                                        <option :value="a.id" x-text="'@' + (a.username || a.instagram_user_id || a.id)"></option>
+                                    </template>
+                                </select>
+                            </div>
+                            <div class="field" style="display:flex;gap:0.35rem;flex-wrap:wrap;margin-bottom:0.65rem;">
+                                <label class="btn btn-small" style="cursor:pointer;margin:0;">
+                                    Upload to Garage
+                                    <input type="file" style="display:none;" @change="garageUploadFile($event)" :disabled="mediaLoading || garageUploading || !garageIgId">
+                                </label>
+                            </div>
+                            <template x-for="row in mediaGarage" :key="row.key">
+                                <div class="media-record-card">
+                                    <p class="media-record-title" style="font-weight:500;font-size:0.7rem;" x-text="row.rel"></p>
+                                    <template x-if="row.kind === 'image'">
+                                        <div class="media-entry">
+                                            <img class="media-thumb" draggable="true" @dragstart="onMediaDragStart($event, row.public_url || row.preview_url)" :src="row.preview_url" loading="lazy" :alt="row.rel">
+                                        </div>
+                                    </template>
+                                    <template x-if="row.kind === 'video'">
+                                        <div class="media-entry">
+                                            <video class="media-video" :src="row.preview_url" controls playsinline preload="metadata"></video>
+                                        </div>
+                                    </template>
+                                    <template x-if="row.kind === 'audio'">
+                                        <div class="media-entry">
+                                            <audio class="media-audio" :src="row.preview_url" controls preload="metadata"></audio>
+                                        </div>
+                                    </template>
+                                    <div class="media-file-row" style="margin-top:0.35rem;">
+                                        <span style="opacity:0.75;" x-text="garageFmtSize(row.size)"></span>
+                                        <a class="btn btn-small" :href="row.download_url">Download</a>
+                                        <button type="button" class="btn btn-small" @click="garageDeleteRel(row.rel)" :disabled="mediaLoading || garageUploading">Delete</button>
+                                    </div>
+                                </div>
+                            </template>
+                            <p class="hint" style="margin:0 0 0.65rem;" x-show="!mediaLoading && garageIgId && !mediaGarage.length">No objects in this account’s Garage prefix yet — upload above or run <code>scripts/garage-put-social-placeholder.sh &lt;social_accounts_id&gt;</code> on the server.</p>
+                            <?php elseif (!$garageReady): ?>
+                            <p class="media-subhead">Input media (PocketBase)</p>
+                            <p class="hint" style="margin:0 0 0.5rem;">Garage not configured — showing PocketBase <code><?php echo $htmlInputMediaCol; ?></code> only. Set <code>GARAGE_*</code> and <code>scripts/garage-ensure-social-content-bucket.sh</code> (use <code>GARAGE_SOCIAL_CONTENT_BUCKET=my-bucket</code> for your generic bucket).</p>
+                            <template x-if="!mediaPbInput.length">
+                                <p class="hint" style="margin:0 0 0.5rem;">No file attachments on recent <code><?php echo $htmlInputMediaCol; ?></code> rows.</p>
+                            </template>
+                            <template x-for="block in mediaPbInput" :key="block.record_id">
+                                <div class="media-record-card">
+                                    <p class="media-record-title" x-text="block.title"></p>
+                                    <template x-for="(en, ei) in block.entries" :key="block.record_id + '-' + ei + '-' + en.label">
+                                        <div class="media-entry">
+                                            <template x-if="en.kind === 'image'">
+                                                <img class="media-thumb" draggable="true" @dragstart="onMediaDragStart($event, en.url)" :src="en.url" loading="lazy" :alt="en.label">
+                                            </template>
+                                            <template x-if="en.kind === 'video'">
+                                                <video class="media-video" :src="en.url" controls playsinline preload="metadata"></video>
+                                            </template>
+                                            <template x-if="en.kind === 'audio'">
+                                                <audio class="media-audio" :src="en.url" controls preload="metadata"></audio>
+                                            </template>
+                                            <template x-if="en.kind === 'file'">
+                                                <div class="media-file-row">
+                                                    <span x-text="en.label"></span>
+                                                    <a class="btn btn-small" :href="en.url" target="_blank" rel="noopener noreferrer">Open</a>
+                                                </div>
+                                            </template>
+                                        </div>
+                                    </template>
+                                </div>
+                            </template>
+                            <?php else: ?>
+                            <p class="media-subhead">Input media (PocketBase)</p>
+                            <p class="hint" style="margin:0 0 0.5rem;">Link Instagram in <strong>Socials</strong> to scope input media to Garage (<code>social_accounts/…</code>). Until then, previews use PocketBase <code><?php echo $htmlInputMediaCol; ?></code>.</p>
+                            <template x-if="!mediaPbInput.length">
+                                <p class="hint" style="margin:0 0 0.5rem;">No file attachments on recent <code><?php echo $htmlInputMediaCol; ?></code> rows.</p>
+                            </template>
+                            <template x-for="block in mediaPbInput" :key="block.record_id">
+                                <div class="media-record-card">
+                                    <p class="media-record-title" x-text="block.title"></p>
+                                    <template x-for="(en, ei) in block.entries" :key="block.record_id + '-' + ei + '-' + en.label">
+                                        <div class="media-entry">
+                                            <template x-if="en.kind === 'image'">
+                                                <img class="media-thumb" draggable="true" @dragstart="onMediaDragStart($event, en.url)" :src="en.url" loading="lazy" :alt="en.label">
+                                            </template>
+                                            <template x-if="en.kind === 'video'">
+                                                <video class="media-video" :src="en.url" controls playsinline preload="metadata"></video>
+                                            </template>
+                                            <template x-if="en.kind === 'audio'">
+                                                <audio class="media-audio" :src="en.url" controls preload="metadata"></audio>
+                                            </template>
+                                            <template x-if="en.kind === 'file'">
+                                                <div class="media-file-row">
+                                                    <span x-text="en.label"></span>
+                                                    <a class="btn btn-small" :href="en.url" target="_blank" rel="noopener noreferrer">Open</a>
+                                                </div>
+                                            </template>
+                                        </div>
+                                    </template>
+                                </div>
+                            </template>
+                            <?php endif; ?>
+                            <p class="media-subhead">Output media (PocketBase)</p>
+                            <template x-if="!mediaPbOutput.length">
+                                <p class="hint" style="margin:0 0 0.5rem;">No previewable files on recent <code>output_media</code> rows.</p>
+                            </template>
+                            <template x-for="block in mediaPbOutput" :key="block.record_id">
+                                <div class="media-record-card">
+                                    <p class="media-record-title" x-text="block.title"></p>
+                                    <template x-for="(en, ei) in block.entries" :key="block.record_id + '-o-' + ei + '-' + en.label">
+                                        <div class="media-entry">
+                                            <template x-if="en.kind === 'image'">
+                                                <img class="media-thumb" draggable="true" @dragstart="onMediaDragStart($event, en.url)" :src="en.url" loading="lazy" :alt="en.label">
+                                            </template>
+                                            <template x-if="en.kind === 'video'">
+                                                <video class="media-video" :src="en.url" controls playsinline preload="metadata"></video>
+                                            </template>
+                                            <template x-if="en.kind === 'audio'">
+                                                <audio class="media-audio" :src="en.url" controls preload="metadata"></audio>
+                                            </template>
+                                            <template x-if="en.kind === 'file'">
+                                                <div class="media-file-row">
+                                                    <span x-text="en.label"></span>
+                                                    <a class="btn btn-small" :href="en.url" target="_blank" rel="noopener noreferrer">Open</a>
+                                                </div>
+                                            </template>
+                                        </div>
+                                    </template>
+                                </div>
+                            </template>
+                        </div>
+                        <?php else: ?>
+                        <p class="hint" style="margin-top:0.65rem;">Sign in to load previews from PocketBase and Garage.</p>
+                        <?php endif; ?>
+                    </section>
+                </div>
+
+                <div class="sidebar-tab-panel" x-show="rightTab === 'debug'" x-cloak>
+                    <section class="sidebar-section">
+                        <h3 class="sidebar-heading">Diagnostics</h3>
+                        <p class="hint" style="margin-top:0;"><?php if ($user): ?><a href="?ff_debug_json=1">Download debug JSON</a> (safe config snapshot).<?php else: ?>Sign in to use debug JSON.<?php endif; ?></p>
+                    </section>
+                </div>
+            </div>
+        </aside>
+
+        <div class="carousel-scrubber-bar" aria-label="Current slide video segment and music">
+            <div class="carousel-scrubber-inner">
+                <div class="carousel-scrubber-wrap" x-show="currentSlideIsVideo()" x-cloak>
+                    <div class="carousel-scrubber-meta">
+                        <button type="button" class="btn btn-small" @click="carouselPlayToggle()"
+                            x-text="carouselPlaying ? 'Pause' : 'Play'"></button>
+                        <span class="carousel-scrubber-time" x-text="carouselTimeLabel()"></span>
+                    </div>
+                    <div class="carousel-scrubber-track-wrap">
+                        <div class="carousel-scrubber-ticks" aria-hidden="true"></div>
+                        <input type="range" class="carousel-scrubber-range" min="0"
+                            :max="slideDurationSec()"
+                            step="0.05"
+                            :value="carouselTimelineSec"
+                            @input="onCarouselScrubInput($event)"
+                            :style="{ '--carousel-fill-pct': carouselScrubFillPct() + '%' }">
+                    </div>
+                    <p class="carousel-scrubber-hint">Video slide: scrubber covers <strong>this slide only</strong> (0 → seconds per slide from the <strong>Video</strong> tab). Use slide arrows or the list to change slides; playback does not walk the whole carousel.</p>
+                </div>
+                <div class="carousel-still-music" x-show="slide && !currentSlideIsVideo()" x-cloak>
+                    <div class="carousel-still-music-row">
+                        <label class="carousel-still-label" for="carousel-still-music-input">Music for this slide</label>
+                        <input id="carousel-still-music-input" type="text" class="carousel-still-input"
+                            x-model="slide.musicPath"
+                            placeholder="e.g. ./music/intro.mp3 or a public audio URL">
+                    </div>
+                    <p class="carousel-scrubber-hint">This slide is a <strong>still</strong> (image + hold). Set audio above, or change it to a <strong>video</strong> slide in the Slides tab to use the scrubber. Exported JSON includes <code>musicPath</code> per slide for your pipeline.</p>
+                </div>
+            </div>
         </div>
-        <?php endif; ?>
     </div>
+
     <script>
-        function ffHealth() {
-            return {
-                loading: true,
-                healthOk: false,
-                healthMsg: '',
-                async checkHealth() {
-                    this.loading = true;
-                    try {
-                        const r = await fetch('/api/health', { headers: { 'Accept': 'application/json' } });
-                        this.healthOk = r.ok;
-                        this.healthMsg = r.ok ? 'OK' : ('HTTP ' + r.status);
-                    } catch (e) {
-                        this.healthOk = false;
-                        this.healthMsg = 'Down';
-                    }
-                    this.loading = false;
-                }
-            };
-        }
-        function ffDebug() {
-            return {
-                loading: false,
-                text: '',
-                err: '',
-                async load() {
-                    this.loading = true;
-                    this.err = '';
-                    try {
-                        const r = await fetch('/?ff_debug_json=1', { headers: { 'Accept': 'application/json' }, credentials: 'same-origin' });
-                        const ct = r.headers.get('content-type') || '';
-                        if (!r.ok) {
-                            const t = await r.text();
-                            this.err = 'HTTP ' + r.status + (t ? ': ' + t.slice(0, 240) : '');
-                            this.text = '';
-                            this.loading = false;
-                            return;
-                        }
-                        if (!ct.includes('application/json')) {
-                            this.err = 'Unexpected response (not JSON).';
-                            this.text = '';
-                            this.loading = false;
-                            return;
-                        }
-                        const j = await r.json();
-                        this.text = JSON.stringify(j, null, 2);
-                    } catch (e) {
-                        this.err = String(e);
-                        this.text = '';
-                    }
-                    this.loading = false;
-                },
-                async copy() {
-                    try {
-                        await navigator.clipboard.writeText(this.text);
-                    } catch (e) {
-                        this.err = 'Copy failed: ' + e;
-                    }
-                }
-            };
-        }
+window.__CG_GENERATE_URL__ = <?= json_encode($generateUrl, JSON_UNESCAPED_SLASHES) ?>;
+window.__CG_IMAGE_GEN_URL__ = <?= json_encode($generateImageUrl, JSON_UNESCAPED_SLASHES) ?>;
+window.__FF_SCRIPT__ = <?= $jsonFfScript ?>;
+window.__FF_IG_ACCOUNTS__ = <?= $jsonIgAccounts ?>;
+window.__FF_USER__ = <?= $user ? 'true' : 'false' ?>;
     </script>
+    <script>
+(function () {
+  function cgResolveApiUrl(pathOrUrl) {
+    var p = pathOrUrl || '';
+    if (!p) {
+      return '';
+    }
+    try {
+      return new URL(p, window.location.href).href;
+    } catch (e) {
+      return p;
+    }
+  }
+  const GENERATE_URL = cgResolveApiUrl(window.__CG_GENERATE_URL__);
+  const IMAGE_GEN_URL = cgResolveApiUrl(window.__CG_IMAGE_GEN_URL__ || '');
+
+  function cgNonJsonApiError(res, rawTxt, label) {
+    var st = res ? res.status : 0;
+    var ct = (res && res.headers && res.headers.get('Content-Type')) || '';
+    var snip = String(rawTxt || '').replace(/\s+/g, ' ').trim().slice(0, 200);
+    var isCf = /cloudflare|cdn-cgi|<!--\[if lt IE 7\]|Ray ID:/i.test(rawTxt || '');
+    var msg = label + ' returned HTTP ' + (st || '?') + '. ';
+    if (ct.indexOf('text/html') !== -1 || /^\s*<!DOCTYPE/i.test(rawTxt || '')) {
+      msg += 'Body is HTML, not JSON — you are seeing an error page from the edge or origin, not the carousel API. ';
+      if (st === 502 && isCf) {
+        msg += 'Cloudflare 502 = bad response from your server behind Cloudflare (not WAF blocking). Typical causes: nginx cannot talk to PHP-FPM (wrong unix socket in fastcgi_pass vs pool listen=), PHP-FPM request_terminate_timeout or max_execution_time killing the worker while OpenRouter runs (allow ~130s), PHP fatal on that code path, or SSL mode mismatch (Flexible vs Full). Check /var/log/nginx/error.log and php-fpm log; from the server POST the same URL with your session cookie to see the real error. ';
+      } else if (st === 524 && isCf) {
+        msg += 'Cloudflare 524 = origin too slow. Raise nginx fastcgi_read_timeout and pool request_terminate_timeout; slide AI can take up to ~120s. ';
+      } else if (isCf && (st === 403 || st === 429)) {
+        msg += 'Often WAF or rate limit — review Cloudflare Security → Events for this Ray ID. ';
+      } else if (isCf) {
+        msg += 'Pause orange-cloud or curl the origin directly to see the real nginx/PHP error. ';
+      } else {
+        msg += 'Check nginx and PHP-FPM logs (timeouts, client_max_body_size). ';
+      }
+    }
+    msg += snip ? ('Snippet: ' + snip) : '(empty body)';
+    return msg;
+  }
+
+  const STORAGE_KEY = 'carousel-generator-doc';
+  const PIPELINE_PREFS_KEY = 'carousel-generator-pipeline';
+  const SLIDE_TEMPLATES_KEY_LEGACY = 'carousel-slide-templates';
+  const SLIDE_TEMPLATES_KEY_V2 = 'carousel-slide-templates-v2';
+
+  const PALETTES = {
+    black: { primary: '#373737', secondary: '#161616', background: '#000000' },
+    light: { primary: '#4f46e5', secondary: '#6366f1', background: '#ffffff' },
+    dracula: { primary: '#ff79c6', secondary: '#bd93f9', background: '#282a36' },
+    nord: { primary: '#5e81ac', secondary: '#81a1c1', background: '#eceff4' },
+    night: { primary: '#38bdf8', secondary: '#818cf8', background: '#0f172a' },
+    forest: { primary: '#1eb854', secondary: '#1db88e', background: '#171212' },
+  };
+
+  const FONT_CSS = {
+    DM_Serif_Display: '"DM Serif Display", Georgia, serif',
+    DM_Sans: '"DM Sans", system-ui, sans-serif',
+    Inter: 'Inter, system-ui, sans-serif',
+    Montserrat: 'Montserrat, system-ui, sans-serif',
+    Roboto: 'Roboto, system-ui, sans-serif',
+    Roboto_Condensed: '"Roboto Condensed", system-ui, sans-serif',
+    PT_Serif: '"PT Serif", Georgia, serif',
+    Syne: 'Syne, system-ui, sans-serif',
+    ArchivoBlack: '"Archivo Black", system-ui, sans-serif',
+    Ultra: 'Ultra, Georgia, serif',
+  };
+
+  function defaultImage(bgOpacity) {
+    return {
+      type: 'Image',
+      source: { src: '', type: 'URL' },
+      style: { opacity: bgOpacity },
+    };
+  }
+
+  function defaultContentImage() {
+    return {
+      type: 'ContentImage',
+      source: { src: '', type: 'URL' },
+      style: {
+        opacity: 100,
+        objectFit: 'Cover',
+        imgScale: 100,
+        imgRotateDeg: 0,
+        imgPanX: 0,
+        imgPanY: 0,
+      },
+    };
+  }
+
+  function textStyle() {
+    return { fontSize: 'Medium', align: 'Left' };
+  }
+
+  function elTitle(text) {
+    return { type: 'Title', text: text || 'YOUR TITLE', style: textStyle() };
+  }
+  function elSubtitle(text) {
+    return { type: 'Subtitle', text: text || 'Your awesome subtitle', style: textStyle() };
+  }
+  function elDescription(text) {
+    return {
+      type: 'Description',
+      text: text || 'Lorem ipsum dolor sit amet consectetur adipisicing elit.',
+      style: textStyle(),
+    };
+  }
+
+  function defaultSlideMedia() {
+    return { mediaKind: 'still', musicPath: '' };
+  }
+
+  function normalizeDocSlidesMedia(doc) {
+    if (!doc || !Array.isArray(doc.slides)) {
+      return;
+    }
+    doc.slides.forEach(function (s) {
+      if (s.mediaKind !== 'video' && s.mediaKind !== 'still') {
+        s.mediaKind = 'still';
+      }
+      if (typeof s.musicPath !== 'string') {
+        s.musicPath = '';
+      }
+      (s.elements || []).forEach(function (el) {
+        if (!el || (el.type !== 'ContentImage' && el.type !== 'Image')) {
+          return;
+        }
+        if (!el.style || typeof el.style !== 'object') {
+          el.style = {};
+        }
+        if (typeof el.style.imgScale !== 'number' || el.style.imgScale <= 0) {
+          el.style.imgScale = 100;
+        }
+        if (el.style.imgScale > 400) {
+          el.style.imgScale = 400;
+        }
+        if (typeof el.style.imgRotateDeg !== 'number') {
+          el.style.imgRotateDeg = 0;
+        }
+        if (typeof el.style.imgPanX !== 'number') {
+          el.style.imgPanX = 0;
+        }
+        if (typeof el.style.imgPanY !== 'number') {
+          el.style.imgPanY = 0;
+        }
+      });
+    });
+  }
+
+  /** Deep clone one slide and run the same media normalization as the full document. */
+  function cloneSlideForDoc(s) {
+    if (!s || typeof s !== 'object') {
+      return slideCommon();
+    }
+    try {
+      var x = JSON.parse(JSON.stringify(s));
+      normalizeDocSlidesMedia({ slides: [x], config: {} });
+      return x;
+    } catch (e) {
+      return slideCommon();
+    }
+  }
+
+  /** One still slide whose main content is an image URL (intro/outro from Media drag). */
+  function slideFromImageUrl(url) {
+    const ci = defaultContentImage();
+    ci.source.src = url;
+    return Object.assign(defaultSlideMedia(), {
+      elements: [elTitle(), ci],
+      backgroundImage: defaultImage(30),
+    });
+  }
+
+  function slideIntro() {
+    return Object.assign(defaultSlideMedia(), {
+      elements: [elTitle(), defaultContentImage()],
+      backgroundImage: defaultImage(30),
+    });
+  }
+  function slideCommon() {
+    return Object.assign(defaultSlideMedia(), {
+      elements: [elTitle(), elSubtitle(), defaultContentImage()],
+      backgroundImage: defaultImage(30),
+    });
+  }
+  function slideContent() {
+    return Object.assign(defaultSlideMedia(), {
+      elements: [elTitle(), elDescription()],
+      backgroundImage: defaultImage(30),
+    });
+  }
+  function slideOutro() {
+    return Object.assign(defaultSlideMedia(), {
+      elements: [elTitle(), elSubtitle(), elDescription()],
+      backgroundImage: defaultImage(30),
+    });
+  }
+
+  function defaultDocument() {
+    return {
+      slides: [
+        slideIntro(),
+        slideCommon(),
+        slideContent(),
+        slideContent(),
+        slideOutro(),
+      ],
+      config: {
+        brand: {
+          avatar: {
+            type: 'Image',
+            source: { src: '', type: 'URL' },
+            style: { opacity: 100 },
+          },
+          name: 'My name',
+          handle: '@name',
+        },
+        theme: {
+          isCustom: false,
+          pallette: 'black',
+          primary: '#0d0d0d',
+          secondary: '#161616',
+          background: '#ffffff',
+        },
+        fonts: { font1: 'DM_Serif_Display', font2: 'DM_Sans' },
+        pageNumber: { showNumbers: true },
+      },
+      filename: 'My Carousel File',
+    };
+  }
+
+  function normalizeAiElement(raw) {
+    const t = raw && raw.type;
+    const text = typeof raw.text === 'string' ? raw.text : '';
+    if (t === 'Subtitle') return elSubtitle(text);
+    if (t === 'Description') return elDescription(text);
+    return elTitle(text || 'Slide');
+  }
+
+  function normalizeAiSlides(slides) {
+    if (!Array.isArray(slides)) return null;
+    return slides.map(function (s) {
+      const els = Array.isArray(s.elements) ? s.elements : [];
+      const mapped = els.slice(0, 3).map(normalizeAiElement);
+      if (mapped.length === 0) mapped.push(elTitle('Slide'));
+      return Object.assign(defaultSlideMedia(), {
+        elements: mapped,
+        backgroundImage: defaultImage(30),
+      });
+    });
+  }
+
+  function applyPalette(doc, name) {
+    const p = PALETTES[name];
+    if (!p) return;
+    doc.config.theme.pallette = name;
+    doc.config.theme.isCustom = false;
+    doc.config.theme.primary = p.primary;
+    doc.config.theme.secondary = p.secondary;
+    doc.config.theme.background = p.background;
+  }
+
+  document.addEventListener('alpine:init', function () {
+    Alpine.data('carouselApp', function () {
+      return {
+        doc: defaultDocument(),
+        currentIndex: 0,
+        tab: 'slides',
+        rightTab: 'account',
+        igAccounts: Array.isArray(window.__FF_IG_ACCOUNTS__) ? window.__FF_IG_ACCOUNTS__ : [],
+        garageIgId: '',
+        mediaPbInput: [],
+        mediaPbOutput: [],
+        mediaGarage: [],
+        mediaLoading: false,
+        mediaErr: '',
+        garageUploading: false,
+        aiPrompt: '',
+        aiLoading: false,
+        aiError: '',
+        imgGenPrompt: '',
+        imgGenUrl: '',
+        imgGenAspect: '4:5',
+        imgGenResolution: '2K',
+        imgGenFileB64: '',
+        imgGenFileMime: '',
+        imgGenLoading: false,
+        imgGenError: '',
+        imgGenResultUrl: '',
+        previewDropActive: false,
+        /** Same-page fallback when dataTransfer.getData is empty (common when dragging the AI preview img). */
+        dragImgGenUrl: '',
+        importError: '',
+        videoSeconds: 3,
+        videoMusicPath: './music/track.mp3',
+        videoOutPath: '../out/carousel.mp4',
+        pipelineCopyOk: '',
+        carouselTimelineSec: 0,
+        carouselPlaying: false,
+        carouselRafId: null,
+        slideTemplates: { intro: null, outro: null },
+        slideTemplatesByAccount: {},
+        templateMsg: '',
+        draggingOverTpl: '',
+        igScheduleCaption: '',
+        igScheduleAt: '',
+        igSchedules: [],
+        igScheduleLoading: false,
+        igScheduleErr: '',
+        igScheduleMsg: '',
+
+        init: function () {
+          const self = this;
+          try {
+            const raw = localStorage.getItem(STORAGE_KEY);
+            if (raw) {
+              const parsed = JSON.parse(raw);
+              if (parsed && parsed.slides && parsed.config) {
+                this.doc = parsed;
+                normalizeDocSlidesMedia(this.doc);
+              }
+            }
+          } catch (e) { /* ignore */ }
+          try {
+            const pr = localStorage.getItem(PIPELINE_PREFS_KEY);
+            if (pr) {
+              const po = JSON.parse(pr);
+              if (typeof po.videoSeconds === 'number' && !isNaN(po.videoSeconds)) {
+                self.videoSeconds = po.videoSeconds;
+              }
+              if (typeof po.videoMusicPath === 'string') {
+                self.videoMusicPath = po.videoMusicPath;
+              }
+              if (typeof po.videoOutPath === 'string') {
+                self.videoOutPath = po.videoOutPath;
+              }
+            }
+          } catch (e2) { /* ignore */ }
+          this.loadSlideTemplatesFromStorage();
+          if (this.igAccounts.length && !this.garageIgId) {
+            this.garageIgId = this.igAccounts[0].id || '';
+          }
+          (function setDefaultIgScheduleAt() {
+            const d = new Date();
+            d.setMinutes(d.getMinutes() + 65);
+            d.setSeconds(0, 0);
+            const pad = function (n) { return String(n).padStart(2, '0'); };
+            self.igScheduleAt = d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate()) + 'T' + pad(d.getHours()) + ':' + pad(d.getMinutes());
+          })();
+          this.migrateLegacySlideTemplatesIfNeeded();
+          this.assignSlideTemplatesFromAccount();
+          if (window.__FF_USER__) {
+            this.refreshMediaLibrary();
+            this.refreshInstagramSchedules();
+          }
+          this.$watch('doc', function () { this.persist(); }.bind(this), { deep: true });
+          ['videoSeconds', 'videoMusicPath', 'videoOutPath'].forEach(function (k) {
+            self.$watch(k, function () { self.persistPipeline(); });
+          });
+          this.$watch('videoSeconds', function () {
+            self.carouselStop();
+            var tot = self.slideDurationSec();
+            if (self.carouselTimelineSec > tot) {
+              self.carouselTimelineSec = tot;
+            }
+          });
+          function onDocDragOverCapture(ev) {
+            var frame = ev.target && ev.target.closest && ev.target.closest('.preview-frame');
+            if (!frame || !self.$el.contains(frame)) return;
+            ev.preventDefault();
+            if (ev.dataTransfer) ev.dataTransfer.dropEffect = 'copy';
+          }
+          function onDocDropCapture(ev) {
+            var frame = ev.target && ev.target.closest && ev.target.closest('.preview-frame');
+            if (!frame || !self.$el.contains(frame)) return;
+            var url = self.resolvePreviewDropUrl(ev);
+            if (!url) return;
+            ev.preventDefault();
+            ev.stopPropagation();
+            self.previewDropActive = false;
+            self.applyContentImageUrl(url);
+            if (typeof window !== 'undefined') window.__FF_DRAG_AI_IMG_URL__ = '';
+            self.dragImgGenUrl = '';
+          }
+          document.addEventListener('dragover', onDocDragOverCapture, true);
+          document.addEventListener('drop', onDocDropCapture, true);
+          document.addEventListener('dragend', function () {
+            self.draggingOverTpl = '';
+          });
+        },
+
+        persistPipeline: function () {
+          try {
+            localStorage.setItem(
+              PIPELINE_PREFS_KEY,
+              JSON.stringify({
+                videoSeconds: this.videoSeconds,
+                videoMusicPath: this.videoMusicPath,
+                videoOutPath: this.videoOutPath,
+              })
+            );
+          } catch (e) { /* ignore */ }
+        },
+
+        pipelineShellScript: function () {
+          let sec = Number(this.videoSeconds);
+          if (isNaN(sec) || sec < 0.5) {
+            sec = 3;
+          }
+          const music = (this.videoMusicPath || '').trim();
+          let out = (this.videoOutPath || '../out/carousel.mp4').trim();
+          if (!out) {
+            out = '../out/carousel.mp4';
+          }
+          const jsonFile = '../carousel-doc.json';
+          let cmd = 'node run.mjs ' + jsonFile + ' --seconds ' + sec + ' --out "' + out + '"';
+          if (music) {
+            cmd += ' --music "' + music + '"';
+          }
+          return [
+            '# Run from project root (folder that contains video-pipeline/).',
+            '# Prereqs: Node.js, ffmpeg on PATH, network (Google Fonts).',
+            '# 1) Data tab → Export JSON → save as carousel-doc.json in project root.',
+            '# Still slides: per-slide musicPath in JSON (Slides tab / bottom bar). Video slides: mediaKind "video".',
+            'cd video-pipeline',
+            'npm install',
+            'npx playwright install chromium',
+            cmd,
+          ].join('\n');
+        },
+
+        copyPipelineCommand: function () {
+          const self = this;
+          const text = this.pipelineShellScript();
+          if (navigator.clipboard && navigator.clipboard.writeText) {
+            navigator.clipboard.writeText(text).then(function () {
+              self.pipelineCopyOk = 'Commands copied to clipboard.';
+              setTimeout(function () { self.pipelineCopyOk = ''; }, 2500);
+            }).catch(function () {
+              self.pipelineCopyOk = 'Could not copy — select the script block below.';
+              setTimeout(function () { self.pipelineCopyOk = ''; }, 4000);
+            });
+          } else {
+            self.pipelineCopyOk = 'Clipboard not available — select the script below.';
+            setTimeout(function () { self.pipelineCopyOk = ''; }, 4000);
+          }
+        },
+
+        persist: function () {
+          try {
+            localStorage.setItem(STORAGE_KEY, JSON.stringify(this.doc));
+          } catch (e) { /* ignore */ }
+        },
+
+        get slide() {
+          return this.doc.slides[this.currentIndex] || this.doc.slides[0];
+        },
+
+        currentSlideIsVideo: function () {
+          var s = this.slide;
+          return !!(s && s.mediaKind === 'video');
+        },
+
+        slideDurationSec: function () {
+          var s = Number(this.videoSeconds);
+          if (isNaN(s) || s < 0.5) {
+            s = 3;
+          }
+          if (s > 120) {
+            s = 120;
+          }
+          return s;
+        },
+
+        snapTimelineToCurrentSlide: function () {
+          this.carouselTimelineSec = 0;
+        },
+
+        goToSlide: function (i) {
+          if (i < 0 || i >= this.doc.slides.length) {
+            return;
+          }
+          this.carouselStop();
+          this.currentIndex = i;
+          this.snapTimelineToCurrentSlide();
+        },
+
+        carouselGoPrev: function () {
+          this.carouselStop();
+          this.currentIndex = Math.max(0, this.currentIndex - 1);
+          this.snapTimelineToCurrentSlide();
+        },
+
+        carouselGoNext: function () {
+          this.carouselStop();
+          this.currentIndex = Math.min(this.doc.slides.length - 1, this.currentIndex + 1);
+          this.snapTimelineToCurrentSlide();
+        },
+
+        onCarouselScrubInput: function (e) {
+          this.carouselStop();
+          var t = parseFloat(e.target.value);
+          if (isNaN(t)) {
+            return;
+          }
+          var total = this.slideDurationSec();
+          if (t < 0) {
+            t = 0;
+          }
+          if (t > total) {
+            t = total;
+          }
+          this.carouselTimelineSec = t;
+        },
+
+        formatCarouselClock: function (sec) {
+          var s = Math.max(0, sec);
+          var m = Math.floor(s / 60);
+          var r = s - m * 60;
+          var whole = Math.floor(r);
+          var frac = Math.round((r - whole) * 10);
+          if (frac >= 10) {
+            whole++;
+            frac = 0;
+          }
+          var secPart = String(whole).padStart(2, '0');
+          if (frac > 0) {
+            secPart += '.' + frac;
+          }
+          return m + ':' + secPart;
+        },
+
+        carouselTimeLabel: function () {
+          var d = this.slideDurationSec();
+          return this.formatCarouselClock(this.carouselTimelineSec)
+            + ' / '
+            + this.formatCarouselClock(d);
+        },
+
+        carouselScrubFillPct: function () {
+          var tot = this.slideDurationSec();
+          if (tot <= 0) {
+            return 0;
+          }
+          return Math.min(100, (this.carouselTimelineSec / tot) * 100);
+        },
+
+        carouselStop: function () {
+          this.carouselPlaying = false;
+          if (this.carouselRafId != null) {
+            cancelAnimationFrame(this.carouselRafId);
+            this.carouselRafId = null;
+          }
+        },
+
+        carouselPlayToggle: function () {
+          var self = this;
+          if (this.carouselPlaying) {
+            this.carouselStop();
+            return;
+          }
+          if (this.doc.slides.length < 1) {
+            return;
+          }
+          if (!this.currentSlideIsVideo()) {
+            return;
+          }
+          var seg = this.slideDurationSec();
+          if (this.carouselTimelineSec >= seg - 0.04) {
+            this.carouselTimelineSec = 0;
+          }
+          this.carouselPlaying = true;
+          var last = performance.now();
+          function tick(now) {
+            if (!self.carouselPlaying) {
+              return;
+            }
+            var dt = (now - last) / 1000;
+            last = now;
+            var total = self.slideDurationSec();
+            self.carouselTimelineSec = Math.min(self.carouselTimelineSec + dt, total);
+            var cur = self.doc.slides[self.currentIndex];
+            if (!cur || cur.mediaKind !== 'video') {
+              self.carouselStop();
+              return;
+            }
+            if (self.carouselTimelineSec >= total - 0.02) {
+              self.carouselStop();
+              return;
+            }
+            self.carouselRafId = requestAnimationFrame(tick);
+          }
+          this.carouselRafId = requestAnimationFrame(tick);
+        },
+
+        setPalette: function (name) {
+          applyPalette(this.doc, name);
+        },
+
+        setCustomMode: function () {
+          this.doc.config.theme.isCustom = true;
+        },
+
+        moveSlide: function (i, delta) {
+          const j = i + delta;
+          if (j < 0 || j >= this.doc.slides.length) return;
+          const arr = this.doc.slides;
+          const tmp = arr[i];
+          arr[i] = arr[j];
+          arr[j] = tmp;
+          if (this.currentIndex === i) this.currentIndex = j;
+          else if (this.currentIndex === j) this.currentIndex = i;
+          this.snapTimelineToCurrentSlide();
+        },
+
+        removeSlide: function (i) {
+          if (this.doc.slides.length <= 1) return;
+          this.carouselStop();
+          this.doc.slides.splice(i, 1);
+          if (this.currentIndex >= this.doc.slides.length) {
+            this.currentIndex = this.doc.slides.length - 1;
+          }
+          var tot = this.slideDurationSec();
+          if (this.carouselTimelineSec > tot) {
+            this.carouselTimelineSec = tot;
+          }
+          this.snapTimelineToCurrentSlide();
+        },
+
+        addSlide: function (kind) {
+          let s;
+          if (kind === 'intro') s = slideIntro();
+          else if (kind === 'content') s = slideContent();
+          else if (kind === 'outro') s = slideOutro();
+          else s = slideCommon();
+          this.carouselStop();
+          this.doc.slides.push(s);
+          this.currentIndex = this.doc.slides.length - 1;
+          this.snapTimelineToCurrentSlide();
+        },
+
+        loadSlideTemplatesFromStorage: function () {
+          try {
+            const raw = localStorage.getItem(SLIDE_TEMPLATES_KEY_V2);
+            if (raw) {
+              const o = JSON.parse(raw);
+              if (o && typeof o === 'object' && !Array.isArray(o)) {
+                this.slideTemplatesByAccount = o;
+                return;
+              }
+            }
+          } catch (e) { /* ignore */ }
+          try {
+            const leg = localStorage.getItem(SLIDE_TEMPLATES_KEY_LEGACY);
+            if (leg) {
+              const o = JSON.parse(leg);
+              if (o && o.intro && typeof o.intro === 'object') {
+                this.slideTemplatesByAccount = {
+                  _legacy: {
+                    intro: o.intro,
+                    outro: o.outro && typeof o.outro === 'object' ? o.outro : null,
+                  },
+                };
+                localStorage.setItem(SLIDE_TEMPLATES_KEY_V2, JSON.stringify(this.slideTemplatesByAccount));
+                return;
+              }
+            }
+          } catch (e2) { /* ignore */ }
+          this.slideTemplatesByAccount = {};
+        },
+
+        migrateLegacySlideTemplatesIfNeeded: function () {
+          try {
+            const map = this.slideTemplatesByAccount;
+            if (!map || !map._legacy) {
+              return;
+            }
+            const acc = this.igAccounts;
+            if (!acc || !acc.length) {
+              return;
+            }
+            const firstId = acc[0].id;
+            if (!firstId) {
+              return;
+            }
+            if (!map[firstId]) {
+              map[firstId] = {
+                intro: map._legacy.intro,
+                outro: map._legacy.outro,
+              };
+            }
+            delete map._legacy;
+            localStorage.setItem(SLIDE_TEMPLATES_KEY_V2, JSON.stringify(map));
+          } catch (e) { /* ignore */ }
+        },
+
+        assignSlideTemplatesFromAccount: function () {
+          const key = this.garageIgId || '_';
+          const map = this.slideTemplatesByAccount || {};
+          const entry = map[key] || {};
+          this.slideTemplates.intro = entry.intro && typeof entry.intro === 'object' ? entry.intro : null;
+          this.slideTemplates.outro = entry.outro && typeof entry.outro === 'object' ? entry.outro : null;
+        },
+
+        persistSlideTemplates: function () {
+          try {
+            const key = this.garageIgId || '_';
+            if (!this.slideTemplatesByAccount || typeof this.slideTemplatesByAccount !== 'object') {
+              this.slideTemplatesByAccount = {};
+            }
+            if (!this.slideTemplatesByAccount[key]) {
+              this.slideTemplatesByAccount[key] = {};
+            }
+            this.slideTemplatesByAccount[key].intro = this.slideTemplates.intro;
+            this.slideTemplatesByAccount[key].outro = this.slideTemplates.outro;
+            localStorage.setItem(SLIDE_TEMPLATES_KEY_V2, JSON.stringify(this.slideTemplatesByAccount));
+          } catch (e) { /* ignore */ }
+        },
+
+        onGarageIgScopeChange: function () {
+          this.assignSlideTemplatesFromAccount();
+          if (window.__FF_USER__) {
+            this.refreshMediaLibrary();
+          }
+        },
+
+        igAccountScopeLabel: function () {
+          const id = this.garageIgId;
+          if (!id || !Array.isArray(this.igAccounts)) {
+            return '';
+          }
+          for (let i = 0; i < this.igAccounts.length; i++) {
+            const a = this.igAccounts[i];
+            if (a && a.id === id) {
+              const u = a.username || a.instagram_user_id || a.id;
+              return u ? '@' + u : id;
+            }
+          }
+          return id;
+        },
+
+        flashTemplateMsg: function (msg) {
+          const self = this;
+          this.templateMsg = msg;
+          if (this._templateMsgTimer) {
+            clearTimeout(this._templateMsgTimer);
+          }
+          this._templateMsgTimer = setTimeout(function () {
+            self.templateMsg = '';
+          }, 2500);
+        },
+
+        onMediaDragStart: function (e, url) {
+          if (!url || !e.dataTransfer) {
+            return;
+          }
+          let u = String(url).trim();
+          try {
+            u = new URL(u, window.location.href).href;
+          } catch (err) {
+            return;
+          }
+          try {
+            e.dataTransfer.setData('text/plain', u);
+            e.dataTransfer.setData('text/uri-list', u);
+          } catch (err2) {
+            /* ignore */
+          }
+          e.dataTransfer.effectAllowed = 'copy';
+        },
+
+        onTemplateImageDrop: function (e, which) {
+          let url = '';
+          if (e.dataTransfer) {
+            try {
+              url = e.dataTransfer.getData('text/plain') || e.dataTransfer.getData('text/uri-list') || '';
+            } catch (err) {
+              url = '';
+            }
+          }
+          url = String(url).split('\n')[0].trim();
+          if (!url) {
+            this.flashTemplateMsg('Drop an image from the Media tab.');
+            return;
+          }
+          try {
+            url = new URL(url, window.location.href).href;
+          } catch (err2) {
+            this.flashTemplateMsg('Invalid URL.');
+            return;
+          }
+          if (!/^https?:\/\//i.test(url)) {
+            this.flashTemplateMsg('Use an http(s) image URL from Media.');
+            return;
+          }
+          const slide = slideFromImageUrl(url);
+          this.carouselStop();
+          if (which === 'intro') {
+            this.slideTemplates.intro = cloneSlideForDoc(slide);
+            this.flashTemplateMsg('Intro template set from image.');
+          } else {
+            this.slideTemplates.outro = cloneSlideForDoc(slide);
+            this.flashTemplateMsg('Outro template set from image.');
+          }
+          this.persistSlideTemplates();
+        },
+
+        exportJson: function () {
+          const blob = new Blob([JSON.stringify(this.doc, null, 2)], {
+            type: 'application/json',
+          });
+          const a = document.createElement('a');
+          a.href = URL.createObjectURL(blob);
+          a.download = (this.doc.filename || 'carousel').replace(/\s+/g, '-') + '.json';
+          a.click();
+          URL.revokeObjectURL(a.href);
+        },
+
+        onImportFile: function (e) {
+          this.importError = '';
+          const file = e.target.files && e.target.files[0];
+          if (!file) return;
+          const reader = new FileReader();
+          const self = this;
+          reader.onload = function () {
+            try {
+              const parsed = JSON.parse(String(reader.result));
+              if (!parsed.slides || !parsed.config) {
+                self.importError = 'Invalid file: need slides and config.';
+                return;
+              }
+              self.doc = parsed;
+              normalizeDocSlidesMedia(self.doc);
+              self.currentIndex = 0;
+              self.carouselStop();
+              self.carouselTimelineSec = 0;
+            } catch (err) {
+              self.importError = 'Could not parse JSON.';
+            }
+          };
+          reader.readAsText(file);
+          e.target.value = '';
+        },
+
+        ffScriptPath: function () {
+          return typeof window.__FF_SCRIPT__ === 'string' && window.__FF_SCRIPT__ !== ''
+            ? window.__FF_SCRIPT__
+            : (window.location.pathname || '/index.php');
+        },
+
+        garageFmtSize: function (n) {
+          const x = typeof n === 'number' ? n : parseInt(n, 10) || 0;
+          if (x < 1024) return x + ' B';
+          if (x < 1048576) return (x / 1024).toFixed(1) + ' KB';
+          return (x / 1048576).toFixed(1) + ' MB';
+        },
+
+        formatIgScheduleWhen: function (iso) {
+          if (!iso) {
+            return '';
+          }
+          const d = new Date(iso);
+          if (isNaN(d.getTime())) {
+            return String(iso);
+          }
+          try {
+            return d.toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' });
+          } catch (e) {
+            return d.toISOString();
+          }
+        },
+
+        igScheduleAccountLabel: function (sid) {
+          const id = String(sid || '');
+          const acc = Array.isArray(this.igAccounts) ? this.igAccounts : [];
+          for (let i = 0; i < acc.length; i++) {
+            if (acc[i] && String(acc[i].id) === id) {
+              const a = acc[i];
+              return '@' + (a.username || a.instagram_user_id || a.id);
+            }
+          }
+          return id || '—';
+        },
+
+        refreshInstagramSchedules: async function () {
+          this.igScheduleErr = '';
+          if (!window.__FF_USER__) {
+            this.igSchedules = [];
+            return;
+          }
+          this.igScheduleLoading = true;
+          try {
+            const path = this.ffScriptPath();
+            const res = await fetch(path + '?action=list_instagram_schedules', { credentials: 'same-origin' });
+            const data = await res.json().catch(function () { return {}; });
+            if (!res.ok) {
+              throw new Error((data && data.error) ? String(data.error) : ('HTTP ' + res.status));
+            }
+            this.igSchedules = Array.isArray(data.items) ? data.items : [];
+          } catch (err) {
+            this.igScheduleErr = err && err.message ? err.message : String(err);
+            this.igSchedules = [];
+          } finally {
+            this.igScheduleLoading = false;
+          }
+        },
+
+        scheduleInstagramCarousel: async function () {
+          this.igScheduleErr = '';
+          this.igScheduleMsg = '';
+          if (!this.garageIgId) {
+            this.igScheduleErr = 'Choose a linked Instagram account.';
+            return;
+          }
+          const raw = (this.igScheduleAt || '').trim();
+          if (!raw) {
+            this.igScheduleErr = 'Choose date and time.';
+            return;
+          }
+          const d = new Date(raw);
+          if (isNaN(d.getTime())) {
+            this.igScheduleErr = 'Invalid date and time.';
+            return;
+          }
+          const scheduledAt = d.toISOString();
+          this.igScheduleLoading = true;
+          try {
+            const path = this.ffScriptPath();
+            const res = await fetch(path + '?action=schedule_instagram_carousel', {
+              method: 'POST',
+              credentials: 'same-origin',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                social_account_id: this.garageIgId,
+                caption: this.igScheduleCaption || '',
+                scheduled_at: scheduledAt,
+                doc: this.doc,
+              }),
+            });
+            const data = await res.json().catch(function () { return {}; });
+            if (!res.ok) {
+              throw new Error((data && data.error) ? String(data.error) : ('HTTP ' + res.status));
+            }
+            const n = data.image_count != null ? data.image_count : '?';
+            this.igScheduleMsg = 'Scheduled (' + n + ' image' + (n === 1 ? '' : 's') + ').';
+            await this.refreshInstagramSchedules();
+            await this.refreshMediaLibrary();
+          } catch (err) {
+            this.igScheduleErr = err && err.message ? err.message : String(err);
+          } finally {
+            this.igScheduleLoading = false;
+          }
+        },
+
+        cancelInstagramSchedule: async function (id) {
+          if (!id) {
+            return;
+          }
+          if (!window.confirm('Cancel this scheduled Instagram post?')) {
+            return;
+          }
+          this.igScheduleErr = '';
+          this.igScheduleMsg = '';
+          this.igScheduleLoading = true;
+          try {
+            const path = this.ffScriptPath();
+            const res = await fetch(path + '?action=cancel_instagram_schedule', {
+              method: 'POST',
+              credentials: 'same-origin',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ id: String(id) }),
+            });
+            const data = await res.json().catch(function () { return {}; });
+            if (!res.ok) {
+              throw new Error((data && data.error) ? String(data.error) : ('HTTP ' + res.status));
+            }
+            this.igScheduleMsg = 'Cancelled.';
+            await this.refreshInstagramSchedules();
+          } catch (err) {
+            this.igScheduleErr = err && err.message ? err.message : String(err);
+          } finally {
+            this.igScheduleLoading = false;
+          }
+        },
+
+        refreshMediaLibrary: async function () {
+          this.mediaErr = '';
+          if (!window.__FF_USER__) {
+            this.mediaPbInput = [];
+            this.mediaPbOutput = [];
+            this.mediaGarage = [];
+            return;
+          }
+          this.mediaLoading = true;
+          try {
+            const path = this.ffScriptPath();
+            let url = path + '?action=media_library';
+            if (this.garageIgId) {
+              url += '&social_account_id=' + encodeURIComponent(this.garageIgId);
+            }
+            const res = await fetch(url, { credentials: 'same-origin' });
+            const data = await res.json().catch(function () { return {}; });
+            if (!res.ok) {
+              const base = (data && data.error) ? String(data.error) : ('HTTP ' + res.status);
+              const detail = (data && data.detail) ? (' — ' + String(data.detail)) : '';
+              throw new Error(base + detail);
+            }
+            this.mediaPbInput = Array.isArray(data.input_media) ? data.input_media : [];
+            this.mediaPbOutput = Array.isArray(data.output_media) ? data.output_media : [];
+            const g = data.garage && typeof data.garage === 'object' ? data.garage : {};
+            this.mediaGarage = Array.isArray(g.items) ? g.items : [];
+            const errParts = [];
+            const pe = data.errors && typeof data.errors === 'object' ? data.errors : null;
+            if (pe && pe.input_media) {
+              errParts.push('Input media: ' + String(pe.input_media));
+            }
+            if (pe && pe.output_media) {
+              errParts.push('Output (PocketBase): ' + String(pe.output_media));
+            }
+            if (data.garage && data.garage.error) {
+              const gErr = String(data.garage.error);
+              if (!pe || !pe.input_media || gErr !== String(pe.input_media)) {
+                errParts.push('Garage: ' + gErr);
+              }
+            }
+            this.mediaErr = errParts.join(' ');
+          } catch (err) {
+            this.mediaErr = err && err.message ? err.message : String(err);
+            this.mediaPbInput = [];
+            this.mediaPbOutput = [];
+            this.mediaGarage = [];
+          } finally {
+            this.mediaLoading = false;
+          }
+        },
+
+        garageUploadFile: async function (e) {
+          this.mediaErr = '';
+          const inp = e && e.target;
+          const file = inp && inp.files && inp.files[0];
+          if (!file || !this.garageIgId) {
+            if (inp) inp.value = '';
+            return;
+          }
+          this.garageUploading = true;
+          try {
+            const fd = new FormData();
+            fd.append('social_account_id', this.garageIgId);
+            fd.append('file', file);
+            const path = this.ffScriptPath();
+            const res = await fetch(path + '?action=garage_upload', {
+              method: 'POST',
+              credentials: 'same-origin',
+              body: fd,
+            });
+            const data = await res.json().catch(function () { return {}; });
+            if (!res.ok) {
+              throw new Error(data.error || ('HTTP ' + res.status));
+            }
+            await this.refreshMediaLibrary();
+          } catch (err) {
+            this.mediaErr = err && err.message ? err.message : String(err);
+          } finally {
+            this.garageUploading = false;
+            if (inp) inp.value = '';
+          }
+        },
+
+        garageDeleteRel: async function (rel) {
+          this.mediaErr = '';
+          if (!rel || !this.garageIgId) return;
+          if (!window.confirm('Delete ' + rel + ' from Garage?')) return;
+          this.mediaLoading = true;
+          try {
+            const path = this.ffScriptPath();
+            const res = await fetch(path + '?action=garage_delete', {
+              method: 'POST',
+              credentials: 'same-origin',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ social_account_id: this.garageIgId, key: rel }),
+            });
+            const data = await res.json().catch(function () { return {}; });
+            if (!res.ok) {
+              throw new Error(data.error || ('HTTP ' + res.status));
+            }
+            await this.refreshMediaLibrary();
+          } catch (err) {
+            this.mediaErr = err && err.message ? err.message : String(err);
+          } finally {
+            this.mediaLoading = false;
+          }
+        },
+
+        generateAi: async function () {
+          this.aiError = '';
+          if (!this.aiPrompt.trim()) {
+            this.aiError = 'Enter a topic or outline.';
+            return;
+          }
+          this.aiLoading = true;
+          try {
+            const genBody = { prompt: this.aiPrompt };
+            if (this.garageIgId) {
+              genBody.social_account_id = this.garageIgId;
+            }
+            const res = await fetch(GENERATE_URL, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              credentials: 'same-origin',
+              body: JSON.stringify(genBody),
+            });
+            const rawTxt = await res.text();
+            let data = {};
+            if (rawTxt) {
+              try {
+                data = JSON.parse(rawTxt);
+              } catch (parseErr) {
+                this.aiError = cgNonJsonApiError(res, rawTxt, 'Generate slides');
+                return;
+              }
+            }
+            if (!res.ok) {
+              this.aiError = (data && data.error) ? data.error : ('HTTP ' + res.status);
+              return;
+            }
+            const normalized = normalizeAiSlides(data.slides);
+            if (!normalized || !normalized.length) {
+              this.aiError = 'No slides returned.';
+              return;
+            }
+            this.doc.slides = normalized;
+            this.currentIndex = 0;
+            this.carouselStop();
+            this.carouselTimelineSec = 0;
+            this.aiPrompt = '';
+          } catch (err) {
+            this.aiError = (err && err.message) ? err.message : 'Network error (fetch failed).';
+          } finally {
+            this.aiLoading = false;
+          }
+        },
+
+        onImgGenFile: function (e) {
+          this.imgGenError = '';
+          const f = e.target.files && e.target.files[0];
+          if (!f) {
+            this.imgGenFileB64 = '';
+            this.imgGenFileMime = '';
+            return;
+          }
+          const self = this;
+          const reader = new FileReader();
+          reader.onload = function () {
+            const s = String(reader.result || '');
+            const m = /^data:([^;]+);base64,(.+)$/i.exec(s);
+            if (m) {
+              self.imgGenFileMime = m[1].trim();
+              self.imgGenFileB64 = m[2].replace(/\s/g, '');
+            } else {
+              self.imgGenFileB64 = '';
+              self.imgGenFileMime = '';
+            }
+          };
+          reader.readAsDataURL(f);
+        },
+
+        generateImageAi: async function () {
+          this.imgGenError = '';
+          this.imgGenResultUrl = '';
+          if (!IMAGE_GEN_URL) {
+            this.imgGenError = 'Image generation URL not configured.';
+            return;
+          }
+          const prompt = (this.imgGenPrompt || '').trim();
+          if (!prompt) {
+            this.imgGenError = 'Enter an image prompt.';
+            return;
+          }
+          this.imgGenLoading = true;
+          try {
+            const payload = {
+              prompt: prompt,
+              aspect_ratio: this.imgGenAspect || '4:5',
+              resolution: this.imgGenResolution || '2K',
+            };
+            const urlHint = (this.imgGenUrl || '').trim();
+            if (urlHint && /^https?:\/\//i.test(urlHint)) {
+              payload.image_url = urlHint;
+            }
+            if (this.imgGenFileB64) {
+              payload.image_base64 = this.imgGenFileB64;
+              payload.image_mime = this.imgGenFileMime || 'image/jpeg';
+            }
+            if (this.garageIgId) {
+              payload.social_account_id = this.garageIgId;
+            }
+            const res = await fetch(IMAGE_GEN_URL, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              credentials: 'same-origin',
+              body: JSON.stringify(payload),
+            });
+            const rawTxt = await res.text();
+            let data = {};
+            if (rawTxt) {
+              try {
+                data = JSON.parse(rawTxt);
+              } catch (parseErr) {
+                this.imgGenError = cgNonJsonApiError(res, rawTxt, 'Image generation');
+                return;
+              }
+            }
+            if (!res.ok) {
+              this.imgGenError = data.error || ('HTTP ' + res.status);
+              return;
+            }
+            if (!data.image_url && !data.public_image_url) {
+              this.imgGenError = 'No image URL in response.';
+              return;
+            }
+            this.imgGenResultUrl = data.public_image_url || data.image_url;
+          } catch (err) {
+            this.imgGenError = (err && err.message) ? err.message : 'Network error (fetch failed).';
+          } finally {
+            this.imgGenLoading = false;
+          }
+        },
+
+        applyImgGenToCurrentSlide: function () {
+          if (!this.imgGenResultUrl || !this.slide) {
+            return;
+          }
+          this.applyContentImageUrl(this.imgGenResultUrl);
+        },
+
+        onImgGenDragStart: function (e) {
+          if (!this.imgGenResultUrl || !e.dataTransfer) {
+            return;
+          }
+          this.dragImgGenUrl = this.imgGenResultUrl;
+          if (typeof window !== 'undefined') {
+            window.__FF_DRAG_AI_IMG_URL__ = this.imgGenResultUrl;
+          }
+          e.dataTransfer.setData('text/plain', this.imgGenResultUrl);
+          e.dataTransfer.setData('text/uri-list', this.imgGenResultUrl);
+          e.dataTransfer.effectAllowed = 'copy';
+        },
+
+        onImgGenDragEnd: function () {
+          this.dragImgGenUrl = '';
+          setTimeout(function () {
+            if (typeof window !== 'undefined') window.__FF_DRAG_AI_IMG_URL__ = '';
+          }, 150);
+        },
+
+        resolvePreviewDropUrl: function (e) {
+          var url = '';
+          if (typeof window !== 'undefined' && window.__FF_DRAG_AI_IMG_URL__) {
+            url = window.__FF_DRAG_AI_IMG_URL__;
+          }
+          if (!url) url = this.dragImgGenUrl || '';
+          if (!url && e.dataTransfer) {
+            try {
+              url = e.dataTransfer.getData('text/plain')
+                || e.dataTransfer.getData('text/uri-list')
+                || e.dataTransfer.getData('URL')
+                || '';
+            } catch (err) {
+              return '';
+            }
+          }
+          url = String(url).split('\n')[0].trim();
+          if (!url || !/^https?:\/\//i.test(url)) {
+            return '';
+          }
+          return url;
+        },
+
+        onPreviewDragEnter: function (e) {
+          e.preventDefault();
+          this.previewDropActive = true;
+        },
+
+        onPreviewDragLeave: function (e) {
+          e.preventDefault();
+          const rect = e.currentTarget.getBoundingClientRect();
+          const x = e.clientX;
+          const y = e.clientY;
+          if (x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom) {
+            return;
+          }
+          this.previewDropActive = false;
+        },
+
+        ensureContentImageOnSlide: function () {
+          if (!this.slide) {
+            return;
+          }
+          const els = this.slide.elements || [];
+          for (let i = 0; i < els.length; i++) {
+            if (els[i] && (els[i].type === 'ContentImage' || els[i].type === 'Image')) {
+              return;
+            }
+          }
+          els.push(defaultContentImage());
+        },
+
+        ensureContentImageStyle: function (el) {
+          if (!el || (el.type !== 'ContentImage' && el.type !== 'Image')) {
+            return;
+          }
+          if (!el.style || typeof el.style !== 'object') {
+            el.style = {};
+          }
+          if (typeof el.style.imgScale !== 'number' || el.style.imgScale <= 0) {
+            el.style.imgScale = 100;
+          }
+          if (el.style.imgScale > 400) {
+            el.style.imgScale = 400;
+          }
+          if (typeof el.style.imgRotateDeg !== 'number') {
+            el.style.imgRotateDeg = 0;
+          }
+          if (typeof el.style.imgPanX !== 'number') {
+            el.style.imgPanX = 0;
+          }
+          if (typeof el.style.imgPanY !== 'number') {
+            el.style.imgPanY = 0;
+          }
+        },
+
+        nudgeContentImgScale: function (el, delta) {
+          this.ensureContentImageStyle(el);
+          const cur = Number(el.style.imgScale) || 100;
+          el.style.imgScale = Math.round(Math.max(25, Math.min(400, cur + delta)));
+        },
+
+        applyContentImageUrl: function (url) {
+          url = String(url || '').trim().split('\n')[0];
+          if (!url || !this.slide) {
+            return;
+          }
+          try {
+            url = new URL(url, window.location.href).href;
+          } catch (err) {
+            return;
+          }
+          if (!/^https?:\/\//i.test(url)) {
+            return;
+          }
+          this.ensureContentImageOnSlide();
+          const els = this.slide.elements || [];
+          for (let i = 0; i < els.length; i++) {
+            const el = els[i];
+            if (el && (el.type === 'ContentImage' || el.type === 'Image')) {
+              if (!el.source) {
+                el.source = { src: '', type: 'URL' };
+              }
+              el.source.src = url;
+              el.source.type = 'URL';
+              this.ensureContentImageStyle(el);
+              return;
+            }
+          }
+        },
+
+        resetContentImageTransform: function (el) {
+          this.ensureContentImageStyle(el);
+          el.style.imgScale = 100;
+          el.style.imgRotateDeg = 0;
+          el.style.imgPanX = 0;
+          el.style.imgPanY = 0;
+        },
+
+        clearContentImage: function (el) {
+          if (!el || (el.type !== 'ContentImage' && el.type !== 'Image')) {
+            return;
+          }
+          this.ensureContentImageStyle(el);
+          if (!el.source) {
+            el.source = { src: '', type: 'URL' };
+          } else {
+            el.source.src = '';
+            el.source.type = 'URL';
+          }
+          this.resetContentImageTransform(el);
+          this.carouselStop();
+        },
+
+        contentImageTransformStyle: function (el) {
+          this.ensureContentImageStyle(el);
+          const st = el.style;
+          const scale = st.imgScale / 100;
+          const rot = st.imgRotateDeg;
+          const px = st.imgPanX;
+          const py = st.imgPanY;
+          return {
+            transform: 'translate(' + px + 'px, ' + py + 'px) rotate(' + rot + 'deg) scale(' + scale + ')',
+            transformOrigin: 'center center',
+          };
+        },
+
+        slideHasContentImageWithSrc: function () {
+          const els = (this.slide && this.slide.elements) || [];
+          return els.some(function (el) {
+            return el && (el.type === 'ContentImage' || el.type === 'Image')
+              && el.source && el.source.src;
+          });
+        },
+
+        slideHasContentImageElement: function () {
+          const els = (this.slide && this.slide.elements) || [];
+          return els.some(function (el) {
+            return el && (el.type === 'ContentImage' || el.type === 'Image');
+          });
+        },
+
+        removeContentImageElementAt: function (ei) {
+          if (!this.slide || !Array.isArray(this.slide.elements)) {
+            return;
+          }
+          const i = typeof ei === 'number' ? ei : parseInt(ei, 10);
+          if (isNaN(i) || i < 0 || i >= this.slide.elements.length) {
+            return;
+          }
+          const el = this.slide.elements[i];
+          if (!el || (el.type !== 'ContentImage' && el.type !== 'Image')) {
+            return;
+          }
+          this.carouselStop();
+          this.slide.elements.splice(i, 1);
+        },
+
+        addContentImageElement: function () {
+          if (!this.slide) {
+            return;
+          }
+          if (!Array.isArray(this.slide.elements)) {
+            this.slide.elements = [];
+          }
+          this.carouselStop();
+          this.slide.elements.push(defaultContentImage());
+        },
+
+        contentImgPointerDown: function (ei, ev) {
+          if (ev.button !== 0 || !this.slide) {
+            return;
+          }
+          const el = this.slide.elements[ei];
+          if (!el || (el.type !== 'ContentImage' && el.type !== 'Image') || !el.source || !el.source.src) {
+            return;
+          }
+          ev.preventDefault();
+          if (typeof ev.target.setPointerCapture === 'function' && ev.pointerId != null) {
+            try {
+              ev.target.setPointerCapture(ev.pointerId);
+            } catch (err) { /* ignore */ }
+          }
+          this.ensureContentImageStyle(el);
+          const self = this;
+          const startX = ev.clientX;
+          const startY = ev.clientY;
+          const ox = el.style.imgPanX;
+          const oy = el.style.imgPanY;
+          const cap = 220;
+          function move(e) {
+            const dx = e.clientX - startX;
+            const dy = e.clientY - startY;
+            el.style.imgPanX = Math.round(Math.max(-cap, Math.min(cap, ox + dx)));
+            el.style.imgPanY = Math.round(Math.max(-cap, Math.min(cap, oy + dy)));
+          }
+          function up() {
+            window.removeEventListener('pointermove', move);
+            window.removeEventListener('pointerup', up);
+            window.removeEventListener('pointercancel', up);
+          }
+          window.addEventListener('pointermove', move);
+          window.addEventListener('pointerup', up);
+          window.addEventListener('pointercancel', up);
+        },
+
+        onContentImgWheel: function (ei, ev) {
+          if (!this.slide) {
+            return;
+          }
+          const el = this.slide.elements[ei];
+          if (!el || (el.type !== 'ContentImage' && el.type !== 'Image') || !el.source || !el.source.src) {
+            return;
+          }
+          ev.preventDefault();
+          this.ensureContentImageStyle(el);
+          const d = ev.deltaY;
+          if (ev.shiftKey) {
+            let r = el.style.imgRotateDeg - Math.sign(d) * 4;
+            el.style.imgRotateDeg = Math.max(-180, Math.min(180, r));
+          } else {
+            let s = el.style.imgScale - Math.sign(d) * 4;
+            el.style.imgScale = Math.max(25, Math.min(400, s));
+          }
+        },
+
+        previewStyle: function () {
+          const t = this.doc.config.theme;
+          return {
+            background: t.background,
+            color: t.primary,
+            '--cg-secondary': t.secondary,
+          };
+        },
+
+        titleFontFamily: function () {
+          return FONT_CSS[this.doc.config.fonts.font1] || FONT_CSS.DM_Serif_Display;
+        },
+
+        bodyFontFamily: function () {
+          return FONT_CSS[this.doc.config.fonts.font2] || FONT_CSS.DM_Sans;
+        },
+
+        elementStyle: function (el) {
+          const align =
+            el.style && el.style.align === 'Center'
+              ? 'center'
+              : el.style && el.style.align === 'Right'
+                ? 'right'
+                : 'left';
+          const size =
+            el.style && el.style.fontSize === 'Large'
+              ? '1.35rem'
+              : el.style && el.style.fontSize === 'Small'
+                ? '0.95rem'
+                : '1.1rem';
+          const fontWeight = '400';
+          if (el.type === 'Title') {
+            return {
+              textAlign: align,
+              fontSize: 'clamp(1.5rem, 4vw, 2.25rem)',
+              fontWeight: '600',
+              lineHeight: 1.15,
+              fontFamily: this.titleFontFamily(),
+            };
+          }
+          if (el.type === 'Subtitle') {
+            return {
+              textAlign: align,
+              fontSize: 'clamp(1.1rem, 2.5vw, 1.35rem)',
+              fontWeight: '500',
+              opacity: 0.92,
+              fontFamily: this.bodyFontFamily(),
+            };
+          }
+          return {
+            textAlign: align,
+            fontSize: size,
+            fontWeight: fontWeight,
+            lineHeight: 1.45,
+            opacity: 0.88,
+            fontFamily: this.bodyFontFamily(),
+          };
+        },
+
+        elementStyleThumb: function (el) {
+          const align =
+            el.style && el.style.align === 'Center'
+              ? 'center'
+              : el.style && el.style.align === 'Right'
+                ? 'right'
+                : 'left';
+          const ffTitle = this.titleFontFamily();
+          const ffBody = this.bodyFontFamily();
+          if (el.type === 'Title') {
+            return {
+              textAlign: align,
+              fontSize: '0.58rem',
+              fontWeight: '600',
+              lineHeight: 1.12,
+              fontFamily: ffTitle,
+            };
+          }
+          if (el.type === 'Subtitle') {
+            return {
+              textAlign: align,
+              fontSize: '0.48rem',
+              fontWeight: '500',
+              opacity: 0.92,
+              fontFamily: ffBody,
+            };
+          }
+          return {
+            textAlign: align,
+            fontSize: '0.42rem',
+            fontWeight: '400',
+            lineHeight: 1.35,
+            opacity: 0.88,
+            fontFamily: ffBody,
+          };
+        },
+      };
+    });
+  });
+})();
+    </script>
+    <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.14.3/dist/cdn.min.js"></script>
 </body>
 </html>
