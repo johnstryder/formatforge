@@ -28,6 +28,65 @@ if (is_readable($envFile)) {
     }
 }
 
+/**
+ * UTF-8 safe length/slice without relying on global mb_* polyfills (avoids FPM/opcache oddities).
+ * Uses ext-mbstring when loaded; otherwise UTF-8 code units via regex.
+ */
+function ff_mb_strlen(string $string): int
+{
+    if ($string === '') {
+        return 0;
+    }
+    if (extension_loaded('mbstring')) {
+        return mb_strlen($string);
+    }
+    if (preg_match_all('/./us', $string, $m) === false) {
+        return strlen($string);
+    }
+
+    return count($m[0]);
+}
+
+function ff_mb_substr(string $string, int $start, ?int $length = null): string
+{
+    if ($string === '') {
+        return '';
+    }
+    if (extension_loaded('mbstring')) {
+        return $length === null ? mb_substr($string, $start) : mb_substr($string, $start, $length);
+    }
+    if (preg_match_all('/./us', $string, $m) === false) {
+        return $length === null ? substr($string, $start) : substr($string, $start, (int) $length);
+    }
+    $chars = $m[0];
+    $n = count($chars);
+    if ($start < 0) {
+        $start = max(0, $n + $start);
+    }
+    if ($start >= $n) {
+        return '';
+    }
+    if ($length === null) {
+        return implode('', array_slice($chars, $start));
+    }
+
+    return implode('', array_slice($chars, $start, $length));
+}
+
+/** Raise PHP’s per-request wall clock for Playwright + Instagram Graph polling (FPM defaults are often 30s). */
+function ff_allow_long_request(int $seconds = 300): void
+{
+    if (function_exists('set_time_limit')) {
+        @set_time_limit($seconds);
+    }
+    @ini_set('max_execution_time', (string) $seconds);
+    $cur = (int) ini_get('max_execution_time');
+    // php_admin_value[max_execution_time] in the FPM pool overrides ini_set — worker still dies at 30s → nginx/Cloudflare 502.
+    if ($cur > 0 && $cur < min($seconds, 120)) {
+        error_log('FormatForge: max_execution_time is ' . $cur . 's after ff_allow_long_request(' . $seconds . '); set php_admin_value[max_execution_time]=' . $seconds . ' in php-fpm [www] (and reload php8.3-fpm). Cloudflare proxy also times out ~100s.');
+    }
+}
+
 /** @return string|false Value from env, or default when set and non-empty, or false when missing and no default. */
 function cg_env(string $key, string $default = ''): string|false
 {
@@ -57,6 +116,9 @@ function cg_parse_slides_json(string $content): ?array
 
     return $decoded['slides'];
 }
+
+/** Hard cap for AI-generated slide count (matches Instagram carousel maximum). */
+const FF_CAROUSEL_AI_SLIDES_MAX = 10;
 
 /**
  * Query action=… for API routes. Some stacks omit $_GET on POST; fall back to QUERY_STRING / REQUEST_URI.
@@ -163,7 +225,7 @@ $CONFIG = [
     'pocketbase_admin_url' => rtrim($pbPublicUrl, '/') . '/_/',
     'site_url' => $siteUrl,
     'site_name' => getenv('SITE_NAME') ?: 'FormatForge',
-    'app_version' => getenv('APP_VERSION') ?: 'v1.1.275',
+    'app_version' => getenv('APP_VERSION') ?: 'v1.1.295',
     'users_collection' => getenv('USERS_COLLECTION') ?: 'users',
     'fb_app_id' => getenv('FB_APP_ID') ?: '',
     'fb_app_secret' => getenv('FB_APP_SECRET') ?: '',
@@ -221,13 +283,24 @@ function pb_request(string $method, string $path, $data = null, ?string $token =
         CURLOPT_HTTPHEADER => $headers,
     ]);
     if ($data !== null) {
-        curl_setopt($ch, CURLOPT_POSTFIELDS, is_array($data) ? json_encode($data) : $data);
+        if (is_array($data)) {
+            $payload = json_encode($data, JSON_UNESCAPED_UNICODE | JSON_INVALID_UTF8_SUBSTITUTE);
+            if ($payload === false) {
+                curl_close($ch);
+
+                return ['code' => 0, 'body' => ['message' => 'Request JSON encode failed.'], 'raw' => '', 'curl_errno' => 0];
+            }
+            curl_setopt($ch, CURLOPT_POSTFIELDS, $payload);
+        } else {
+            curl_setopt($ch, CURLOPT_POSTFIELDS, $data);
+        }
     }
     $res = curl_exec($ch);
     $code = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
     $errNo = curl_errno($ch);
     curl_close($ch);
-    $body = json_decode($res ?: '{}', true) ?? [];
+    $decoded = json_decode($res ?: '{}', true);
+    $body = is_array($decoded) ? $decoded : [];
 
     return ['code' => $code, 'body' => $body, 'raw' => $res ?: '', 'curl_errno' => $errNo];
 }
@@ -1202,6 +1275,414 @@ function ff_carousel_doc_collect_raw_image_srcs(array $doc): array
     return array_values(array_unique($raws));
 }
 
+/**
+ * Whether any slide is a video segment (not supported for JPEG carousel export).
+ */
+function ff_carousel_doc_has_video_slides(array $doc): bool
+{
+    $slides = $doc['slides'] ?? null;
+    if (!is_array($slides)) {
+        return false;
+    }
+    foreach ($slides as $s) {
+        if (!is_array($s)) {
+            continue;
+        }
+        if (($s['mediaKind'] ?? '') === 'video') {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+/**
+ * Resolve an image src for headless Chromium: keep public https URLs; inline others as data: URLs using the signed-in session.
+ *
+ * @return array{ok: bool, src: string, error: string}
+ */
+function ff_playwright_resolved_image_src(string $raw, string $authHeader, ?string $pbUserId, int $maxInlineBytes): array
+{
+    $raw = trim($raw);
+    if ($raw === '') {
+        return ['ok' => true, 'src' => '', 'error' => ''];
+    }
+    if (str_starts_with($raw, 'data:')) {
+        return ['ok' => true, 'src' => $raw, 'error' => ''];
+    }
+    $pub = ff_instagram_public_https_image_url($raw, $pbUserId);
+    if ($pub !== '' && preg_match('#^https://#i', $pub)) {
+        return ['ok' => true, 'src' => $pub, 'error' => ''];
+    }
+    $fb = ff_ig_fetch_carousel_image_bytes($raw, $authHeader, $pbUserId);
+    if (!$fb['ok']) {
+        return ['ok' => false, 'src' => '', 'error' => $fb['error'] !== '' ? $fb['error'] : 'Image fetch failed'];
+    }
+    if (strlen($fb['bytes']) > $maxInlineBytes) {
+        return ['ok' => false, 'src' => '', 'error' => 'Image too large for slide render (' . (int) round(strlen($fb['bytes']) / 1048576) . ' MiB)'];
+    }
+    $mime = strtolower(trim($fb['content_type']));
+    if ($mime !== '' && !str_starts_with($mime, 'image/')) {
+        return ['ok' => false, 'src' => '', 'error' => 'Not an image (Content-Type: ' . $mime . ')'];
+    }
+    $mimeOut = $mime !== '' ? $mime : 'image/png';
+    $b64 = base64_encode($fb['bytes']);
+
+    return ['ok' => true, 'src' => 'data:' . $mimeOut . ';base64,' . $b64, 'error' => ''];
+}
+
+/**
+ * Deep-copy doc and replace image sources with public URLs or data URLs so Playwright can render without app cookies.
+ *
+ * @return array{ok: bool, doc: array, error: string}
+ */
+function ff_carousel_doc_materialize_images_for_playwright(array $doc, string $authHeader, ?string $pbUserId): array
+{
+    $maxInline = 15 * 1024 * 1024;
+    $json = json_encode($doc, JSON_UNESCAPED_UNICODE);
+    if (!is_string($json)) {
+        return ['ok' => false, 'doc' => [], 'error' => 'Could not encode carousel JSON'];
+    }
+    $out = json_decode($json, true);
+    if (!is_array($out)) {
+        return ['ok' => false, 'doc' => [], 'error' => 'Could not clone carousel JSON'];
+    }
+    $brand = &$out['config']['brand'];
+    if (is_array($brand)) {
+        $av = $brand['avatar']['source']['src'] ?? '';
+        if (is_string($av) && trim($av) !== '') {
+            $r = ff_playwright_resolved_image_src($av, $authHeader, $pbUserId, $maxInline);
+            if (!$r['ok']) {
+                return ['ok' => false, 'doc' => [], 'error' => 'Avatar image: ' . $r['error']];
+            }
+            if (!isset($brand['avatar']) || !is_array($brand['avatar'])) {
+                $brand['avatar'] = ['type' => 'Image', 'source' => ['src' => '', 'type' => 'URL'], 'style' => ['opacity' => 100]];
+            }
+            if (!isset($brand['avatar']['source']) || !is_array($brand['avatar']['source'])) {
+                $brand['avatar']['source'] = ['src' => '', 'type' => 'URL'];
+            }
+            $brand['avatar']['source']['src'] = $r['src'];
+        }
+    }
+    $slides = &$out['slides'];
+    if (!is_array($slides)) {
+        return ['ok' => true, 'doc' => $out, 'error' => ''];
+    }
+    foreach ($slides as $si => $_) {
+        if (!is_array($slides[$si])) {
+            continue;
+        }
+        $bg = &$slides[$si]['backgroundImage'];
+        if (is_array($bg)) {
+            $bs = $bg['source']['src'] ?? '';
+            if (is_string($bs) && trim($bs) !== '') {
+                $r = ff_playwright_resolved_image_src($bs, $authHeader, $pbUserId, $maxInline);
+                if (!$r['ok']) {
+                    return ['ok' => false, 'doc' => [], 'error' => 'Background image on slide ' . ($si + 1) . ': ' . $r['error']];
+                }
+                if (!isset($bg['source']) || !is_array($bg['source'])) {
+                    $bg['source'] = ['src' => '', 'type' => 'URL'];
+                }
+                $bg['source']['src'] = $r['src'];
+            }
+        }
+        $els = &$slides[$si]['elements'];
+        if (!is_array($els)) {
+            continue;
+        }
+        foreach ($els as $ei => $_el) {
+            if (!is_array($els[$ei])) {
+                continue;
+            }
+            $t = $els[$ei]['type'] ?? '';
+            if ($t !== 'ContentImage' && $t !== 'Image') {
+                continue;
+            }
+            $cs = $els[$ei]['source']['src'] ?? '';
+            if (!is_string($cs) || trim($cs) === '') {
+                continue;
+            }
+            $r = ff_playwright_resolved_image_src($cs, $authHeader, $pbUserId, $maxInline);
+            if (!$r['ok']) {
+                return ['ok' => false, 'doc' => [], 'error' => 'Content image on slide ' . ($si + 1) . ': ' . $r['error']];
+            }
+            if (!isset($els[$ei]['source']) || !is_array($els[$ei]['source'])) {
+                $els[$ei]['source'] = ['src' => '', 'type' => 'URL'];
+            }
+            $els[$ei]['source']['src'] = $r['src'];
+        }
+    }
+
+    return ['ok' => true, 'doc' => $out, 'error' => ''];
+}
+
+/**
+ * Run video-pipeline/render-ig-jpegs.mjs; returns sorted list of JPEG file paths.
+ *
+ * @return array{ok: bool, files: list<string>, error: string, detail: string}
+ */
+function ff_carousel_run_playwright_jpeg_render(array $docForPlaywright): array
+{
+    $base = ['ok' => false, 'files' => [], 'error' => '', 'detail' => ''];
+    $vp = __DIR__ . DIRECTORY_SEPARATOR . 'video-pipeline';
+    $script = $vp . DIRECTORY_SEPARATOR . 'render-ig-jpegs.mjs';
+    if (!is_file($script)) {
+        $base['error'] = 'Slide JPEG renderer missing. Deploy video-pipeline/render-ig-jpegs.mjs.';
+
+        return $base;
+    }
+    $node = trim((string) (getenv('FF_NODE_BIN') ?: ''));
+    if ($node === '') {
+        $node = 'node';
+    }
+    $tmpRoot = sys_get_temp_dir();
+    $uniq = 'ff_ig_jpg_' . bin2hex(random_bytes(8));
+    $workDir = $tmpRoot . DIRECTORY_SEPARATOR . $uniq;
+    if (!@mkdir($workDir, 0700, true) && !is_dir($workDir)) {
+        $base['error'] = 'Could not create temp directory for slide render.';
+
+        return $base;
+    }
+    $jsonPath = $workDir . DIRECTORY_SEPARATOR . 'carousel-doc.json';
+    $outDir = $workDir . DIRECTORY_SEPARATOR . 'out';
+    $enc = json_encode($docForPlaywright, JSON_UNESCAPED_UNICODE);
+    if ($enc === false || $enc === '') {
+        @unlink($jsonPath);
+        @rmdir($workDir);
+        $base['error'] = 'Could not serialize carousel for renderer.';
+
+        return $base;
+    }
+    if (strlen($enc) > 12 * 1024 * 1024) {
+        @rmdir($workDir);
+        $base['error'] = 'Carousel JSON too large for slide render.';
+
+        return $base;
+    }
+    file_put_contents($jsonPath, $enc);
+
+    $cmd = [$node, $script, $jsonPath, '--out-dir', $outDir];
+    $descriptorSpec = [0 => ['pipe', 'r'], 1 => ['pipe', 'w'], 2 => ['pipe', 'w']];
+    $pbBrowsers = trim((string) (getenv('FF_PLAYWRIGHT_BROWSERS_PATH') ?: getenv('PLAYWRIGHT_BROWSERS_PATH') ?: ''));
+    if ($pbBrowsers === '') {
+        $defBrowsers = __DIR__ . DIRECTORY_SEPARATOR . 'video-pipeline' . DIRECTORY_SEPARATOR . '.playwright-browsers';
+        if (is_dir($defBrowsers)) {
+            $pbBrowsers = $defBrowsers;
+        }
+    }
+    $savedPb = getenv('PLAYWRIGHT_BROWSERS_PATH');
+    if ($pbBrowsers !== '') {
+        putenv('PLAYWRIGHT_BROWSERS_PATH=' . $pbBrowsers);
+    }
+    try {
+        $proc = @proc_open($cmd, $descriptorSpec, $pipes, $vp, null, ['bypass_shell' => true]);
+        if (!is_resource($proc)) {
+            @unlink($jsonPath);
+            ff_carousel_rrmdir($workDir);
+            $base['error'] = 'Could not start Node/Playwright (is node on PATH?).';
+
+            return $base;
+        }
+        fclose($pipes[0]);
+        stream_set_blocking($pipes[1], true);
+        stream_set_blocking($pipes[2], true);
+        $stdout = (string) stream_get_contents($pipes[1]);
+        $stderr = (string) stream_get_contents($pipes[2]);
+        fclose($pipes[1]);
+        fclose($pipes[2]);
+        $code = proc_close($proc);
+
+        if ($code !== 0) {
+            ff_carousel_rrmdir($workDir);
+            $base['error'] = 'Playwright slide render failed (exit ' . $code . '). On the server run: cd video-pipeline && npm ci && PLAYWRIGHT_BROWSERS_PATH="$(pwd)/.playwright-browsers" npx playwright install chromium && chmod -R a+rX .playwright-browsers (PHP-FPM uses a different HOME than your shell unless you set FF_PLAYWRIGHT_BROWSERS_PATH).';
+            $base['detail'] = trim($stderr !== '' ? $stderr : $stdout);
+
+            return $base;
+        }
+        $line = trim($stdout);
+        $decoded = json_decode($line, true);
+        $files = [];
+        if (is_array($decoded) && !empty($decoded['ok']) && isset($decoded['files']) && is_array($decoded['files'])) {
+            foreach ($decoded['files'] as $p) {
+                if (is_string($p) && $p !== '' && is_file($p)) {
+                    $files[] = $p;
+                }
+            }
+        }
+        if ($files === []) {
+            $jpgs = glob($outDir . DIRECTORY_SEPARATOR . 'slide-*.jpg', GLOB_NOSORT) ?: [];
+            natsort($jpgs);
+            $files = array_values($jpgs);
+        }
+        if ($files === []) {
+            ff_carousel_rrmdir($workDir);
+            $base['error'] = 'Slide render produced no JPEG files.';
+            $base['detail'] = trim($stderr !== '' ? $stderr : $stdout);
+
+            return $base;
+        }
+        natsort($files);
+        $base['ok'] = true;
+        $base['files'] = array_values($files);
+        $base['detail'] = trim($stderr);
+
+        return $base;
+    } finally {
+        if ($pbBrowsers !== '') {
+            if ($savedPb !== false && $savedPb !== '') {
+                putenv('PLAYWRIGHT_BROWSERS_PATH=' . $savedPb);
+            } else {
+                putenv('PLAYWRIGHT_BROWSERS_PATH');
+            }
+        }
+    }
+}
+
+/** Best-effort recursive delete of a temp render directory. */
+function ff_carousel_rrmdir(string $dir): void
+{
+    if ($dir === '' || !is_dir($dir)) {
+        return;
+    }
+    $it = @scandir($dir);
+    if (!is_array($it)) {
+        return;
+    }
+    foreach ($it as $f) {
+        if ($f === '.' || $f === '..') {
+            continue;
+        }
+        $p = $dir . DIRECTORY_SEPARATOR . $f;
+        if (is_dir($p)) {
+            ff_carousel_rrmdir($p);
+        } else {
+            @unlink($p);
+        }
+    }
+    @rmdir($dir);
+}
+
+/**
+ * Legacy: one URL per unique raw image src (content + background). Does not flatten slides.
+ *
+ * @return array{ok: bool, urls: list<string>, error: string}
+ */
+function ff_carousel_doc_resolve_ig_image_urls_legacy(array $doc, string $authHeader, ?string $pbUserId): array
+{
+    $raws = ff_carousel_doc_collect_raw_image_srcs($doc);
+    if ($raws === []) {
+        return ['ok' => false, 'urls' => [], 'error' => 'No image URLs in this carousel. In the Slides tab, set a Content image or Background image URL on each slide (or add content-image blocks).'];
+    }
+    $needMat = false;
+    foreach ($raws as $raw) {
+        $u = ff_instagram_public_https_image_url($raw, $pbUserId);
+        if ($u === '' || !preg_match('#^https://#i', $u)) {
+            $needMat = true;
+            break;
+        }
+    }
+    if ($needMat && ff_ig_hmac_secret() === '') {
+        return ['ok' => false, 'urls' => [], 'error' => 'Set CRON_SECRET or IG_PUBLIC_IMAGE_SECRET so images can be hosted as signed HTTPS URLs for Instagram.'];
+    }
+    $urls = [];
+    foreach ($raws as $raw) {
+        $u = ff_instagram_public_https_image_url($raw, $pbUserId);
+        if ($u !== '' && preg_match('#^https://#i', $u)) {
+            $urls[] = $u;
+
+            continue;
+        }
+        $mat = ff_ig_materialize_signed_url_for_src($raw, $authHeader, $pbUserId);
+        if (!$mat['ok']) {
+            return ['ok' => false, 'urls' => [], 'error' => $mat['error'] !== '' ? $mat['error'] : 'Could not prepare image for Instagram.'];
+        }
+        $urls[] = $mat['url'];
+    }
+
+    return ['ok' => true, 'urls' => array_values(array_unique($urls)), 'error' => ''];
+}
+
+/**
+ * Render each still slide to JPEG (1080×1350), upload to PocketBase, return signed https URLs for Meta.
+ *
+ * @return array{ok: bool, urls: list<string>, error: string}
+ */
+function ff_carousel_doc_resolve_ig_jpeg_urls_from_render(array $doc, string $authHeader, ?string $pbUserId): array
+{
+    $slides = $doc['slides'] ?? null;
+    if (!is_array($slides) || $slides === []) {
+        return ['ok' => false, 'urls' => [], 'error' => 'Carousel has no slides.'];
+    }
+    if (count($slides) > 10) {
+        return ['ok' => false, 'urls' => [], 'error' => 'Instagram carousels allow at most 10 images; reduce slide count.'];
+    }
+    if (ff_carousel_doc_has_video_slides($doc)) {
+        return ['ok' => false, 'urls' => [], 'error' => 'Instagram JPEG scheduling supports still slides only. Change video slides to still or remove them.'];
+    }
+    if (ff_ig_hmac_secret() === '') {
+        return ['ok' => false, 'urls' => [], 'error' => 'Set CRON_SECRET or IG_PUBLIC_IMAGE_SECRET for hosted slide JPEG URLs.'];
+    }
+    $cronTok = trim((string) (getenv('FF_CRON_PB_TOKEN') ?: ''));
+    if ($cronTok === '') {
+        return ['ok' => false, 'urls' => [], 'error' => 'Set FF_CRON_PB_TOKEN so Instagram can fetch uploaded slide JPEGs.'];
+    }
+    if ($authHeader === null || trim((string) $authHeader) === '') {
+        return ['ok' => false, 'urls' => [], 'error' => 'Session required for slide render.'];
+    }
+    $mat = ff_carousel_doc_materialize_images_for_playwright($doc, $authHeader, $pbUserId);
+    if (!$mat['ok']) {
+        return ['ok' => false, 'urls' => [], 'error' => $mat['error'] !== '' ? $mat['error'] : 'Could not prepare images for slide render.'];
+    }
+    $render = ff_carousel_run_playwright_jpeg_render($mat['doc']);
+    if (!$render['ok']) {
+        $msg = $render['error'];
+        if ($render['detail'] !== '' && strlen($render['detail']) < 800) {
+            $msg .= ' — ' . $render['detail'];
+        }
+
+        return ['ok' => false, 'urls' => [], 'error' => $msg];
+    }
+    $cfg = $GLOBALS['CONFIG'];
+    $inpCol = (string) ($cfg['input_media_collection'] ?? 'input_media');
+    $urls = [];
+    $n = 0;
+    foreach ($render['files'] as $path) {
+        if (!is_readable($path)) {
+            return ['ok' => false, 'urls' => [], 'error' => 'Rendered JPEG missing on disk.'];
+        }
+        $bytes = @file_get_contents($path);
+        if ($bytes === false || $bytes === '') {
+            return ['ok' => false, 'urls' => [], 'error' => 'Could not read rendered JPEG.'];
+        }
+        if (strlen($bytes) > 25 * 1024 * 1024) {
+            return ['ok' => false, 'urls' => [], 'error' => 'Rendered slide file too large for upload.'];
+        }
+        $fname = 'ig_slide_' . gmdate('Ymd\THis\Z') . '_' . bin2hex(random_bytes(3)) . '_' . (++$n) . '.jpg';
+        $cr = ff_ig_pb_create_input_media_from_bytes($bytes, 'image/jpeg', $fname, $authHeader);
+        if (!$cr['ok']) {
+            return ['ok' => false, 'urls' => [], 'error' => $cr['error'] !== '' ? $cr['error'] : 'PocketBase upload of slide JPEG failed.'];
+        }
+        $probe = ff_pb_file_get_bytes($inpCol, $cr['record_id'], $cr['stored_filename'], $cronTok);
+        if (!$probe['ok']) {
+            return ['ok' => false, 'urls' => [], 'error' => 'FF_CRON_PB_TOKEN cannot read uploaded slide JPEG (check PocketBase rules / token).'];
+        }
+        $exp = time() + (86400 * 400);
+        $u = ff_ig_signed_public_image_url($inpCol, $cr['record_id'], $cr['stored_filename'], $exp);
+        if ($u === '' || !preg_match('#^https://#i', $u)) {
+            return ['ok' => false, 'urls' => [], 'error' => 'Could not build signed URL for slide JPEG (APP_URL must be https in production).'];
+        }
+        $urls[] = $u;
+    }
+    $firstPath = $render['files'][0] ?? '';
+    if (is_string($firstPath) && $firstPath !== '') {
+        $outDirReal = dirname($firstPath);
+        $workReal = dirname($outDirReal);
+        ff_carousel_rrmdir($workReal);
+    }
+
+    return ['ok' => true, 'urls' => $urls, 'error' => ''];
+}
+
 function ff_ig_hmac_secret(): string
 {
     $s = trim((string) (getenv('IG_PUBLIC_IMAGE_SECRET') ?: ''));
@@ -1477,6 +1958,188 @@ function ff_ig_fetch_carousel_image_bytes(string $raw, ?string $authHeader, ?str
     return $fail;
 }
 
+function ff_ig_image_bytes_looks_like_jpeg(string $b): bool
+{
+    return strlen($b) >= 3 && $b[0] === "\xFF" && $b[1] === "\xD8" && $b[2] === "\xFF";
+}
+
+/**
+ * Instagram feed publishing expects JPEG (see Meta image specs). Pass-through JPEG or re-encode via GD.
+ *
+ * @return array{ok: bool, bytes: string, error: string}
+ */
+function ff_ig_normalize_image_bytes_to_jpeg_for_ig(string $bytes): array
+{
+    if ($bytes === '') {
+        return ['ok' => false, 'bytes' => '', 'error' => 'Empty image data.'];
+    }
+    if (strlen($bytes) > 10 * 1024 * 1024) {
+        return ['ok' => false, 'bytes' => '', 'error' => 'Image too large before conversion (max ~10MB).'];
+    }
+    if (ff_ig_image_bytes_looks_like_jpeg($bytes)) {
+        return ['ok' => true, 'bytes' => $bytes, 'error' => ''];
+    }
+    if (!extension_loaded('gd')) {
+        return ['ok' => false, 'bytes' => '', 'error' => 'Instagram expects JPEG. This image is not JPEG; install/enable php-gd on the server to convert PNG/WebP automatically.'];
+    }
+    $im = @imagecreatefromstring($bytes);
+    if ($im === false) {
+        return ['ok' => false, 'bytes' => '', 'error' => 'Could not decode image (corrupt or unsupported format).'];
+    }
+    if (function_exists('imagepalettetotruecolor') && !imageistruecolor($im)) {
+        imagepalettetotruecolor($im);
+    }
+    imagealphablending($im, true);
+    imagesavealpha($im, false);
+    ob_start();
+    imagejpeg($im, null, 92);
+    $jpeg = (string) ob_get_clean();
+    imagedestroy($im);
+    if ($jpeg === '') {
+        return ['ok' => false, 'bytes' => '', 'error' => 'JPEG encode failed.'];
+    }
+    if (strlen($jpeg) > 8 * 1024 * 1024) {
+        return ['ok' => false, 'bytes' => '', 'error' => 'JPEG exceeds Instagram 8MB limit; simplify the image.'];
+    }
+
+    return ['ok' => true, 'bytes' => $jpeg, 'error' => ''];
+}
+
+/**
+ * @return array{ok: bool, bytes: string, error: string}
+ */
+function ff_ig_curl_fetch_public_image_url(string $url, int $maxBytes = 10485760, int $timeoutSec = 90): array
+{
+    $fail = ['ok' => false, 'bytes' => '', 'error' => ''];
+    $url = trim($url);
+    if ($url === '' || !preg_match('#^https://#i', $url)) {
+        $fail['error'] = 'Image URL must use HTTPS.';
+
+        return $fail;
+    }
+    $ch = curl_init($url);
+    if ($ch === false) {
+        $fail['error'] = 'Could not start download.';
+
+        return $fail;
+    }
+    curl_setopt_array($ch, [
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_FOLLOWLOCATION => true,
+        CURLOPT_MAXREDIRS => 5,
+        CURLOPT_TIMEOUT => $timeoutSec,
+        CURLOPT_SSL_VERIFYPEER => true,
+    ]);
+    $body = curl_exec($ch);
+    $code = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    curl_close($ch);
+    if ($code < 200 || $code >= 300 || !is_string($body) || $body === '') {
+        $fail['error'] = 'Could not download image (HTTP ' . $code . ').';
+
+        return $fail;
+    }
+    if (strlen($body) > $maxBytes) {
+        $fail['error'] = 'Image download exceeds ' . (int) round($maxBytes / 1048576) . 'MB.';
+
+        return $fail;
+    }
+
+    return ['ok' => true, 'bytes' => $body, 'error' => ''];
+}
+
+/**
+ * Non-JPEG files (WebP, PNG, …) are converted and re-hosted so Meta always fetches JPEG.
+ *
+ * @param  list<string>  $urls
+ * @return array{ok: bool, urls: list<string>, error: string}
+ */
+function ff_ig_publish_prepare_urls_jpeg_for_meta(array $urls, string $pbBearer): array
+{
+    $out = ['ok' => false, 'urls' => [], 'error' => ''];
+    $pbBearer = preg_replace('/^\s*Bearer\s+/i', '', trim($pbBearer));
+    if ($pbBearer === '') {
+        $out['error'] = 'Internal: PocketBase token missing for JPEG step.';
+
+        return $out;
+    }
+    if (ff_ig_hmac_secret() === '') {
+        $out['error'] = 'CRON_SECRET or IG_PUBLIC_IMAGE_SECRET required to sign re-hosted JPEG URLs.';
+
+        return $out;
+    }
+    $inpCol = (string) ($GLOBALS['CONFIG']['input_media_collection'] ?? 'input_media');
+    $exp = time() + (86400 * 400);
+    $n = 0;
+    foreach ($urls as $u) {
+        if (!is_string($u)) {
+            continue;
+        }
+        $u = trim($u);
+        if ($u === '' || !preg_match('#^https://#i', $u)) {
+            $out['error'] = 'Each carousel image must be a public HTTPS URL.';
+
+            return $out;
+        }
+        $leaf = '';
+        $qs = (string) (parse_url($u, PHP_URL_QUERY) ?? '');
+        if ($qs !== '') {
+            parse_str($qs, $qq);
+            if (($qq['action'] ?? '') === 'ig_public_image' && !empty($qq['f'])) {
+                $leaf = basename(str_replace('\\', '/', (string) $qq['f']));
+            }
+        }
+        if ($leaf === '') {
+            $path = (string) (parse_url($u, PHP_URL_PATH) ?? '');
+            $leaf = $path !== '' ? basename($path) : '';
+        }
+        if ($leaf !== '' && preg_match('/\.jpe?g$/i', $leaf)) {
+            $out['urls'][] = $u;
+
+            continue;
+        }
+        $got = ff_ig_curl_fetch_public_image_url($u, 10 * 1024 * 1024, 90);
+        if (!$got['ok']) {
+            $out['error'] = $got['error'] !== '' ? $got['error'] : 'Image download failed.';
+
+            return $out;
+        }
+        if (ff_ig_image_bytes_looks_like_jpeg($got['bytes'])) {
+            $out['urls'][] = $u;
+
+            continue;
+        }
+        $norm = ff_ig_normalize_image_bytes_to_jpeg_for_ig($got['bytes']);
+        if (!$norm['ok']) {
+            $out['error'] = $norm['error'] !== '' ? $norm['error'] : 'Could not convert image to JPEG for Instagram.';
+
+            return $out;
+        }
+        $fname = 'ig_meta_jpeg_' . gmdate('Ymd\THis\Z') . '_' . bin2hex(random_bytes(3)) . '_' . (++$n) . '.jpg';
+        $cr = ff_ig_pb_create_input_media_from_bytes($norm['bytes'], 'image/jpeg', $fname, $pbBearer);
+        if (!$cr['ok']) {
+            $out['error'] = $cr['error'] !== '' ? $cr['error'] : 'PocketBase upload failed after JPEG conversion.';
+
+            return $out;
+        }
+        $probe = ff_pb_file_get_bytes($inpCol, $cr['record_id'], $cr['stored_filename'], $pbBearer);
+        if (!$probe['ok']) {
+            $out['error'] = 'PocketBase token cannot read re-hosted JPEG (check rules / FF_CRON_PB_TOKEN).';
+
+            return $out;
+        }
+        $signed = ff_ig_signed_public_image_url($inpCol, $cr['record_id'], $cr['stored_filename'], $exp);
+        if ($signed === '' || !preg_match('#^https://#i', $signed)) {
+            $out['error'] = 'Could not build signed URL for converted JPEG (site_url must be https).';
+
+            return $out;
+        }
+        $out['urls'][] = $signed;
+    }
+    $out['ok'] = true;
+
+    return $out;
+}
+
 /**
  * @return array{ok: bool, error: string, record_id: string, stored_filename: string}
  */
@@ -1611,16 +2274,14 @@ function ff_ig_materialize_signed_url_for_src(string $raw, ?string $authHeader, 
 
         return $out;
     }
-    $ext = 'png';
-    if (str_contains($mime, 'jpeg') || str_contains($mime, 'jpg')) {
-        $ext = 'jpg';
-    } elseif (str_contains($mime, 'webp')) {
-        $ext = 'webp';
-    } elseif (str_contains($mime, 'gif')) {
-        $ext = 'gif';
+    $normB = ff_ig_normalize_image_bytes_to_jpeg_for_ig($fb['bytes']);
+    if (!$normB['ok']) {
+        $out['error'] = $normB['error'] !== '' ? $normB['error'] : 'Could not convert image to JPEG for Instagram.';
+
+        return $out;
     }
-    $fname = 'ig_carousel_' . gmdate('Ymd\THis\Z') . '_' . bin2hex(random_bytes(3)) . '.' . $ext;
-    $cr = ff_ig_pb_create_input_media_from_bytes($fb['bytes'], $fb['content_type'] !== '' ? $fb['content_type'] : 'image/png', $fname, $authHeader);
+    $fname = 'ig_carousel_' . gmdate('Ymd\THis\Z') . '_' . bin2hex(random_bytes(3)) . '.jpg';
+    $cr = ff_ig_pb_create_input_media_from_bytes($normB['bytes'], 'image/jpeg', $fname, $authHeader);
     if (!$cr['ok']) {
         $out['error'] = $cr['error'] !== '' ? $cr['error'] : 'PocketBase upload failed';
 
@@ -1652,37 +2313,11 @@ function ff_ig_materialize_signed_url_for_src(string $raw, ?string $authHeader, 
  */
 function ff_carousel_doc_resolve_ig_image_urls_for_schedule(array $doc, string $authHeader, ?string $pbUserId): array
 {
-    $raws = ff_carousel_doc_collect_raw_image_srcs($doc);
-    if ($raws === []) {
-        return ['ok' => false, 'urls' => [], 'error' => 'No image URLs in this carousel. In the Slides tab, set a Content image or Background image URL on each slide (or add content-image blocks). Instagram only receives public https:// links to image files—Meta does not screenshot the center preview card.'];
-    }
-    $needMat = false;
-    foreach ($raws as $raw) {
-        $u = ff_instagram_public_https_image_url($raw, $pbUserId);
-        if ($u === '' || !preg_match('#^https://#i', $u)) {
-            $needMat = true;
-            break;
-        }
-    }
-    if ($needMat && ff_ig_hmac_secret() === '') {
-        return ['ok' => false, 'urls' => [], 'error' => 'Set CRON_SECRET or IG_PUBLIC_IMAGE_SECRET so images can be hosted as signed HTTPS URLs for Instagram.'];
-    }
-    $urls = [];
-    foreach ($raws as $raw) {
-        $u = ff_instagram_public_https_image_url($raw, $pbUserId);
-        if ($u !== '' && preg_match('#^https://#i', $u)) {
-            $urls[] = $u;
-
-            continue;
-        }
-        $mat = ff_ig_materialize_signed_url_for_src($raw, $authHeader, $pbUserId);
-        if (!$mat['ok']) {
-            return ['ok' => false, 'urls' => [], 'error' => $mat['error'] !== '' ? $mat['error'] : 'Could not prepare image for Instagram.'];
-        }
-        $urls[] = $mat['url'];
+    if (trim((string) (getenv('FF_IG_USE_SLIDE_RENDER') ?: '')) === '0') {
+        return ff_carousel_doc_resolve_ig_image_urls_legacy($doc, $authHeader, $pbUserId);
     }
 
-    return ['ok' => true, 'urls' => array_values(array_unique($urls)), 'error' => ''];
+    return ff_carousel_doc_resolve_ig_jpeg_urls_from_render($doc, $authHeader, $pbUserId);
 }
 
 /**
@@ -1764,18 +2399,28 @@ function ff_ig_normalize_image_url_list(array $imageUrls, ?string $pbUserIdForGa
 /**
  * @return array{ok: bool, error: string, media_id: string}
  */
-function ff_ig_publish_carousel_or_single(string $igUserId, string $accessToken, array $imageUrls, string $caption, ?string $pbUserIdForGarage = null): array
+function ff_ig_publish_carousel_or_single(string $igUserId, string $accessToken, array $imageUrls, string $caption, ?string $pbUserIdForGarage = null, ?string $pbTokenForJpegNormalize = null): array
 {
     $out = ['ok' => false, 'error' => '', 'media_id' => ''];
     $caption = trim($caption);
-    if (mb_strlen($caption) > 2200) {
-        $caption = mb_substr($caption, 0, 2200);
+    if (ff_mb_strlen($caption) > 2200) {
+        $caption = ff_mb_substr($caption, 0, 2200);
     }
     $imageUrls = ff_ig_normalize_image_url_list($imageUrls, $pbUserIdForGarage);
     if ($imageUrls === []) {
         $out['error'] = 'No public HTTPS image URLs for Instagram. Configure GARAGE_PUBLIC_URL / GARAGE_PUBLIC_ROOT_DOMAIN or use direct https:// image links.';
 
         return $out;
+    }
+    $jpegTok = $pbTokenForJpegNormalize !== null ? trim((string) $pbTokenForJpegNormalize) : '';
+    if ($jpegTok !== '' && ff_ig_hmac_secret() !== '') {
+        $prep = ff_ig_publish_prepare_urls_jpeg_for_meta($imageUrls, $jpegTok);
+        if (!$prep['ok']) {
+            $out['error'] = $prep['error'] !== '' ? $prep['error'] : 'Could not prepare JPEG URLs for Instagram.';
+
+            return $out;
+        }
+        $imageUrls = $prep['urls'];
     }
     if (count($imageUrls) > 10) {
         $out['error'] = 'Instagram allows at most 10 images per post.';
@@ -3308,6 +3953,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_GET['action'] ?? '') === 'schedu
         echo json_encode(['error' => 'Instagram account not found or not accessible.'], JSON_UNESCAPED_UNICODE);
         exit;
     }
+    if (function_exists('session_write_close')) {
+        session_write_close();
+    }
+    ff_allow_long_request(300);
     $uidSchedule = ff_session_pb_user_id();
     $res = ff_carousel_doc_resolve_ig_image_urls_for_schedule($doc, $authHeader, $uidSchedule !== '' ? $uidSchedule : null);
     if (!$res['ok']) {
@@ -3332,7 +3981,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_GET['action'] ?? '') === 'schedu
     $scheduledIso = gmdate('Y-m-d\TH:i:s.000\Z', $ts);
     $payload = [
         'type' => 'ig_carousel_schedule',
-        'title' => $caption !== '' ? mb_substr($caption, 0, 200) : 'Instagram carousel',
+        'title' => $caption !== '' ? ff_mb_substr($caption, 0, 200) : 'Instagram carousel',
         'prompt' => '',
         'status' => 'scheduled',
         'social_account_id' => $sid,
@@ -3349,6 +3998,241 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_GET['action'] ?? '') === 'schedu
     $rec = ff_pb_normalize_api_record($r['body']);
     echo json_encode(['ok' => true, 'id' => (string) ($rec['id'] ?? ''), 'image_count' => count($urls)], JSON_UNESCAPED_UNICODE);
     exit;
+}
+
+/**
+ * Publish one output_media ig_carousel_schedule row to Instagram; PATCHes status/metadata on success or failure.
+ *
+ * @return array{ok: bool, media_id?: string, error?: string}
+ */
+function ff_instagram_publish_schedule_record(string $outCol, string $rid, array $it, string $pbToken): array
+{
+    $sid = trim((string) ($it['social_account_id'] ?? ''));
+    if ($rid === '' || $sid === '') {
+        return ['ok' => false, 'error' => 'bad_record'];
+    }
+    $meta = $it['metadata'] ?? [];
+    if (is_string($meta)) {
+        $meta = json_decode($meta, true) ?: [];
+    }
+    if (!is_array($meta)) {
+        $meta = [];
+    }
+    $caption = (string) ($meta['caption'] ?? '');
+    $urls = $meta['image_urls'] ?? [];
+    if (!is_array($urls)) {
+        $urls = [];
+    }
+    $soc = pb_request('GET', '/api/collections/social_accounts/records/' . rawurlencode($sid), null, $pbToken);
+    if (($soc['code'] ?? 0) !== 200) {
+        $failMeta = array_merge($meta, ['schedule_error' => 'social_accounts record missing']);
+        pb_request('PATCH', '/api/collections/' . rawurlencode($outCol) . '/records/' . rawurlencode($rid), [
+            'status' => 'failed',
+            'metadata' => $failMeta,
+        ], $pbToken);
+
+        return ['ok' => false, 'error' => 'social_accounts record missing'];
+    }
+    $srec = ff_pb_normalize_api_record($soc['body']);
+    $igUserId = trim((string) ($srec['instagram_user_id'] ?? ''));
+    $token = trim((string) ($srec['access_token'] ?? ''));
+    if ($igUserId === '' || $token === '') {
+        $failMeta = array_merge($meta, ['schedule_error' => 'Missing instagram_user_id or access_token']);
+        pb_request('PATCH', '/api/collections/' . rawurlencode($outCol) . '/records/' . rawurlencode($rid), [
+            'status' => 'failed',
+            'metadata' => $failMeta,
+        ], $pbToken);
+
+        return ['ok' => false, 'error' => 'Missing instagram_user_id or access_token'];
+    }
+    $pbUidCron = trim((string) ($meta['pb_user_id'] ?? ''));
+    $pub = ff_ig_publish_carousel_or_single($igUserId, $token, $urls, $caption, $pbUidCron !== '' ? $pbUidCron : null, $pbToken);
+    if (!$pub['ok']) {
+        $schedErr = $pub['error'] ?? 'publish_failed';
+        if (!is_string($schedErr)) {
+            $schedErr = json_encode($schedErr, JSON_UNESCAPED_UNICODE | JSON_INVALID_UTF8_SUBSTITUTE) ?: 'publish_failed';
+        }
+        $failMeta = array_merge($meta, ['schedule_error' => $schedErr]);
+        pb_request('PATCH', '/api/collections/' . rawurlencode($outCol) . '/records/' . rawurlencode($rid), [
+            'status' => 'failed',
+            'metadata' => $failMeta,
+        ], $pbToken);
+
+        return ['ok' => false, 'error' => (string) ($pub['error'] ?? 'publish_failed')];
+    }
+    $okMeta = array_merge($meta, [
+        'published_ig_media_id' => $pub['media_id'],
+        'published_at' => gmdate('c'),
+    ]);
+    pb_request('PATCH', '/api/collections/' . rawurlencode($outCol) . '/records/' . rawurlencode($rid), [
+        'status' => 'published',
+        'published_at' => gmdate('Y-m-d\TH:i:s.000\Z'),
+        'metadata' => $okMeta,
+    ], $pbToken);
+
+    return ['ok' => true, 'media_id' => (string) ($pub['media_id'] ?? '')];
+}
+
+/** POST ?action=post_instagram_carousel_now — same as schedule, but creates a due row and publishes immediately (session). */
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_GET['action'] ?? '') === 'post_instagram_carousel_now') {
+    header('Content-Type: application/json; charset=utf-8');
+    header('Cache-Control: no-store');
+    try {
+        ff_allow_long_request(300);
+        if (!ff_gate_session_ok()) {
+            http_response_code(403);
+            echo json_encode(['error' => 'Sign in required.'], JSON_UNESCAPED_UNICODE);
+            exit;
+        }
+        $raw = file_get_contents('php://input') ?: '';
+        $data = json_decode($raw, true);
+        if (!is_array($data)) {
+            http_response_code(400);
+            echo json_encode(['error' => 'Invalid JSON body.'], JSON_UNESCAPED_UNICODE);
+            exit;
+        }
+        $sid = trim((string) ($data['social_account_id'] ?? ''));
+        $caption = trim((string) ($data['caption'] ?? ''));
+        $doc = $data['doc'] ?? null;
+        if ($sid === '') {
+            http_response_code(400);
+            echo json_encode(['error' => 'social_account_id is required.'], JSON_UNESCAPED_UNICODE);
+            exit;
+        }
+        if (!is_array($doc)) {
+            http_response_code(400);
+            echo json_encode(['error' => 'doc must be the carousel JSON (slides, config).'], JSON_UNESCAPED_UNICODE);
+            exit;
+        }
+        global $authHeader, $user;
+        if ($authHeader === null || trim((string) $authHeader) === '') {
+            http_response_code(403);
+            echo json_encode(['error' => 'Session token missing.'], JSON_UNESCAPED_UNICODE);
+            exit;
+        }
+        if (ff_pb_owned_social_account($authHeader, $sid) === null) {
+            http_response_code(403);
+            echo json_encode(['error' => 'Instagram account not found or not accessible.'], JSON_UNESCAPED_UNICODE);
+            exit;
+        }
+        if (function_exists('session_write_close')) {
+            session_write_close();
+        }
+        $uidSchedule = ff_session_pb_user_id();
+        $res = ff_carousel_doc_resolve_ig_image_urls_for_schedule($doc, $authHeader, $uidSchedule !== '' ? $uidSchedule : null);
+        if (!$res['ok']) {
+            http_response_code(400);
+            echo json_encode(['error' => $res['error'] !== '' ? $res['error'] : 'Could not resolve image URLs for Instagram.'], JSON_UNESCAPED_UNICODE);
+            exit;
+        }
+        $urls = $res['urls'];
+        $cfg = $GLOBALS['CONFIG'];
+        $outCol = (string) ($cfg['output_media_collection'] ?? 'output_media');
+        $userEmail = is_array($user) ? trim((string) ($user['email'] ?? '')) : '';
+        $meta = [
+            'user_email' => $userEmail,
+            'caption' => $caption,
+            'image_urls' => $urls,
+            'pb_user_id' => $uidSchedule,
+        ];
+        $enc = json_encode($doc, JSON_UNESCAPED_UNICODE | JSON_INVALID_UTF8_SUBSTITUTE);
+        if (is_string($enc) && strlen($enc) < 400000) {
+            $meta['carousel_doc'] = $doc;
+        }
+        $scheduledIso = gmdate('Y-m-d\TH:i:s.000\Z');
+        $payload = [
+            'type' => 'ig_carousel_schedule',
+            'title' => $caption !== '' ? ff_mb_substr($caption, 0, 200) : 'Instagram carousel',
+            'prompt' => '',
+            'status' => 'scheduled',
+            'social_account_id' => $sid,
+            'scheduled_publish_at' => $scheduledIso,
+            'metadata' => $meta,
+        ];
+        $r = pb_request('POST', '/api/collections/' . rawurlencode($outCol) . '/records', $payload, $authHeader);
+        if (($r['code'] ?? 0) < 200 || ($r['code'] ?? 0) >= 300) {
+            $msg = ff_pb_extract_error_message($r['body'] ?? []) ?: ('HTTP ' . ($r['code'] ?? 0));
+            http_response_code(502);
+            echo json_encode(['error' => $msg], JSON_UNESCAPED_UNICODE | JSON_INVALID_UTF8_SUBSTITUTE);
+            exit;
+        }
+        $rec = ff_pb_normalize_api_record($r['body']);
+        $rid = (string) ($rec['id'] ?? '');
+        if ($rid === '') {
+            http_response_code(502);
+            echo json_encode(['error' => 'Create succeeded but record id missing.'], JSON_UNESCAPED_UNICODE);
+            exit;
+        }
+        // Create API response may omit metadata; publish must see image_urls we just stored.
+        $rec['social_account_id'] = $sid;
+        $rec['metadata'] = $meta;
+        $nUrls = count($urls);
+        // Default: finish Meta publish before closing the HTTP request. Background mode (FF_IG_POST_NOW_BACKGROUND=1)
+        // returns early via fastcgi_finish_request(); on some FPM/nginx setups the worker exits and the row
+        // stays stuck as status=scheduled with nothing posted (see post_instagram_carousel_now + list UI).
+        $bgPublish = trim((string) (getenv('FF_IG_POST_NOW_BACKGROUND') ?: '')) === '1'
+            && function_exists('fastcgi_finish_request');
+        if ($bgPublish) {
+            header('X-Accel-Buffering: no');
+            $outEarly = [
+                'ok' => true,
+                'id' => $rid,
+                'publishing' => true,
+                'image_count' => $nUrls,
+            ];
+            $outJson = json_encode($outEarly, JSON_UNESCAPED_UNICODE | JSON_INVALID_UTF8_SUBSTITUTE);
+            if ($outJson === false) {
+                http_response_code(500);
+                echo json_encode(['error' => 'Could not encode response JSON.'], JSON_UNESCAPED_UNICODE);
+                exit;
+            }
+            ignore_user_abort(true);
+            echo $outJson;
+            fastcgi_finish_request();
+            try {
+                $pubResult = ff_instagram_publish_schedule_record($outCol, $rid, $rec, $authHeader);
+                if (!$pubResult['ok']) {
+                    error_log('FormatForge post_instagram_carousel_now background publish failed id=' . $rid . ': ' . ((string) ($pubResult['error'] ?? '')));
+                }
+            } catch (Throwable $e2) {
+                error_log('FormatForge post_instagram_carousel_now background: ' . $e2->getMessage() . ' @ ' . $e2->getFile() . ':' . $e2->getLine());
+            }
+            exit;
+        }
+        $pubResult = ff_instagram_publish_schedule_record($outCol, $rid, $rec, $authHeader);
+        if (!$pubResult['ok']) {
+            http_response_code(502);
+            echo json_encode([
+                'ok' => false,
+                'error' => (string) ($pubResult['error'] ?? 'Publish failed.'),
+                'id' => $rid,
+                'image_count' => $nUrls,
+            ], JSON_UNESCAPED_UNICODE | JSON_INVALID_UTF8_SUBSTITUTE);
+            exit;
+        }
+        $outJson = json_encode([
+            'ok' => true,
+            'id' => $rid,
+            'ig_media_id' => (string) ($pubResult['media_id'] ?? ''),
+            'image_count' => $nUrls,
+        ], JSON_UNESCAPED_UNICODE | JSON_INVALID_UTF8_SUBSTITUTE);
+        if ($outJson === false) {
+            http_response_code(500);
+            echo json_encode(['error' => 'Could not encode response JSON.'], JSON_UNESCAPED_UNICODE);
+            exit;
+        }
+        echo $outJson;
+        exit;
+    } catch (Throwable $e) {
+        error_log('FormatForge post_instagram_carousel_now: ' . $e->getMessage() . ' @ ' . $e->getFile() . ':' . $e->getLine());
+        http_response_code(500);
+        $err = ['error' => 'Server error while publishing (see server log).'];
+        if (trim((string) (getenv('FF_DEBUG_MEDIA') ?: '')) === '1') {
+            $err['detail'] = $e->getMessage();
+        }
+        echo json_encode($err, JSON_UNESCAPED_UNICODE | JSON_INVALID_UTF8_SUBSTITUTE);
+        exit;
+    }
 }
 
 /** GET ?action=list_instagram_schedules — scheduled Instagram posts for the signed-in user. */
@@ -3370,18 +4254,22 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET' && ($_GET['action'] ?? '') === 'list_in
     $outCol = (string) ($cfg['output_media_collection'] ?? 'output_media');
     $email = trim((string) ($user['email'] ?? ''));
     $q = http_build_query([
-        'filter' => 'type = "ig_carousel_schedule" && status = "scheduled"',
-        'perPage' => 50,
-        'sort' => 'scheduled_publish_at',
+        'filter' => 'type = "ig_carousel_schedule" && status != "cancelled"',
+        'perPage' => 60,
+        // Use @rowid like other output_media lists — some PB/API setups reject sort on system updated.
+        'sort' => '-@rowid',
     ]);
     $r = pb_request('GET', '/api/collections/' . rawurlencode($outCol) . '/records?' . $q, null, $authHeader);
     if (($r['code'] ?? 0) !== 200) {
+        $pbMsg = is_array($r['body'] ?? null) ? trim((string) ($r['body']['message'] ?? '')) : '';
+        error_log('FormatForge list_instagram_schedules: PocketBase HTTP ' . ($r['code'] ?? 0) . ($pbMsg !== '' ? (' — ' . $pbMsg) : ''));
         http_response_code(502);
         echo json_encode(['error' => 'Could not list schedules.'], JSON_UNESCAPED_UNICODE);
         exit;
     }
     $items = ff_pb_list_items($r);
     $out = [];
+    $publishedKept = 0;
     foreach ($items as $it) {
         if (!is_array($it)) {
             continue;
@@ -3396,14 +4284,49 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET' && ($_GET['action'] ?? '') === 'list_in
         if (($meta['user_email'] ?? '') !== $email) {
             continue;
         }
+        $st = trim((string) ($it['status'] ?? ''));
+        if ($st === 'published') {
+            if ($publishedKept >= 12) {
+                continue;
+            }
+            $publishedKept++;
+        }
         $out[] = [
             'id' => (string) ($it['id'] ?? ''),
+            'status' => $st !== '' ? $st : 'scheduled',
             'scheduled_publish_at' => (string) ($it['scheduled_publish_at'] ?? ''),
             'social_account_id' => (string) ($it['social_account_id'] ?? ''),
             'caption' => (string) ($meta['caption'] ?? ''),
             'image_count' => is_array($meta['image_urls'] ?? null) ? count($meta['image_urls']) : 0,
+            'schedule_error' => (string) ($meta['schedule_error'] ?? ''),
+            'ig_media_id' => (string) ($meta['published_ig_media_id'] ?? ''),
         ];
     }
+    usort($out, static function (array $a, array $b): int {
+        $sa = $a['status'] ?? '';
+        $sb = $b['status'] ?? '';
+        $rank = static function (string $s): int {
+            return match ($s) {
+                'scheduled' => 0,
+                'failed' => 1,
+                'published' => 2,
+                default => 3,
+            };
+        };
+        $ra = $rank($sa);
+        $rb = $rank($sb);
+        if ($ra !== $rb) {
+            return $ra <=> $rb;
+        }
+
+        $ta = (string) ($a['scheduled_publish_at'] ?? '');
+        $tb = (string) ($b['scheduled_publish_at'] ?? '');
+        $tier = (string) ($a['status'] ?? '');
+        if ($tier === 'scheduled' || $tier === '') {
+            return strcmp($ta, $tb);
+        }
+        return strcmp($tb, $ta);
+    });
     echo json_encode(['ok' => true, 'items' => $out], JSON_UNESCAPED_UNICODE);
     exit;
 }
@@ -3481,6 +4404,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET' && ($_GET['action'] ?? '') === 'process
         echo json_encode(['error' => 'Cron not configured (CRON_SECRET + FF_CRON_PB_TOKEN).'], JSON_UNESCAPED_UNICODE);
         exit;
     }
+    ff_allow_long_request(300);
     $cfg = $GLOBALS['CONFIG'];
     $outCol = (string) ($cfg['output_media_collection'] ?? 'output_media');
     $q = http_build_query([
@@ -3513,62 +4437,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'GET' && ($_GET['action'] ?? '') === 'process
         if ($wt === false || $wt > $now) {
             continue;
         }
-        $sid = trim((string) ($it['social_account_id'] ?? ''));
-        $meta = $it['metadata'] ?? [];
-        if (is_string($meta)) {
-            $meta = json_decode($meta, true) ?: [];
+        $pubResult = ff_instagram_publish_schedule_record($outCol, $rid, $it, $pbCron);
+        if ($pubResult['ok']) {
+            $processed[] = ['id' => $rid, 'ok' => true, 'ig_media_id' => $pubResult['media_id'] ?? ''];
+        } else {
+            $processed[] = ['id' => $rid, 'ok' => false, 'error' => $pubResult['error'] ?? 'unknown'];
         }
-        if (!is_array($meta)) {
-            $meta = [];
-        }
-        $caption = (string) ($meta['caption'] ?? '');
-        $urls = $meta['image_urls'] ?? [];
-        if (!is_array($urls)) {
-            $urls = [];
-        }
-        $soc = pb_request('GET', '/api/collections/social_accounts/records/' . rawurlencode($sid), null, $pbCron);
-        if (($soc['code'] ?? 0) !== 200) {
-            $failMeta = array_merge($meta, ['schedule_error' => 'social_accounts record missing']);
-            pb_request('PATCH', '/api/collections/' . rawurlencode($outCol) . '/records/' . rawurlencode($rid), [
-                'status' => 'failed',
-                'metadata' => $failMeta,
-            ], $pbCron);
-            $processed[] = ['id' => $rid, 'ok' => false, 'error' => 'no_social_account'];
-            continue;
-        }
-        $srec = ff_pb_normalize_api_record($soc['body']);
-        $igUserId = trim((string) ($srec['instagram_user_id'] ?? ''));
-        $token = trim((string) ($srec['access_token'] ?? ''));
-        if ($igUserId === '' || $token === '') {
-            $failMeta = array_merge($meta, ['schedule_error' => 'Missing instagram_user_id or access_token']);
-            pb_request('PATCH', '/api/collections/' . rawurlencode($outCol) . '/records/' . rawurlencode($rid), [
-                'status' => 'failed',
-                'metadata' => $failMeta,
-            ], $pbCron);
-            $processed[] = ['id' => $rid, 'ok' => false, 'error' => 'bad_token'];
-            continue;
-        }
-        $pbUidCron = trim((string) ($meta['pb_user_id'] ?? ''));
-        $pub = ff_ig_publish_carousel_or_single($igUserId, $token, $urls, $caption, $pbUidCron !== '' ? $pbUidCron : null);
-        if (!$pub['ok']) {
-            $failMeta = array_merge($meta, ['schedule_error' => $pub['error']]);
-            pb_request('PATCH', '/api/collections/' . rawurlencode($outCol) . '/records/' . rawurlencode($rid), [
-                'status' => 'failed',
-                'metadata' => $failMeta,
-            ], $pbCron);
-            $processed[] = ['id' => $rid, 'ok' => false, 'error' => $pub['error']];
-            continue;
-        }
-        $okMeta = array_merge($meta, [
-            'published_ig_media_id' => $pub['media_id'],
-            'published_at' => gmdate('c'),
-        ]);
-        pb_request('PATCH', '/api/collections/' . rawurlencode($outCol) . '/records/' . rawurlencode($rid), [
-            'status' => 'published',
-            'published_at' => gmdate('Y-m-d\TH:i:s.000\Z'),
-            'metadata' => $okMeta,
-        ], $pbCron);
-        $processed[] = ['id' => $rid, 'ok' => true, 'ig_media_id' => $pub['media_id']];
     }
     echo json_encode(['ok' => true, 'processed' => $processed], JSON_UNESCAPED_UNICODE);
     exit;
@@ -3946,7 +4820,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && ff_request_action() === 'generate')
     $system = <<<'SYS'
 You output only valid JSON (no markdown). Shape: {"slides":[{"elements":[{"type":"Title"|"Subtitle"|"Description","text":"..."}]}]}.
 Rules:
-- 8-15 slides; each slide has 2-3 elements mixing Title, Subtitle, Description.
+- At most 10 slides (never more); fewer is fine if the topic is narrow. Each slide has 2-3 elements mixing Title, Subtitle, Description.
 - Text under ~70% of typical limits: title/subtitle max ~110 chars; descriptions shorter.
 - Add tasteful emojis in text. No slide numbers in copy.
 - Elements on a slide share one idea; adapt the user topic for LinkedIn-style carousels.
@@ -4012,6 +4886,12 @@ SYS;
     if ($slides === null) {
         http_response_code(502);
         echo json_encode(['error' => 'Model did not return valid slides JSON']);
+        exit;
+    }
+    $slides = array_slice($slides, 0, FF_CAROUSEL_AI_SLIDES_MAX);
+    if ($slides === []) {
+        http_response_code(502);
+        echo json_encode(['error' => 'Model returned no slides']);
         exit;
     }
 
@@ -4310,6 +5190,11 @@ if ($authHeader) {
 }
 $htmlPbAdmin = htmlspecialchars((string) ($CONFIG['pocketbase_admin_url'] ?? ''), ENT_QUOTES | ENT_HTML5, 'UTF-8');
 $htmlInputMediaCol = htmlspecialchars((string) ($CONFIG['input_media_collection'] ?? 'input_media'), ENT_QUOTES | ENT_HTML5, 'UTF-8');
+$htmlIgCronProcessUrl = htmlspecialchars(
+    rtrim((string) ($CONFIG['site_url'] ?? ''), '/') . '/index.php?action=process_instagram_schedules&cron_secret=',
+    ENT_QUOTES | ENT_HTML5,
+    'UTF-8'
+);
 $slideAiEnabled = cg_env('OPENROUTER_API_KEY') !== false;
 
 $replicateImageEnabled = trim((string) (getenv('REPLICATE_API_TOKEN') ?: '')) !== '';
@@ -4374,9 +5259,15 @@ $fontPairsBody = [
   --cg-text: #e8eaed;
 }
 *, *::before, *::after { box-sizing: border-box; }
+html {
+  height: 100%;
+}
 body {
   margin: 0;
-  min-height: 100vh;
+  height: 100%;
+  min-height: 100dvh;
+  max-height: 100dvh;
+  overflow: hidden;
   display: flex;
   flex-direction: column;
   font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
@@ -4394,6 +5285,7 @@ a { color: var(--cg-accent); }
   border-bottom: 1px solid var(--cg-border);
   background: var(--cg-panel);
   flex-wrap: wrap;
+  flex-shrink: 0;
 }
 .app-header h1 { margin: 0; font-size: 1.1rem; font-weight: 600; }
 .app-header-left { display: flex; flex-direction: column; gap: 0.15rem; min-width: 0; }
@@ -4401,12 +5293,14 @@ a { color: var(--cg-accent); }
   padding: 0.5rem 1.25rem;
   font-size: 0.85rem;
   border-bottom: 1px solid var(--cg-border);
+  flex-shrink: 0;
 }
 .flash-banner.ok { background: rgba(34, 197, 94, 0.12); color: #86efac; }
 .flash-banner.bad { background: rgba(248, 113, 113, 0.12); color: #fca5a5; }
 .layout {
   flex: 1;
   min-height: 0;
+  overflow: hidden;
   display: grid;
   grid-template-columns: minmax(240px, 300px) minmax(0, 1fr) minmax(260px, 340px);
   grid-template-areas:
@@ -4428,7 +5322,8 @@ a { color: var(--cg-accent); }
       "preview"
       "sources"
       "scrub";
-    grid-template-rows: auto auto auto auto;
+    /* Share viewport height between stacked columns; each scrolls inside (panel-body / main / sidebar-inner) */
+    grid-template-rows: minmax(0, 1fr) minmax(0, 1fr) minmax(0, 1fr) auto;
   }
 }
 .panel {
@@ -4451,6 +5346,7 @@ a { color: var(--cg-accent); }
     border-right: none;
     border-bottom: 1px solid var(--cg-border);
     max-height: none;
+    min-height: 0;
   }
 }
 .sidebar-right {
@@ -4469,6 +5365,7 @@ a { color: var(--cg-accent); }
     border-left: none;
     border-top: 1px solid var(--cg-border);
     max-height: none;
+    min-height: 0;
   }
 }
 .sidebar-right > .tabs {
@@ -4579,12 +5476,6 @@ a { color: var(--cg-accent); }
   gap: 0.35rem;
   flex-wrap: wrap;
   font-size: 0.72rem;
-}
-.media-scroll {
-  max-height: 22rem;
-  overflow-y: auto;
-  margin-top: 0.35rem;
-  padding-right: 0.15rem;
 }
 .tabs {
   display: flex;
@@ -4705,6 +5596,7 @@ textarea { min-height: 72px; resize: vertical; }
   gap: 1rem;
   overflow: auto;
   min-width: 0;
+  min-height: 0;
   background: var(--cg-shell);
 }
 .pager {
@@ -5462,7 +6354,7 @@ textarea { min-height: 72px; resize: vertical; }
                     <span x-show="aiLoading">Working…</span>
                 </button>
                 <p class="err" x-show="aiError" x-text="aiError"></p>
-                <p class="hint">Replaces all slides with AI output. You can edit after.</p>
+                <p class="hint">Replaces all slides with AI output (at most 10 — Instagram carousel limit). You can edit after.</p>
                 <?php endif; ?>
 
                 <?php if ($replicateImageEnabled): ?>
@@ -5562,8 +6454,6 @@ textarea { min-height: 72px; resize: vertical; }
                 <span x-text="(currentIndex + 1) + ' / ' + doc.slides.length"></span>
                 <button type="button" class="btn btn-small" @click="carouselGoNext()">Next</button>
             </div>
-            <p class="hint" style="margin:0.35rem 0 0.65rem;font-size:0.72rem;"><strong>Center card</strong> is a live layout preview (brand, text, content image). <strong>Schedule to Instagram</strong> sends only the <code>https://</code> image files linked in your JSON (content + background URLs)—not a flattened JPEG of this card. For full-frame exports matching this layout, run the <strong>Video</strong> pipeline. Click text on the card to edit; use the <strong>Slides</strong> tab for images and structure.</p>
-
             <div class="preview-frame"
                 :class="{ 'preview-drop-active': previewDropActive }"
                 :style="previewStyle()"
@@ -5703,9 +6593,9 @@ textarea { min-height: 72px; resize: vertical; }
                             <p class="hint" style="margin:0.5rem 0 0;">No Instagram accounts linked yet.</p>
                             <?php endif; ?>
                             <?php if ($igAccountsList !== []): ?>
-                            <div class="sidebar-ig-schedule" style="margin-top:0.85rem;padding-top:0.75rem;border-top:1px solid rgba(255,255,255,0.08);">
+                            <div class="sidebar-ig-schedule" style="margin-top:0.85rem;padding:0.75rem 0.55rem 0.85rem;border-top:1px solid rgba(255,255,255,0.08);border-radius:8px;background:rgba(0,0,0,0.14);">
                                 <p class="hint" style="margin:0 0 0.45rem;font-weight:600;">Schedule this carousel</p>
-                                <p class="hint" style="margin:0 0 0.5rem;font-size:0.72rem;">Queues the <strong>current document</strong> for the selected linked account. Meta fetches each resolved <code>https://</code> image (JPEG/PNG/etc. per their API)—it is <strong>not</strong> auto-generated from the on-screen slide layout. Non-public URLs are copied to PocketBase as signed links (needs <code>CRON_SECRET</code> + <code>FF_CRON_PB_TOKEN</code>), or use <code>GARAGE_PUBLIC_URL</code> / external <code>https://</code> links. Cron must call <code>process_instagram_schedules</code> — see <code>.env.example</code>.</p>
+                                <p class="hint" style="margin:0 0 0.5rem;font-size:0.72rem;">Queues the <strong>current document</strong> after rendering each still slide to a <strong>JPEG</strong> on the server (Node + Playwright in <code>video-pipeline/</code>). Images inside slides are inlined or fetched with your session, then Meta downloads the uploaded files via signed URLs (<code>CRON_SECRET</code> + <code>FF_CRON_PB_TOKEN</code>). Server needs <code>node</code> on PATH and Chromium in <code>video-pipeline/.playwright-browsers</code> (see <code>.env.example</code>; php-fpm cannot use only your user’s <code>~/.cache</code>). <strong>Cron</strong> (GET, often every minute): <code style="word-break:break-all;display:block;margin-top:0.25rem;"><?php echo $htmlIgCronProcessUrl; ?><span style="user-select:all;">CRON_SECRET</span></code> The date and time you pick are in <strong>your device timezone</strong>, then sent to the server as <strong>UTC</strong> (preview below). Set <code>FF_IG_USE_SLIDE_RENDER=0</code> only for the legacy “raw image URL” mode.</p>
                                 <div class="field" style="margin-bottom:0.5rem;">
                                     <label>Instagram account</label>
                                     <select x-model="garageIgId" @change="refreshInstagramSchedules()" style="width:100%;">
@@ -5716,16 +6606,44 @@ textarea { min-height: 72px; resize: vertical; }
                                 </div>
                                 <div class="field" style="margin-bottom:0.5rem;">
                                     <label>Caption (optional, max 2200)</label>
-                                    <textarea x-model="igScheduleCaption" rows="3" maxlength="2200" placeholder="Post caption…" style="width:100%;box-sizing:border-box;"></textarea>
+                                    <textarea x-model="igScheduleCaption" rows="5" maxlength="2200" placeholder="Post caption…" style="width:100%;box-sizing:border-box;min-height:5.5rem;"></textarea>
                                 </div>
                                 <div class="field" style="margin-bottom:0.5rem;">
-                                    <label>Publish at</label>
-                                    <input type="datetime-local" x-model="igScheduleAt" style="width:100%;box-sizing:border-box;">
+                                    <label>Publish at <span class="hint" style="font-weight:400;font-size:0.72rem;" x-show="igScheduleTzLabel()" x-text="'· ' + igScheduleTzLabel()"></span></label>
+                                    <div style="display:grid;grid-template-columns:1fr 1fr;gap:0.35rem;margin-bottom:0.45rem;">
+                                        <button type="button" class="btn btn-small" style="min-height:2.1rem;" @click="igSchedulePresetMinutes(15)">+15 min</button>
+                                        <button type="button" class="btn btn-small" style="min-height:2.1rem;" @click="igSchedulePresetMinutes(60)">+1 hour</button>
+                                        <button type="button" class="btn btn-small" style="min-height:2.1rem;" @click="igSchedulePresetMinutes(180)">+3 hours</button>
+                                        <button type="button" class="btn btn-small" style="min-height:2.1rem;" @click="igSchedulePresetMinutes(1440)">+24 hours</button>
+                                        <button type="button" class="btn btn-small" style="min-height:2.1rem;grid-column:1 / -1;" @click="igSchedulePresetTomorrowAt(9, 0)">Tomorrow 9:00</button>
+                                        <button type="button" class="btn btn-small" style="min-height:2.1rem;grid-column:1 / -1;" @click="igSchedulePresetNextWeekdayAt(1, 9, 0)">Next Monday 9:00</button>
+                                    </div>
+                                    <div style="display:grid;grid-template-columns:1fr;gap:0.45rem;">
+                                        <div>
+                                            <label class="hint" style="display:block;margin:0 0 0.2rem;font-size:0.72rem;">Date</label>
+                                            <input type="date" x-model="igScheduleDate" :min="igScheduleMinDateStr()" style="width:100%;box-sizing:border-box;padding:0.45rem 0.5rem;border-radius:6px;border:1px solid rgba(255,255,255,0.18);background:rgba(0,0,0,0.25);color:inherit;font-size:0.9rem;">
+                                        </div>
+                                        <div>
+                                            <label class="hint" style="display:block;margin:0 0 0.2rem;font-size:0.72rem;">Time</label>
+                                            <input type="time" x-model="igScheduleTime" step="60" style="width:100%;box-sizing:border-box;padding:0.45rem 0.5rem;border-radius:6px;border:1px solid rgba(255,255,255,0.18);background:rgba(0,0,0,0.25);color:inherit;font-size:0.9rem;">
+                                        </div>
+                                    </div>
+                                    <div class="hint" style="margin-top:0.45rem;padding:0.45rem 0.5rem;border-radius:6px;background:rgba(0,0,0,0.2);font-size:0.7rem;line-height:1.45;" x-show="igSchedulePreviewLocal()">
+                                        <div><strong>Local</strong> <span x-text="igSchedulePreviewLocal()"></span></div>
+                                        <div style="margin-top:0.25rem;word-break:break-word;"><strong>UTC (stored)</strong> <code style="font-size:0.68rem;" x-text="igSchedulePreviewUtcIso()"></code></div>
+                                    </div>
                                 </div>
-                                <button type="button" class="btn btn-primary" style="width:100%;" @click="scheduleInstagramCarousel()" :disabled="igScheduleLoading || !garageIgId">
-                                    <span x-show="!igScheduleLoading">Schedule to Instagram</span>
-                                    <span x-show="igScheduleLoading">Working…</span>
-                                </button>
+                                <div style="display:flex;gap:0.45rem;flex-wrap:wrap;align-items:stretch;">
+                                    <button type="button" class="btn btn-primary" style="flex:1 1 8rem;min-width:0;" @click="scheduleInstagramCarousel()" :disabled="igScheduleLoading || !garageIgId">
+                                        <span x-show="!igScheduleLoading">Schedule</span>
+                                        <span x-show="igScheduleLoading">Working…</span>
+                                    </button>
+                                    <button type="button" class="btn" style="flex:1 1 8rem;min-width:0;border-color:rgba(255,255,255,0.22);" @click="postInstagramCarouselNow()" :disabled="igScheduleLoading || !garageIgId" title="Publish immediately (no cron)">
+                                        <span x-show="!igScheduleLoading">Post now</span>
+                                        <span x-show="igScheduleLoading">Working…</span>
+                                    </button>
+                                </div>
+                                <p class="hint" style="margin:0.35rem 0 0;font-size:0.68rem;line-height:1.4;"><strong>Post now</strong> renders uploads and calls Meta in this HTTP request unless <code>FF_IG_POST_NOW_BACKGROUND=1</code> (early response can leave items stuck as Scheduled on some hosts). <strong>Schedule</strong> still needs cron for the chosen time.</p>
                                 <p class="err" style="margin:0.45rem 0 0;" x-show="igScheduleErr" x-text="igScheduleErr"></p>
                                 <p class="hint" style="margin:0.35rem 0 0;color:var(--cg-accent);" x-show="igScheduleMsg" x-text="igScheduleMsg"></p>
                                 <p class="hint" style="margin:0.65rem 0 0.35rem;font-weight:600;">Upcoming</p>
@@ -5734,22 +6652,31 @@ textarea { min-height: 72px; resize: vertical; }
                                     <span class="hint" style="margin:0;" x-show="igScheduleLoading">Loading…</span>
                                 </div>
                                 <template x-if="!igSchedules.length && !igScheduleLoading">
-                                    <p class="hint" style="margin:0;">No scheduled posts.</p>
+                                    <p class="hint" style="margin:0;">Nothing in your Instagram queue yet.</p>
                                 </template>
                                 <ul class="sidebar-ig-list" style="margin:0;padding-left:0;list-style:none;">
                                     <template x-for="row in igSchedules" :key="row.id">
                                         <li style="margin-bottom:0.55rem;padding:0.45rem;border-radius:6px;background:rgba(0,0,0,0.2);">
-                                            <div style="font-size:0.75rem;" x-text="formatIgScheduleWhen(row.scheduled_publish_at)"></div>
-                                            <div class="hint" style="margin:0.2rem 0 0;font-size:0.68rem;" x-text="igScheduleAccountLabel(row.social_account_id) + ' · ' + row.image_count + ' img' + (row.caption ? ' · ' + row.caption.slice(0, 48) + (row.caption.length > 48 ? '…' : '') : '')"></div>
-                                            <button type="button" class="btn btn-small" style="margin-top:0.35rem;" @click="cancelInstagramSchedule(row.id)" :disabled="igScheduleLoading">Cancel</button>
+                                            <div style="display:flex;flex-wrap:wrap;gap:0.35rem;align-items:center;font-size:0.72rem;">
+                                                <span style="font-weight:600;" x-text="formatIgScheduleWhen(row.scheduled_publish_at)"></span>
+                                                <span style="font-size:0.65rem;padding:0.08rem 0.32rem;border-radius:4px;background:rgba(255,255,255,0.08);" :class="row.status === 'failed' ? 'err' : 'hint'" x-text="igScheduleStatusLabel(row.status)"></span>
+                                            </div>
+                                            <div class="hint" style="margin:0.2rem 0 0;font-size:0.68rem;line-height:1.45;white-space:normal;" x-text="igScheduleAccountLabel(row.social_account_id) + ' · ' + row.image_count + ' img' + (row.caption ? ' · ' + row.caption.slice(0, 220) + (row.caption.length > 220 ? '…' : '') : '')"></div>
+                                            <template x-if="row.status === 'published' && row.ig_media_id">
+                                                <div class="hint" style="margin:0.2rem 0 0;font-size:0.66rem;word-break:break-all;">Instagram media id: <code x-text="row.ig_media_id"></code></div>
+                                            </template>
+                                            <template x-if="row.status === 'failed' && row.schedule_error">
+                                                <p class="err" style="margin:0.25rem 0 0;font-size:0.66rem;line-height:1.4;white-space:pre-wrap;" x-text="row.schedule_error"></p>
+                                            </template>
+                                            <button type="button" class="btn btn-small" style="margin-top:0.35rem;" x-show="!row.status || row.status === 'scheduled'" @click="cancelInstagramSchedule(row.id)" :disabled="igScheduleLoading">Cancel</button>
                                         </li>
                                     </template>
                                 </ul>
                             </div>
                             <?php endif; ?>
-                            <details class="hint" style="margin-top:0.65rem;font-size:0.72rem;">
-                                <summary style="cursor:pointer;color:var(--cg-accent);">OAuth scope sent to Meta</summary>
-                                <p style="margin:0.35rem 0 0;word-break:break-all;"><code><?php echo htmlspecialchars((string) ($CONFIG['instagram_oauth_scope'] ?? ''), ENT_QUOTES | ENT_HTML5, 'UTF-8'); ?></code></p>
+                            <details class="hint" style="margin-top:0.85rem;font-size:0.72rem;" open>
+                                <summary style="cursor:pointer;color:var(--cg-accent);font-weight:500;">OAuth scope sent to Meta</summary>
+                                <p style="margin:0.45rem 0 0;word-break:break-word;line-height:1.5;"><code style="display:block;padding:0.55rem 0.65rem;border-radius:6px;background:rgba(0,0,0,0.25);font-size:0.68rem;white-space:pre-wrap;"><?php echo htmlspecialchars((string) ($CONFIG['instagram_oauth_scope'] ?? ''), ENT_QUOTES | ENT_HTML5, 'UTF-8'); ?></code></p>
                             </details>
                         <?php endif; ?>
                     </section>
@@ -5770,7 +6697,7 @@ textarea { min-height: 72px; resize: vertical; }
                             <span class="hint" style="margin:0;" x-show="mediaLoading">Loading…</span>
                         </div>
                         <p class="hint" style="margin:0.35rem 0;color:#f87171;" x-show="mediaErr" x-text="mediaErr"></p>
-                        <div class="media-scroll">
+                        <div style="margin-top:0.35rem;">
                             <?php if ($garageReady && $igAccountsList !== []): ?>
                             <p class="media-subhead">Input media (Garage)</p>
                             <p class="hint" style="margin:0 0 0.5rem;">Drag thumbnails onto <strong>Intro / Outro</strong> in the Slides tab. Everything for the selected account stays in one bucket (<code><?php echo htmlspecialchars((string) ($CONFIG['garage_social_content_bucket'] ?? ''), ENT_QUOTES | ENT_HTML5, 'UTF-8'); ?></code>) under <code>social_accounts/&lt;id&gt;/…</code>. AI slide/image saves use <code>ai/slides/</code> and <code>ai/images/</code> under that same prefix when an Instagram account is selected in this tab.</p>
@@ -6002,6 +6929,7 @@ window.__FF_USER__ = <?= $user ? 'true' : 'false' ?>;
   const PIPELINE_PREFS_KEY = 'carousel-generator-pipeline';
   const SLIDE_TEMPLATES_KEY_LEGACY = 'carousel-slide-templates';
   const SLIDE_TEMPLATES_KEY_V2 = 'carousel-slide-templates-v2';
+  const AI_SLIDES_MAX = 10;
 
   const PALETTES = {
     black: { primary: '#373737', secondary: '#161616', background: '#000000' },
@@ -6199,7 +7127,7 @@ window.__FF_USER__ = <?= $user ? 'true' : 'false' ?>;
 
   function normalizeAiSlides(slides) {
     if (!Array.isArray(slides)) return null;
-    return slides.map(function (s) {
+    return slides.slice(0, AI_SLIDES_MAX).map(function (s) {
       const els = Array.isArray(s.elements) ? s.elements : [];
       const mapped = els.slice(0, 3).map(normalizeAiElement);
       if (mapped.length === 0) mapped.push(elTitle('Slide'));
@@ -6263,7 +7191,8 @@ window.__FF_USER__ = <?= $user ? 'true' : 'false' ?>;
         templateMsg: '',
         draggingOverTpl: '',
         igScheduleCaption: '',
-        igScheduleAt: '',
+        igScheduleDate: '',
+        igScheduleTime: '',
         igSchedules: [],
         igScheduleLoading: false,
         igScheduleErr: '',
@@ -6300,13 +7229,7 @@ window.__FF_USER__ = <?= $user ? 'true' : 'false' ?>;
           if (this.igAccounts.length && !this.garageIgId) {
             this.garageIgId = this.igAccounts[0].id || '';
           }
-          (function setDefaultIgScheduleAt() {
-            const d = new Date();
-            d.setMinutes(d.getMinutes() + 65);
-            d.setSeconds(0, 0);
-            const pad = function (n) { return String(n).padStart(2, '0'); };
-            self.igScheduleAt = d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate()) + 'T' + pad(d.getHours()) + ':' + pad(d.getMinutes());
-          })();
+          this.igScheduleApplyDefaultPublishTime();
           this.migrateLegacySlideTemplatesIfNeeded();
           this.assignSlideTemplatesFromAccount();
           if (window.__FF_USER__) {
@@ -6384,7 +7307,7 @@ window.__FF_USER__ = <?= $user ? 'true' : 'false' ?>;
             '# Still slides: per-slide musicPath in JSON (Slides tab / bottom bar). Video slides: mediaKind "video".',
             'cd video-pipeline',
             'npm install',
-            'npx playwright install chromium',
+            'PLAYWRIGHT_BROWSERS_PATH="$(pwd)/.playwright-browsers" npx playwright install chromium',
             cmd,
           ].join('\n');
         },
@@ -6842,6 +7765,120 @@ window.__FF_USER__ = <?= $user ? 'true' : 'false' ?>;
           return id || '—';
         },
 
+        igScheduleStatusLabel: function (st) {
+          const s = String(st || 'scheduled').toLowerCase();
+          if (s === 'published') {
+            return 'Posted';
+          }
+          if (s === 'failed') {
+            return 'Failed';
+          }
+          if (s === 'scheduled') {
+            return 'Scheduled';
+          }
+          if (s === 'cancelled' || s === 'canceled') {
+            return 'Cancelled';
+          }
+          return s ? s.charAt(0).toUpperCase() + s.slice(1) : 'Scheduled';
+        },
+
+        igSchedulePad2: function (n) {
+          return String(n).padStart(2, '0');
+        },
+
+        igScheduleApplyLocalDate: function (d) {
+          if (!d || isNaN(d.getTime())) {
+            return;
+          }
+          d.setSeconds(0, 0);
+          const p = this.igSchedulePad2;
+          this.igScheduleDate = d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate());
+          this.igScheduleTime = p(d.getHours()) + ':' + p(d.getMinutes());
+        },
+
+        igScheduleApplyDefaultPublishTime: function () {
+          const d = new Date();
+          d.setMinutes(d.getMinutes() + 65);
+          this.igScheduleApplyLocalDate(d);
+        },
+
+        igScheduleTzLabel: function () {
+          try {
+            return Intl.DateTimeFormat().resolvedOptions().timeZone || '';
+          } catch (e) {
+            return '';
+          }
+        },
+
+        igScheduleMinDateStr: function () {
+          const d = new Date();
+          const p = this.igSchedulePad2;
+          return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate());
+        },
+
+        igSchedulePresetMinutes: function (mins) {
+          const n = typeof mins === 'number' ? mins : parseInt(mins, 10);
+          if (!n || isNaN(n)) {
+            return;
+          }
+          const d = new Date();
+          d.setTime(d.getTime() + n * 60000);
+          this.igScheduleApplyLocalDate(d);
+        },
+
+        igSchedulePresetTomorrowAt: function (hour, minute) {
+          const d = new Date();
+          d.setDate(d.getDate() + 1);
+          d.setHours(hour, minute, 0, 0);
+          this.igScheduleApplyLocalDate(d);
+        },
+
+        /** Next occurrence of weekday (0=Sun … 6=Sat), always strictly in the future (not “this” weekday). */
+        igSchedulePresetNextWeekdayAt: function (targetDow, hour, minute) {
+          const d = new Date();
+          const cur = d.getDay();
+          let delta = (targetDow - cur + 7) % 7;
+          if (delta === 0) {
+            delta = 7;
+          }
+          d.setDate(d.getDate() + delta);
+          d.setHours(hour, minute, 0, 0);
+          this.igScheduleApplyLocalDate(d);
+        },
+
+        igScheduleCombinedDate: function () {
+          const ds = String(this.igScheduleDate || '').trim();
+          const ts = String(this.igScheduleTime || '').trim();
+          if (!ds || !ts) {
+            return null;
+          }
+          const d = new Date(ds + 'T' + ts);
+          if (isNaN(d.getTime())) {
+            return null;
+          }
+          return d;
+        },
+
+        igSchedulePreviewLocal: function () {
+          const d = this.igScheduleCombinedDate();
+          if (!d) {
+            return '';
+          }
+          try {
+            return d.toLocaleString(undefined, { weekday: 'short', month: 'short', day: 'numeric', year: 'numeric', hour: 'numeric', minute: '2-digit' });
+          } catch (e) {
+            return d.toString();
+          }
+        },
+
+        igSchedulePreviewUtcIso: function () {
+          const d = this.igScheduleCombinedDate();
+          if (!d) {
+            return '';
+          }
+          return d.toISOString();
+        },
+
         refreshInstagramSchedules: async function () {
           this.igScheduleErr = '';
           if (!window.__FF_USER__) {
@@ -6872,14 +7909,13 @@ window.__FF_USER__ = <?= $user ? 'true' : 'false' ?>;
             this.igScheduleErr = 'Choose a linked Instagram account.';
             return;
           }
-          const raw = (this.igScheduleAt || '').trim();
-          if (!raw) {
-            this.igScheduleErr = 'Choose date and time.';
+          const d = this.igScheduleCombinedDate();
+          if (!d) {
+            this.igScheduleErr = 'Choose a valid date and time.';
             return;
           }
-          const d = new Date(raw);
-          if (isNaN(d.getTime())) {
-            this.igScheduleErr = 'Invalid date and time.';
+          if (d.getTime() < Date.now() + 60000) {
+            this.igScheduleErr = 'Publish time must be at least one minute from now.';
             return;
           }
           const scheduledAt = d.toISOString();
@@ -6903,6 +7939,77 @@ window.__FF_USER__ = <?= $user ? 'true' : 'false' ?>;
             }
             const n = data.image_count != null ? data.image_count : '?';
             this.igScheduleMsg = 'Scheduled (' + n + ' image' + (n === 1 ? '' : 's') + ').';
+            await this.refreshInstagramSchedules();
+            await this.refreshMediaLibrary();
+          } catch (err) {
+            this.igScheduleErr = err && err.message ? err.message : String(err);
+          } finally {
+            this.igScheduleLoading = false;
+          }
+        },
+
+        postInstagramCarouselNow: async function () {
+          this.igScheduleErr = '';
+          this.igScheduleMsg = '';
+          if (!this.garageIgId) {
+            this.igScheduleErr = 'Choose a linked Instagram account.';
+            return;
+          }
+          if (!window.confirm('Post this carousel to Instagram now? It will go live as soon as Meta accepts it (this cannot be undone from FormatForge).')) {
+            return;
+          }
+          this.igScheduleLoading = true;
+          try {
+            const path = this.ffScriptPath();
+            const res = await fetch(path + '?action=post_instagram_carousel_now', {
+              method: 'POST',
+              credentials: 'same-origin',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                social_account_id: this.garageIgId,
+                caption: this.igScheduleCaption || '',
+                doc: this.doc,
+              }),
+            });
+            const data = await res.json().catch(function () { return {}; });
+            if (!res.ok) {
+              throw new Error((data && data.error) ? String(data.error) : ('HTTP ' + res.status));
+            }
+            const n = data.image_count != null ? data.image_count : '?';
+            if (data.publishing && data.id) {
+              const rid = String(data.id);
+              this.igScheduleMsg = 'Publishing ' + n + ' image' + (n === 1 ? '' : 's') + '… (Meta can take a minute; queued for tunnel-safe delivery).';
+              const deadline = Date.now() + 180000;
+              while (Date.now() < deadline) {
+                await new Promise(function (r) { setTimeout(r, 2500); });
+                await this.refreshInstagramSchedules();
+                const rows = Array.isArray(this.igSchedules) ? this.igSchedules : [];
+                let row = null;
+                for (let i = 0; i < rows.length; i++) {
+                  if (rows[i] && String(rows[i].id) === rid) {
+                    row = rows[i];
+                    break;
+                  }
+                }
+                if (!row) {
+                  continue;
+                }
+                if (row.status === 'published') {
+                  const mid = row.ig_media_id ? String(row.ig_media_id) : '';
+                  this.igScheduleMsg = 'Posted (' + n + ' image' + (n === 1 ? '' : 's') + ')' + (mid ? (' — id ' + mid) : '') + '.';
+                  await this.refreshMediaLibrary();
+                  return;
+                }
+                if (row.status === 'failed') {
+                  this.igScheduleErr = row.schedule_error ? String(row.schedule_error) : 'Publish failed.';
+                  return;
+                }
+              }
+              this.igScheduleErr = 'Timed out waiting for Instagram. Check Upcoming — publishing may still finish.';
+              return;
+            }
+            const mid = data.ig_media_id ? String(data.ig_media_id) : '';
+            this.igScheduleMsg = 'Posted (' + n + ' image' + (n === 1 ? '' : 's') + ')' + (mid ? (' — id ' + mid) : '') + '.';
             await this.refreshInstagramSchedules();
             await this.refreshMediaLibrary();
           } catch (err) {
